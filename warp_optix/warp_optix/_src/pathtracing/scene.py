@@ -31,6 +31,10 @@ import warp as wp
 
 import warp_optix as wo
 
+from .. import micromaps
+from ..brep import device as brep_device
+from ..brep import planes as brep_planes
+from ..brep import proxy as brep_proxy
 from . import pathtracing_warp_kernels as pwk
 from .color_utils import srgb_to_linear_u8
 from .materials import ALPHA_OPAQUE, MaterialManager
@@ -583,6 +587,127 @@ class Curve:
         self._packed_material_offset = 0
 
 
+class Brep:
+    """Exact BRep geometry (an OpenUSD ``BrepArray``) traced as custom primitives (experimental).
+
+    ``prim`` is a ``warp_optix._src.brep.loader.BrepPrim`` in object space; instances place it.
+    Each custom primitive (an analytic face or a NURBS sub-patch) takes its face's material from
+    ``face_material_ids`` (one per face), or ``material_id``.
+    """
+
+    primitive_type = "brep"
+    hit_group = "brep"
+    geometry_type = pwk.GEOMETRY_TYPE_BREP
+    dynamic = False
+
+    def __init__(
+        self,
+        prim,
+        material_id: int = 0,
+        face_material_ids: np.ndarray | None = None,
+        shells: bool = True,
+        planes: bool = False,
+    ):
+        self.prim = prim
+        bounds = np.asarray(prim.prim_bounds, dtype=np.float64).reshape(-1, 6)
+        count = len(bounds)
+        if count:
+            lo, hi = bounds[:, :3].min(axis=0), bounds[:, 3:].max(axis=0)
+        else:
+            lo = hi = np.zeros(3)
+        # The bounding-box corners stand in for vertices (scene bounds, camera framing, statistics).
+        self.vertices = np.array(
+            [[x, y, z] for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])], dtype=np.float32
+        )
+        self.bounds = np.ascontiguousarray(bounds, dtype=np.float32)
+        # Bicubic patches are traced through triangle shells (hardware traversal, exact refinement
+        # in any-hit); their AABBs become inactive (NaN).
+        self.proxy = brep_proxy.build_proxy(prim) if shells else None
+        if self.proxy is not None and len(self.proxy.patches):
+            self.bounds[self.proxy.patches] = np.nan
+        # With ``planes``, planar faces are traced as triangles with opacity micromaps of their trims
+        # (hardware traversal; only micro-triangles on trim edges run the exact test) instead of
+        # AABBs. Off by default: on a dense assembly (path tracing, 4 bounces) it measured -8% to +5%
+        # frame time, while building the micromaps on the host adds about 25 s of loading.
+        self.planes = brep_planes.plane_triangles(prim) if planes else None
+        if self.planes is not None and len(self.planes.prims):
+            self.bounds[self.planes.prims] = np.nan
+        self.shell_index = None  # geometry index of the BrepShell, set by Scene.add_brep
+        self.plane_index = None  # geometry index of the BrepPlanes, set by Scene.add_brep
+        # Global BRep primitive ids, assigned when the scene packs its BReps.
+        self.indices = np.arange(count, dtype=np.uint32)
+        self.material_id = int(material_id)
+        if face_material_ids is not None:
+            face_material_ids = np.asarray(face_material_ids, dtype=np.int64)[
+                np.asarray(prim.prim_face, dtype=np.int64)
+            ]
+        self.material_ids = _normalize_primitive_material_ids(face_material_ids, count, self.material_id)
+        self.d_indices = None
+        self.d_vertices = None
+        self.d_bounds = None
+        self._packed_material_offset = 0
+
+
+class BrepShell:
+    """Triangle shells around a Brep's bicubic patches (``brep/proxy.py``), added by ``add_brep``.
+
+    Traced as hardware triangles whose any-hit refines each crossing to the exact surface. The
+    render primitive's position offset holds the first shell triangle's index in the BRep data.
+    """
+
+    primitive_type = "brep_shell"
+    hit_group = "brep_shell"
+    geometry_type = pwk.GEOMETRY_TYPE_BREP_SHELL
+    dynamic = False
+
+    def __init__(self, brep: Brep):
+        self.brep = brep
+        self.vertices = np.ascontiguousarray(brep.proxy.points, dtype=np.float32)
+        self.indices = np.ascontiguousarray(brep.proxy.indices, dtype=np.uint32)
+        self.material_ids = np.ascontiguousarray(brep.material_ids[brep.proxy.tri_prim], dtype=np.uint32)
+        self.material_id = brep.material_id
+        self.tri_base = 0
+        self.d_indices = None
+        self.d_vertices = None
+        self._packed_material_offset = 0
+
+
+class BrepPlanes:
+    """A Brep's planar faces as triangles over their (u, v) ranges, added by ``add_brep``.
+
+    Opacity micromaps from the faces' trim cell grids (``brep/planes.py``) make the RT cores
+    resolve hits inside and outside the trims; micro-triangles on trim edges run an any-hit with
+    the exact trim test. The render primitive's position offset holds the first triangle's index
+    in the BRep data, whose ``proxy_prim`` maps it to its planar primitive.
+    """
+
+    primitive_type = "brep_plane"
+    hit_group = "brep_plane"
+    geometry_type = pwk.GEOMETRY_TYPE_BREP_PLANE
+    dynamic = False
+
+    def __init__(self, brep: Brep):
+        self.brep = brep
+        planes = brep.planes
+        self.vertices = np.ascontiguousarray(planes.points, dtype=np.float32)
+        self.indices = np.ascontiguousarray(planes.indices, dtype=np.uint32)
+        self.tri_prim = np.repeat(planes.prims, 2).astype(np.int32)  # two triangles per plane
+        self.material_ids = np.ascontiguousarray(brep.material_ids[self.tri_prim], dtype=np.uint32)
+        self.material_id = brep.material_id
+        self.tri_base = 0
+        self.micromaps = None
+        self.d_indices = None
+        self.d_vertices = None
+        self._packed_material_offset = 0
+
+
+_BREP_COMPANIONS = ("brep_shell", "brep_plane")
+
+
+def _is_curve(geometry) -> bool:
+    return geometry.primitive_type not in ("triangles", "brep", *_BREP_COMPANIONS)
+
+
 class Instance:
     """Represents an instance of a mesh with a transform."""
 
@@ -632,6 +757,7 @@ class Scene:
         self.materials = MaterialManager()
         self._meshes = []
         self._instances = []
+        self._brep_companions: dict[int, list[int]] = {}
         self._sphere_lights = []
         self._sphere_light_data = None
 
@@ -648,6 +774,7 @@ class Scene:
         self._packed_positions = None
         self._packed_radii = None
         self._packed_normals = None
+        self._brep_data = brep_device.BrepData()
         self._packed_tangents = None
         self._packed_texcoords0 = None
         self._packed_texcoords1 = None
@@ -705,7 +832,11 @@ class Scene:
 
     @property
     def curve_count(self) -> int:
-        return sum(geometry.primitive_type != "triangles" for geometry in self._meshes)
+        return sum(_is_curve(geometry) for geometry in self._meshes)
+
+    @property
+    def brep_count(self) -> int:
+        return sum(geometry.primitive_type == "brep" for geometry in self._meshes)
 
     @property
     def instance_count(self) -> int:
@@ -884,6 +1015,26 @@ class Scene:
         self._meshes.append(curve)
         return len(self._meshes) - 1
 
+    def add_brep(self, brep: Brep) -> int:
+        """Add exact BRep geometry and return its reusable geometry index (experimental).
+
+        Its triangle shells and planar-face triangles become companion geometries, instanced
+        along with it.
+        """
+        self._meshes.append(brep)
+        index = len(self._meshes) - 1
+        if brep.proxy is not None and len(brep.proxy.indices):
+            self._meshes.append(BrepShell(brep))
+            brep.shell_index = len(self._meshes) - 1
+        if brep.planes is not None and len(brep.planes.indices):
+            self._meshes.append(BrepPlanes(brep))
+            brep.plane_index = len(self._meshes) - 1
+        return index
+
+    def brep_companions(self, instance_index: int) -> list[int]:
+        """The shell and plane instances added with a BRep instance."""
+        return self._brep_companions.get(instance_index, [])
+
     def _ensure_instance_cache_capacity(self, count: int):
         """Grow contiguous host-side instance state without per-frame allocation."""
         if self._instance_cache_capacity >= count:
@@ -920,6 +1071,14 @@ class Scene:
         self._instance_transform_cache[instance_index] = instance.transform
         self._instance_visibility_cache[instance_index] = instance.visible
         self._instance_records_dirty = True
+        geometry = self._meshes[mesh_index] if mesh_index < len(self._meshes) else None
+        for attribute in ("shell_index", "plane_index"):
+            companion_index = getattr(geometry, attribute, None)
+            if companion_index is not None:
+                companion = self.add_instance(
+                    companion_index, transform, material_id=material_id, visible=visible, double_sided=True
+                )
+                self._brep_companions.setdefault(instance_index, []).append(companion)
         return instance_index
 
     def set_instance_transform(self, instance_index: int, transform: np.ndarray):
@@ -929,6 +1088,8 @@ class Scene:
             inst.transform = np.ascontiguousarray(transform, dtype=np.float32)
             self._instance_transform_cache[instance_index] = inst.transform
             self._instance_records_dirty = True
+            for companion in self._brep_companions.get(instance_index, []):
+                self.set_instance_transform(companion, transform)
 
     def set_instance_transforms_batch(self, instance_indices, transforms: np.ndarray):
         """Update a batch of instance transforms with one NumPy assignment."""
@@ -941,6 +1102,11 @@ class Scene:
         if int(indices.min()) < 0 or int(indices.max()) >= len(self._instances):
             raise IndexError("instance index is out of range")
         self._instance_transform_cache[indices] = matrices
+        if self._brep_companions:
+            pairs = [(c, n) for n, i in enumerate(indices.tolist()) for c in self._brep_companions.get(i, [])]
+            if pairs:
+                companions, rows = (np.array(x, dtype=np.intp) for x in zip(*pairs, strict=True))
+                self._instance_transform_cache[companions] = matrices[rows]
         self._instance_records_dirty = True
 
     def set_instance_transforms_device(
@@ -1465,6 +1631,7 @@ class Scene:
         """Clear all meshes and instances."""
         self._meshes.clear()
         self._instances.clear()
+        self._brep_companions.clear()
         self._sphere_lights.clear()
         self._sphere_light_data = None
         self._gas.clear()
@@ -1488,6 +1655,7 @@ class Scene:
         self._packed_positions = None
         self._packed_radii = None
         self._packed_normals = None
+        self._brep_data = brep_device.BrepData()
         self._packed_tangents = None
         self._packed_texcoords0 = None
         self._packed_texcoords1 = None
@@ -1538,6 +1706,7 @@ class Scene:
             len(self._instances),
         )
 
+        self._pack_breps()
         self._upload_geometry()
 
         # Build BLAS for each mesh
@@ -1551,13 +1720,44 @@ class Scene:
 
         total_verts = sum(len(m.vertices) for m in self._meshes)
         total_tris = sum(len(m.indices) for m in self._meshes if m.primitive_type == "triangles")
-        total_curves = sum(len(m.indices) for m in self._meshes if m.primitive_type != "triangles")
+        total_curves = sum(len(m.indices) for m in self._meshes if _is_curve(m))
+        total_brep = sum(len(m.indices) for m in self._meshes if m.primitive_type == "brep")
         logger.info(
-            "Scene build complete: %d vertices, %d triangles, %d curve segments.",
+            "Scene build complete: %d vertices, %d triangles, %d curve segments, %d BRep primitives.",
             total_verts,
             total_tris,
             total_curves,
+            total_brep,
         )
+
+    def _pack_breps(self):
+        """Pack every BRep geometry into the one ``BrepData`` the intersection program reads."""
+        breps = [g for g in self._meshes if g.primitive_type == "brep"]
+        if not breps:
+            self._brep_data = brep_device.BrepData()
+            return
+        # Shell triangles, then plane triangles, share the BRep data's per-triangle primitive map.
+        proxies = []
+        for g in breps:
+            shell = g.proxy if g.proxy is not None else brep_proxy.empty_proxy()
+            plane_prims = np.repeat(g.planes.prims, 2) if g.planes is not None else np.zeros(0, np.int32)
+            proxies.append(
+                brep_proxy.Proxy(
+                    shell.points,
+                    shell.indices,
+                    np.concatenate([shell.tri_prim, plane_prims]).astype(np.int32),
+                    np.concatenate([shell.tri_st, np.zeros((len(plane_prims), 3, 2), np.float32)]),
+                    shell.patches,
+                )
+            )
+        self._brep_data, bases, tri_bases = brep_device.pack([g.prim for g in breps], self.device, proxies)
+        for geometry, base, tri_base in zip(breps, bases, tri_bases, strict=True):
+            geometry.indices = (base + np.arange(len(geometry.bounds))).astype(np.uint32)
+            if geometry.shell_index is not None:
+                self._meshes[geometry.shell_index].tri_base = tri_base
+            if geometry.plane_index is not None:
+                shell_count = len(geometry.proxy.tri_prim) if geometry.proxy is not None else 0
+                self._meshes[geometry.plane_index].tri_base = tri_base + shell_count
 
     def rebuild_tlas(self, stream=None):
         """Rebuild only TLAS after instance transform updates."""
@@ -1587,7 +1787,7 @@ class Scene:
 
         meshes = self._meshes
         triangles = [g for g in meshes if g.primitive_type == "triangles"]
-        curves = [g for g in meshes if g.primitive_type != "triangles"]
+        curves = [g for g in meshes if _is_curve(g)]
         self._packed_indices, indices = upload([g.indices.reshape(-1) for g in meshes], wp.uint32)
         _, positions = upload([g.vertices.reshape(-1) for g in triangles], wp.float32)
         self._packed_normals, normals = upload([g.normals.reshape(-1) for g in triangles], wp.float32)
@@ -1600,6 +1800,32 @@ class Scene:
             mesh.d_normals = mesh_normals if mesh.dynamic else None
         for curve, curve_points, curve_radii in zip(curves, control_points, radii, strict=True):
             curve.d_vertices, curve.d_widths = curve_points, curve_radii
+        for companion in (g for g in meshes if g.primitive_type in _BREP_COMPANIONS):
+            companion.d_vertices = wp.array(companion.vertices, dtype=wp.vec3, device=self.device)
+
+    def _plane_build_input(self, geometry: BrepPlanes, all_opaque: bool, stream: wp.Stream):
+        """Plane triangles with trim micromaps. Non-opaque materials need any-hit everywhere (for
+        coverage too), so they skip the micromaps and test the trims on every hit."""
+        geometry.hit_group = "brep_plane" if all_opaque else "brep_plane_alpha"
+        if not all_opaque:
+            return wo.triangles(geometry.d_vertices, geometry.d_indices, flags=wo.GeometryFlags.NONE, validate=False)
+        planes = geometry.brep.planes
+        indices = planes.micromap_indices
+        if np.all(indices == micromaps.INDEX_FULLY_OPAQUE):  # untrimmed planes only
+            return wo.triangles(
+                geometry.d_vertices, geometry.d_indices, flags=wo.GeometryFlags.DISABLE_ANYHIT, validate=False
+            )
+        # Indexed micromaps need an array even when every triangle takes a predefined state.
+        states = planes.states or [np.array([micromaps.UNKNOWN_OPAQUE], np.uint8)]
+        geometry.micromaps = wo.OpacityMicromaps(states, stream=stream)  # on the GAS build's stream
+        return wo.triangles(
+            geometry.d_vertices,
+            geometry.d_indices,
+            flags=wo.GeometryFlags.NONE,
+            validate=False,
+            opacity_micromaps=geometry.micromaps,
+            micromap_indices=indices,
+        )
 
     def _build_blas(self):
         """Build bottom-level acceleration structures for all geometry.
@@ -1628,6 +1854,16 @@ class Scene:
                 build_input = wo.triangles(
                     geometry.d_vertices, geometry.d_indices, flags=geometry_flags, validate=False
                 )
+            elif geometry.primitive_type == "brep":
+                geometry.d_bounds = wp.array(geometry.bounds, dtype=wp.float32, device=self.device)
+                build_input = wo.aabbs(bounds=geometry.d_bounds, flags=geometry_flags)
+            elif geometry.primitive_type == "brep_shell":
+                # Any-hit refines every shell crossing to the exact surface: never disable it.
+                build_input = wo.triangles(
+                    geometry.d_vertices, geometry.d_indices, flags=wo.GeometryFlags.NONE, validate=False
+                )
+            elif geometry.primitive_type == "brep_plane":
+                build_input = self._plane_build_input(geometry, all_opaque, streams[index % len(streams)])
             else:
                 curve_type = (
                     wo.PrimitiveType.ROUND_LINEAR
@@ -1741,7 +1977,22 @@ class Scene:
             opaque = self._opaque_materials
             mesh_indices = np.fromiter((inst.mesh_index for inst in self._instances), dtype=np.intp, count=count)
             flags = np.zeros(count, dtype=np.uint32)
+            alpha_planes = []  # plane instances whose non-opaque override needs the coverage any-hit
             for index, inst in enumerate(self._instances):
+                if self._meshes[inst.mesh_index].primitive_type == "brep_shell":
+                    # Both shell layers must be found, and the refinement always runs.
+                    flags[index] = wo.InstanceFlags.DISABLE_TRIANGLE_FACE_CULLING | wo.InstanceFlags.ENFORCE_ANYHIT
+                    continue
+                if self._meshes[inst.mesh_index].primitive_type == "brep_plane":
+                    # A face is seen from both sides; any-hit runs where the micromap is unknown, and
+                    # everywhere for a non-opaque material override (with coverage, see below).
+                    flags[index] = wo.InstanceFlags.DISABLE_TRIANGLE_FACE_CULLING
+                    if inst.material_id is not None and not (
+                        0 <= inst.material_id < len(opaque) and opaque[inst.material_id]
+                    ):
+                        flags[index] |= wo.InstanceFlags.ENFORCE_ANYHIT
+                        alpha_planes.append(index)
+                    continue
                 if inst.double_sided:
                     flags[index] |= wo.InstanceFlags.DISABLE_TRIANGLE_FACE_CULLING
                 # A material override replaces every per-primitive material of the instance.
@@ -1755,7 +2006,9 @@ class Scene:
                 [pwk.SBT.get_sbt_offset(geometry.hit_group) for geometry in self._meshes], dtype=np.uint32
             )
             self._instance_traversables = wp.array(handles[mesh_indices], dtype=wp.uint64, device=self.device)
-            self._instance_sbt_offsets = wp.array(sbt_offsets[mesh_indices], dtype=wp.uint32, device=self.device)
+            instance_sbt_offsets = sbt_offsets[mesh_indices]
+            instance_sbt_offsets[alpha_planes] = pwk.SBT.get_sbt_offset("brep_plane_alpha")
+            self._instance_sbt_offsets = wp.array(instance_sbt_offsets, dtype=wp.uint32, device=self.device)
             self._instance_flags = wp.array(flags, dtype=wp.uint32, device=self.device)
             self._instance_masks = wp.empty(count, dtype=wp.uint32, device=self.device)
             self._device_instance_transforms = wp.empty((count, 12), dtype=wp.float32, device=self.device)
@@ -1815,7 +2068,7 @@ class Scene:
             return sizes(lambda g: getattr(g, attribute).size if g.primitive_type == "triangles" else 0)
 
         def curve_sizes(attribute):
-            return sizes(lambda g: 0 if g.primitive_type == "triangles" else getattr(g, attribute).size)
+            return sizes(lambda g: getattr(g, attribute).size if _is_curve(g) else 0)
 
         render_primitives = np.zeros(len(meshes), dtype=_create_render_primitive_dtype())
         vertex_buffer = render_primitives["vertexBuffer"]
@@ -1832,6 +2085,10 @@ class Scene:
         vertex_buffer["texCoord0Offset"] = starts(triangle_sizes("texcoords"))
         vertex_buffer["texCoord1Offset"] = starts(triangle_sizes("texcoords1"))
         vertex_buffer["hasTexCoord1"] = [g.primitive_type == "triangles" for g in meshes]
+        # BRep shells and planes: the position offset holds their first triangle in the BRep data.
+        for index, geometry in enumerate(meshes):
+            if geometry.primitive_type in _BREP_COMPANIONS:
+                vertex_buffer["positionOffset"][index] = geometry.tri_base
         for geometry, offset in zip(meshes, material_offsets.tolist(), strict=True):
             geometry._packed_material_offset = offset
         packed_tangents = [g.tangents.reshape(-1) for g in triangles]

@@ -55,6 +55,7 @@ def test_public_surface():
         "Instance",
         "InstanceFlags",
         "Launch",
+        "OpacityMicromaps",
         "Pipeline",
         "PrimitiveType",
         "ProgramKind",

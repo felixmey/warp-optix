@@ -33,6 +33,7 @@ import warp as wp
 
 import warp_optix as wo
 
+from ..brep import device as brep_device
 from . import pathtracing_warp_kernels as pwk
 from .camera import Camera, cross3
 from .defaults import DEFAULT_VIEWER_HEIGHT, DEFAULT_VIEWER_WIDTH
@@ -755,6 +756,17 @@ class Renderer:
                 stream=self._render_stream,
             )
 
+    def _pipeline_registers(self) -> int:
+        """The register limit for the scene: BRep intersection spills at the default limit.
+
+        Measured on 1920x1080 path tracing: BRep scenes (NURBS shells, analytic faces) run
+        1.3-1.6x faster at 168 registers than at the default (and slightly faster than at 255),
+        while triangle-only scenes run 20-30% slower when raised, so only BRep scenes raise it.
+        """
+        if self._scene is not None and self._scene.brep_count > 0:
+            return 168
+        return wo.native.COMPILE_DEFAULT_MAX_REGISTER_COUNT
+
     def _create_pipeline(self):
         """Create the OptiX pipeline with primary and shadow/visibility ray types.
 
@@ -762,11 +774,18 @@ class Renderer:
         ``pwk.SBT`` layout. Bounces iterate in raygen, so hit and miss programs
         never trace recursively.
         """
+        self._pipeline_register_limit = self._pipeline_registers()
+        # BRep scenes reorder bounce rays by direction: their intersection programs diverge.
+        has_breps = self._scene is not None and self._scene.brep_count > 0
         self._pipeline = wo.Pipeline(
-            pwk.primary_raygen,
+            pwk.primary_raygen_reorder if has_breps else pwk.primary_raygen,
             sbt=pwk.SBT,
             payload_words=19,
+            # BRep custom primitives report u, v, normal and face (curves use at most two).
+            attribute_words=brep_device.ATTRIBUTE_WORDS,
+            max_registers=self._pipeline_register_limit,
             graph_flags=wo.TraversableGraphFlags.ALLOW_SINGLE_LEVEL_INSTANCING,
+            opacity_micromaps=has_breps,  # BRep planar faces carry trim micromaps
             module_options={"fast_math": True},
             device=self._device,
         )
@@ -1059,6 +1078,9 @@ class Renderer:
         for name, value in arrays.items():
             if getattr(p, name) is not value:
                 setattr(p, name, value)
+        if self._param_values.get("brep") is not scene._brep_data:
+            p.brep = scene._brep_data
+            self._param_values["brep"] = scene._brep_data
 
     def _reset_launch_params(self) -> None:
         """Start a new launch-parameter struct; every field is assigned on the next update."""
@@ -1178,6 +1200,10 @@ class Renderer:
         if self._pipeline is None:
             logger.error("Pipeline not built. Call build() first.")
             return
+        if self._pipeline_registers() != self._pipeline_register_limit:
+            # The scene gained or lost BReps since the pipeline was built.
+            self._pipeline.close()
+            self._create_pipeline()
 
         if not self._denoiser_status_reported:
             logger.info(

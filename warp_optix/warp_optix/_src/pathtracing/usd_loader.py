@@ -1367,12 +1367,18 @@ def load_scene_from_usd(
         if key in path_to_node:
             return path_to_node[key]
         xformable = UsdGeom.Xformable(prim)
-        if not xformable:
-            return ensure_transform_node(prim.GetParent())
+        if xformable:
+            local = np.asarray(xformable.GetLocalTransformation(), dtype=np.float64).reshape(4, 4).T
+            reset = xformable.GetResetXformStack()
+        elif prim.GetTypeName() == "BrepArray":
+            # A Gprim, but USD only knows that when the omniSolid schema plugin is registered.
+            from ..brep.loader import local_transform  # noqa: PLC0415
 
-        local = np.asarray(xformable.GetLocalTransformation(), dtype=np.float64).reshape(4, 4).T
+            local, reset = local_transform(prim)
+        else:
+            return ensure_transform_node(prim.GetParent())
         parent_index = None
-        if not xformable.GetResetXformStack():
+        if not reset:
             parent_index = ensure_transform_node(prim.GetParent())
         if parent_index is None:
             # Unit/up-axis/root conversion is a stage-root transform in the
@@ -1442,9 +1448,58 @@ def load_scene_from_usd(
             material_uv_grids[result] = (columns, rows)
         return material_ids[key]
 
-    stats = {"meshes": 0, "triangles": 0, "vertices": 0, "lights": 0}
+    stats = {"meshes": 0, "triangles": 0, "vertices": 0, "lights": 0, "breps": 0}
     geometry_jobs = deque()
-    from .scene import Mesh  # noqa: PLC0415
+    from .scene import Brep, Mesh  # noqa: PLC0415
+
+    brep_jobs = []  # (key, prim, node index): loaded together, in parallel, after the traversal
+
+    def add_brep(prim, node_index: int):
+        """Queue a BrepArray; instance proxies of one prototype share its geometry."""
+        key = str(prim.GetPrimInPrototype().GetPath()) if prim.IsInstanceProxy() else str(prim.GetPath())
+        brep_jobs.append((key, prim, node_index))
+
+    def load_breps():
+        from ..brep.loader import load_brep_prims  # noqa: PLC0415
+
+        sources = {}
+        for key, prim, _ in brep_jobs:
+            sources.setdefault(key, prim)
+        keys = list(sources)
+        try:
+            loaded = dict(zip(keys, load_brep_prims([sources[k] for k in keys]), strict=True))
+        except Exception as error:  # noqa: BLE001 - fall back to one at a time to skip bad prims
+            logger.warning("Parallel BrepArray load failed (%s); loading one at a time", error)
+            loaded = {}
+            for key in keys:
+                try:
+                    loaded[key] = load_brep_prims([sources[key]], workers=1)[0]
+                except Exception as prim_error:  # noqa: BLE001
+                    logger.warning("Skipping BrepArray %s: %s", sources[key].GetPath(), prim_error)
+        geometries = {}
+        for key, prim, node_index in brep_jobs:
+            if key not in loaded:
+                continue
+            bound = material_id(_bound_material(prim, UsdShade))
+            if key not in geometries:
+                brep_prim = loaded[key]
+                face_materials = np.full(len(brep_prim.face_kind), bound)
+                for subset in _material_bind_subsets(prim, UsdGeom, UsdShade):
+                    subset_material = _bound_material(subset.GetPrim(), UsdShade)
+                    if subset_material:
+                        faces = np.asarray(subset.GetIndicesAttr().Get(), dtype=np.int64)
+                        face_materials[faces[faces < len(face_materials)]] = material_id(subset_material)
+                geometries[key] = (scene.add_brep(Brep(brep_prim, face_material_ids=face_materials)), bound)
+            geometry_index, first_bound = geometries[key]
+            # Placements of one prototype may bind different materials (e.g. STEP colors).
+            override = None if bound == first_bound else bound
+            instance_id = scene.add_instance(geometry_index, material_id=override, double_sided=True)
+            instance_ids.append(instance_id)
+            instance_node_ids.append(node_index)
+            for companion in scene.brep_companions(instance_id):  # its shells and planes, same placement
+                instance_ids.append(companion)
+                instance_node_ids.append(node_index)
+            stats["breps"] += 1
 
     def build_mesh_group(
         vertices,
@@ -1528,6 +1583,11 @@ def load_scene_from_usd(
             )
             stats["lights"] += 1
             continue
+        if prim.GetTypeName() == "BrepArray":
+            imageable = UsdGeom.Imageable(prim)
+            if str(imageable.ComputeVisibility()) != "invisible" and str(imageable.ComputePurpose()) in purposes:
+                add_brep(prim, ensure_transform_node(prim))
+            continue
         if not prim.IsA(UsdGeom.Mesh):
             continue
         imageable = UsdGeom.Imageable(prim)
@@ -1577,6 +1637,8 @@ def load_scene_from_usd(
 
     while geometry_jobs:
         consume_geometry_job()
+    if brep_jobs:
+        load_breps()
 
     from .usd_scene import UsdScene  # noqa: PLC0415
 
@@ -1602,13 +1664,14 @@ def load_scene_from_usd(
     )
     scene.set_gltf_textures(textures, srgb_texture_indices=srgb_textures)
     logger.info(
-        "[USD timing] total=%.1f ms meshes=%d verts=%d tris=%d lights=%d materials=%d textures=%d",
+        "[USD timing] total=%.1f ms meshes=%d breps=%d verts=%d tris=%d lights=%d materials=%d textures=%d",
         (time.perf_counter() - start) * 1000.0,
         stats["meshes"],
+        stats["breps"],
         stats["vertices"],
         stats["triangles"],
         stats["lights"],
         len(material_ids),
         len(textures),
     )
-    return scene.mesh_count > 0
+    return scene.mesh_count > 0 or scene.brep_count > 0

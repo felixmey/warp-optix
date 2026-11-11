@@ -256,6 +256,7 @@ inline CUDA_CALLABLE_DEVICE void optix_ignore_intersection() { optixIgnoreInters
 inline CUDA_CALLABLE_DEVICE void optix_direct_call(uint32 sbt_index) { optixDirectCall<void>(sbt_index); }
 inline CUDA_CALLABLE_DEVICE void optix_continuation_call(uint32 sbt_index) { optixContinuationCall<void>(sbt_index); }
 inline CUDA_CALLABLE_DEVICE void optix_reorder() { optixReorder(); }
+inline CUDA_CALLABLE_DEVICE void optix_make_nop_hit_object() { optixMakeNopHitObject(); }
 inline CUDA_CALLABLE_DEVICE void optix_reorder(uint32 hint, uint32 num_hint_bits) { optixReorder(hint, num_hint_bits); }
 
 template <typename... Details>

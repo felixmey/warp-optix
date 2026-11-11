@@ -1,0 +1,399 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Experimental BRep (OpenUSD ``BrepArray``) support: loader and path tracer integration."""
+
+import math
+
+import numpy as np
+import pytest
+import warp as wp
+
+pxr = pytest.importorskip("pxr")
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade  # noqa: E402
+from warp_optix._src.brep import loader  # noqa: E402
+
+pytestmark = pytest.mark.usd
+
+
+def _write_sphere_brep(path, radius=1.0, trimmed=False, emissive=False, translate=None):
+    """A one-face solid: a full sphere, optionally trimmed to its upper half by a seam/pole loop.
+
+    Written attribute by attribute, as the schema plugin is not needed to read or render it.
+    """
+    stage = Usd.Stage.CreateNew(str(path))
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
+    UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+    prim = stage.DefinePrim("/Ball", "BrepArray")
+    if translate is not None:
+        op = prim.CreateAttribute("xformOp:translate", Sdf.ValueTypeNames.Double3)
+        op.Set(Gf.Vec3d(*translate))
+        prim.CreateAttribute("xformOpOrder", Sdf.ValueTypeNames.TokenArray, variability=Sdf.VariabilityUniform).Set(
+            ["xformOp:translate"]
+        )
+
+    def attr(name, type_name, value):
+        prim.CreateAttribute(name, type_name, custom=False, variability=Sdf.VariabilityUniform).Set(value)
+
+    t = Sdf.ValueTypeNames
+    attr("brep:extent", t.Double3Array, [Gf.Vec3d(-radius), Gf.Vec3d(radius)])
+    attr("brep:regionCount", t.UIntArray, [2])
+    attr("region:type", t.TokenArray, ["voidRegion", "solidRegion"])
+    attr("region:shellCount", t.UIntArray, [1, 1])
+    attr("shell:faceuseCount", t.UIntArray, [1, 1])
+    attr("faceuse:faceIndex", t.UIntArray, [0, 0])
+    # The void side of the face is its normal side: the surface normal points out of the solid.
+    attr("faceuse:orientationType", t.TokenArray, ["same", "opposite"])
+    attr("face:surfaceType", t.TokenArray, ["BrepSurfaceSphereAPI"])
+    attr("face:range", t.Double2Array, [Gf.Vec2d(0.0, -math.pi / 2), Gf.Vec2d(2 * math.pi, math.pi / 2)])
+    attr("brep:surface:sphere:center", t.Point3dArray, [Gf.Vec3d(0.0)])
+    attr("brep:surface:sphere:axis", t.Vector3dArray, [Gf.Vec3d(0.0, 1.0, 0.0)])
+    attr("brep:surface:sphere:refDirection", t.Vector3dArray, [Gf.Vec3d(1.0, 0.0, 0.0)])
+    attr("brep:surface:sphere:radius", t.DoubleArray, [radius])
+    if not trimmed:
+        attr("face:trimType", t.TokenArray, ["rectangular"])
+        attr("face:loopCount", t.UIntArray, [0])
+    else:
+        # Upper hemisphere: the equator circle, then the seam up to the pole and back down.
+        attr("face:trimType", t.TokenArray, ["general"])
+        attr("face:loopCount", t.UIntArray, [1])
+        attr("loop:edgeuseCount", t.UIntArray, [3])
+        attr("edgeuse:edgeIndex", t.UIntArray, [0, 1, 1])
+        attr("edgeuse:orientationType", t.TokenArray, ["same", "same", "opposite"])
+        attr("edge:curveType", t.TokenArray, ["BrepCurve3dCircleAPI", "BrepCurve3dLineAPI"])
+        attr("edge:range", t.DoubleArray, [0.0, 2 * math.pi, 0.0, radius])
+        attr("brep:edge3dCircle:curve3d:circle:center", t.Point3dArray, [Gf.Vec3d(0.0)])
+        attr("brep:edge3dCircle:curve3d:circle:axis", t.Vector3dArray, [Gf.Vec3d(0.0, 1.0, 0.0)])
+        attr("brep:edge3dCircle:curve3d:circle:refDirection", t.Vector3dArray, [Gf.Vec3d(1.0, 0.0, 0.0)])
+        attr("brep:edge3dCircle:curve3d:circle:radius", t.DoubleArray, [radius])
+        # The seam is not a straight line on the sphere; a quarter circle in the xy plane is.
+        attr("edge:curveType", t.TokenArray, ["BrepCurve3dCircleAPI", "BrepCurve3dCircleAPI"])
+        attr("edge:range", t.DoubleArray, [0.0, 2 * math.pi, 0.0, math.pi / 2])
+        attr("brep:edge3dCircle:curve3d:circle:center", t.Point3dArray, [Gf.Vec3d(0.0)] * 2)
+        attr("brep:edge3dCircle:curve3d:circle:axis", t.Vector3dArray, [Gf.Vec3d(0, 1, 0), Gf.Vec3d(0, 0, 1)])
+        attr("brep:edge3dCircle:curve3d:circle:refDirection", t.Vector3dArray, [Gf.Vec3d(1, 0, 0), Gf.Vec3d(1, 0, 0)])
+        attr("brep:edge3dCircle:curve3d:circle:radius", t.DoubleArray, [radius, radius])
+    if emissive:
+        material = UsdShade.Material.Define(stage, "/Looks/Glow")
+        shader = UsdShade.Shader.Define(stage, "/Looks/Glow/Shader")
+        shader.CreateIdAttr("UsdPreviewSurface")
+        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.0))
+        shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(1.0))
+        material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+        UsdShade.MaterialBindingAPI.Apply(prim).Bind(material)
+    stage.GetRootLayer().Save()
+    return stage
+
+
+def _inside(prim, face, u, v):
+    """The device trim test (range check plus crossing count), evaluated on the host."""
+    umin, umax, vmin, vmax = prim.face_range[face]
+    pu, pv = prim.face_period[face]
+    if pu:
+        u = umin + np.mod(u - umin, pu)
+    if not (umin <= u <= umax and vmin <= v <= vmax):
+        return False
+    if not prim.face_flags[face] & loader.FLAG_TRIMMED:
+        return True
+    a, b = (v, u) if prim.face_flags[face] & loader.FLAG_SWAP else (u, v)
+    base, count = prim.face_slab[face]
+    lo, scale = prim.face_slab_map[face]
+    slab = base + int(np.clip(np.floor((a - lo) * scale), 0, count - 1))
+    members = prim.slab_segments[prim.slab_start[slab] : prim.slab_start[slab + 1]]
+    segs, bulge = prim.segments[members], prim.segment_bulge[members]
+    straddle = segs[(segs[:, 0] <= a) != (segs[:, 2] <= a)]
+    t = (a - straddle[:, 0]) / (straddle[:, 2] - straddle[:, 0])
+    count = np.count_nonzero(straddle[:, 1] + t * (straddle[:, 3] - straddle[:, 1]) > b)
+    dx, dy = segs[:, 2] - segs[:, 0], segs[:, 3] - segs[:, 1]
+    length2 = np.maximum(dx * dx + dy * dy, 1e-300)
+    along = ((a - segs[:, 0]) * dx + (b - segs[:, 1]) * dy) / length2
+    side = ((b - segs[:, 1]) * dx - (a - segs[:, 0]) * dy) / np.sqrt(length2)
+    arc = 4.0 * bulge * along * (1.0 - along)
+    flips = (
+        (bulge != 0)
+        & (along > 0)
+        & (along < 1)
+        & (((bulge > 0) & (side > 0) & (side < arc)) | ((bulge < 0) & (side < 0) & (side > arc)))
+    )
+    return (count + np.count_nonzero(flips)) % 2 == 1
+
+
+def test_loader_reads_surfaces_orientation_and_seam_trims(tmp_path):
+    stage = _write_sphere_brep(tmp_path / "half.usda", radius=2.0, trimmed=True)
+    prim = loader.load_brep_prim(stage.GetPrimAtPath("/Ball"), np.eye(4))
+
+    assert list(prim.face_kind) == [loader.SPHERE]
+    surface = prim.surfaces[0]
+    np.testing.assert_allclose(surface.evaluate(np.array([0.0]), np.array([0.0])), [[2.0, 0.0, 0.0]], atol=1e-12)
+    # Outward normal: the solid region's faceuse is "opposite", so the normal is not flipped.
+    assert prim.face_flags[0] & loader.FLAG_SOLID
+    assert not prim.face_flags[0] & loader.FLAG_FLIP
+    # The loop runs along the equator and twice along the seam through the pole, with no UV
+    # trim curves: projecting it must place the two seam uses a period apart and close the loop
+    # through the pole, leaving exactly the upper hemisphere.
+    for u in np.linspace(0.05, 2 * math.pi - 0.05, 9):
+        assert _inside(prim, 0, u, 0.6)
+        assert not _inside(prim, 0, u, -0.6)
+    # The bounds cover the full sphere face range (conservatively padded).
+    bounds = prim.prim_bounds[0]
+    assert np.all(bounds[:3] <= -2.0) and np.all(bounds[3:] >= 2.0)
+    assert np.all(bounds[:3] > -2.1) and np.all(bounds[3:] < 2.1)
+
+
+def test_brep_xform_ops_apply_without_the_schema_plugin():
+    stage = Usd.Stage.CreateInMemory()
+    xform = UsdGeom.Xform.Define(stage, "/X")
+    xform.AddTranslateOp().Set(Gf.Vec3d(1.0, 2.0, 3.0))
+    xform.AddRotateXYZOp().Set(Gf.Vec3f(10.0, 20.0, 30.0))
+    xform.AddScaleOp().Set(Gf.Vec3f(1.0, 2.0, 3.0))
+    xform.AddTranslateOp(opSuffix="pivot").Set(Gf.Vec3d(0.5, 0.0, 0.0))
+    xform.AddTranslateOp(opSuffix="pivot", isInverseOp=True)
+    brep = stage.DefinePrim("/B", "BrepArray")
+    for attribute in xform.GetPrim().GetAuthoredAttributes():
+        brep.CreateAttribute(attribute.GetName(), attribute.GetTypeName()).Set(attribute.Get())
+    assert not UsdGeom.Xformable(brep)  # unknown type without the plugin
+    local, reset = loader.local_transform(brep)
+    np.testing.assert_allclose(local, np.array(xform.GetLocalTransformation()).T, atol=1e-12)
+    assert not reset
+
+
+def _silhouette(api):
+    """Coverage and horizontal centroid (in pixels) of the bright pixels."""
+    for _ in range(4):
+        api.render_frame()
+    image = np.asarray(api.get_frame()[..., :3], dtype=np.float64)
+    luminance = image.mean(axis=-1)
+    mask = luminance > 0.5 * luminance.max()
+    return float(mask.mean()), float(np.nonzero(mask)[1].mean())
+
+
+@pytest.mark.gpu
+@pytest.mark.render
+def test_path_tracer_renders_brep_like_the_tessellated_sphere(tmp_path):
+    if not wp.is_cuda_available():
+        pytest.skip("CUDA device unavailable")
+    from warp_optix.pathtracing import PathTracer  # noqa: PLC0415
+
+    # The BrepArray's own xformOp places it, as USD does once the schema is known.
+    _write_sphere_brep(tmp_path / "ball.usda", emissive=True, translate=(0.6, 0.0, 0.0))
+
+    def new_api():
+        api = PathTracer(width=96, height=96, denoiser="none", enable_set=False, backface_culling=False)
+        api.initialize()
+        return api
+
+    api = new_api()
+    try:
+        assert api.scene.load_from_usd(str(tmp_path / "ball.usda"))
+        assert api.scene.brep_count == 1
+        api.build_scene()
+        api.set_environment_color((0.0, 0.0, 0.0))
+        api.set_camera_look_at((0.0, 0.0, 4.0), (0.0, 0.0, 0.0))
+        brep_coverage, brep_x = _silhouette(api)
+    finally:
+        api.close()
+
+    api = new_api()
+    try:
+        glow = api.create_emissive_material((1.0, 1.0, 1.0), intensity=1.0)
+        api.scene.add_sphere((0.6, 0.0, 0.0), 1.0, 256, glow)
+        api.build_scene()
+        api.set_environment_color((0.0, 0.0, 0.0))
+        api.set_camera_look_at((0.0, 0.0, 4.0), (0.0, 0.0, 0.0))
+        mesh_coverage, mesh_x = _silhouette(api)
+    finally:
+        api.close()
+
+    assert brep_coverage > 0.05
+    assert abs(brep_coverage - mesh_coverage) < 0.03 * mesh_coverage
+    assert abs(brep_x - mesh_x) < 0.5  # pixels
+    assert abs(brep_x - 48.0) > 5.0  # and the translation did move it off center
+
+
+def _write_nurbs_dome(path):
+    """One untrimmed bicubic NURBS face: a dome over [-1, 1]^2, emissive."""
+    stage = Usd.Stage.CreateNew(str(path))
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
+    UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+    prim = stage.DefinePrim("/Dome", "BrepArray")
+    t = Sdf.ValueTypeNames
+
+    def attr(name, type_name, value):
+        prim.CreateAttribute(name, type_name, custom=False, variability=Sdf.VariabilityUniform).Set(value)
+
+    grid = np.linspace(-1.0, 1.0, 4)
+    heights = np.array([[0.0, 0.3, 0.3, 0.0], [0.3, 1.2, 1.2, 0.3], [0.3, 1.2, 1.2, 0.3], [0.0, 0.3, 0.3, 0.0]])
+    cvs = [Gf.Vec3d(float(grid[i]), float(heights[i, j]), float(grid[j])) for i in range(4) for j in range(4)]
+    attr("brep:extent", t.Double3Array, [Gf.Vec3d(-1.0, 0.0, -1.0), Gf.Vec3d(1.0, 1.2, 1.0)])
+    attr("brep:regionCount", t.UIntArray, [1])
+    attr("region:type", t.TokenArray, ["voidRegion"])
+    attr("region:shellCount", t.UIntArray, [1])
+    attr("shell:faceuseCount", t.UIntArray, [2])
+    attr("faceuse:faceIndex", t.UIntArray, [0, 0])
+    attr("faceuse:orientationType", t.TokenArray, ["same", "opposite"])
+    attr("face:surfaceType", t.TokenArray, ["BrepSurfaceNurbAPI"])
+    attr("face:trimType", t.TokenArray, ["rectangular"])
+    attr("face:loopCount", t.UIntArray, [0])
+    attr("face:range", t.Double2Array, [Gf.Vec2d(0.0, 0.0), Gf.Vec2d(1.0, 1.0)])
+    attr("brep:surface:nurb:controlVertices", t.Point3dArray, cvs)
+    attr("brep:surface:nurb:weights", t.DoubleArray, [1.0] * 16)
+    attr("brep:surface:nurb:uVertexCount", t.UIntArray, [4])
+    attr("brep:surface:nurb:vVertexCount", t.UIntArray, [4])
+    attr("brep:surface:nurb:uOrder", t.UIntArray, [4])
+    attr("brep:surface:nurb:vOrder", t.UIntArray, [4])
+    attr("brep:surface:nurb:uKnots", t.DoubleArray, [0.0] * 4 + [1.0] * 4)
+    attr("brep:surface:nurb:vKnots", t.DoubleArray, [0.0] * 4 + [1.0] * 4)
+    material = UsdShade.Material.Define(stage, "/Looks/Glow")
+    shader = UsdShade.Shader.Define(stage, "/Looks/Glow/Shader")
+    shader.CreateIdAttr("UsdPreviewSurface")
+    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.0))
+    shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(1.0))
+    material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+    UsdShade.MaterialBindingAPI.Apply(prim).Bind(material)
+    stage.GetRootLayer().Save()
+
+
+def test_shell_proxies_enclose_bicubic_patches(tmp_path):
+    from warp_optix._src.brep import proxy  # noqa: PLC0415
+
+    _write_nurbs_dome(tmp_path / "dome.usda")
+    (prim,) = loader.load_stage(str(tmp_path / "dome.usda"))
+    shells = proxy.build_proxy(prim)
+    assert len(shells.patches) == len(prim.prim_kind) > 0
+    rng = np.random.default_rng(0)
+    for p in shells.patches:
+        pw = prim.cvs[prim.prim_cv[p] : prim.prim_cv[p] + 16].reshape(4, 4, 4)
+        points, _, _ = proxy.shell(pw, margin=0.0)
+        n = len(points) // 2
+        outer, inner = points[:n].reshape(5, 5, 3), points[n:].reshape(5, 5, 3)
+        mid, half = 0.5 * (outer + inner), 0.5 * np.linalg.norm(outer - inner, axis=-1).min()
+        s, t = rng.uniform(0.0, 1.0, 200), rng.uniform(0.0, 1.0, 200)
+        i, j = np.minimum((s * 4).astype(int), 3), np.minimum((t * 4).astype(int), 3)
+        a, b = (s * 4 - i)[:, None], (t * 4 - j)[:, None]
+        p00, p10, p01, p11 = mid[i, j], mid[i + 1, j], mid[i, j + 1], mid[i + 1, j + 1]
+        linear = np.where(a >= b, p00 + a * (p10 - p00) + b * (p11 - p10), p00 + b * (p01 - p00) + a * (p11 - p01))
+        assert np.linalg.norm(proxy._eval(pw, s, t) - linear, axis=1).max() < half
+
+
+@pytest.mark.gpu
+@pytest.mark.render
+def test_path_traced_shells_match_the_custom_nurbs_intersector(tmp_path, monkeypatch):
+    if not wp.is_cuda_available():
+        pytest.skip("CUDA device unavailable")
+    from warp_optix._src.pathtracing import scene as scene_module  # noqa: PLC0415
+    from warp_optix.pathtracing import PathTracer  # noqa: PLC0415
+
+    _write_nurbs_dome(tmp_path / "dome.usda")
+    results = []
+    original = scene_module.Brep.__init__
+    for shells in (True, False):
+
+        def init(self, *args, shells=shells, **kwargs):
+            kwargs["shells"] = shells
+            original(self, *args, **kwargs)
+
+        monkeypatch.setattr(scene_module.Brep, "__init__", init)
+        api = PathTracer(width=96, height=96, denoiser="none", enable_set=False, backface_culling=False)
+        api.initialize()
+        try:
+            assert api.scene.load_from_usd(str(tmp_path / "dome.usda"))
+            assert (api.scene.geometry_count == 2) == shells  # the BRep, plus its shells
+            api.build_scene()
+            api.set_environment_color((0.0, 0.0, 0.0))
+            api.set_camera_look_at((0.0, 1.6, 3.2), (0.0, 0.4, 0.0))
+            results.append(_silhouette(api))
+        finally:
+            api.close()
+    (shell_coverage, shell_x), (custom_coverage, custom_x) = results
+    assert shell_coverage > 0.05
+    assert abs(shell_coverage - custom_coverage) < 0.01 * custom_coverage
+    assert abs(shell_x - custom_x) < 0.5
+
+
+def _write_holed_plate(path):
+    """A planar face: the square [-1, 1]^2 in z = 0 with a square hole [-0.4, 0.4]^2, line edges."""
+    stage = Usd.Stage.CreateNew(str(path))
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+    UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+    prim = stage.DefinePrim("/Plate", "BrepArray")
+
+    def attr(name, type_name, value):
+        prim.CreateAttribute(name, type_name, custom=False, variability=Sdf.VariabilityUniform).Set(value)
+
+    t = Sdf.ValueTypeNames
+    outer = [(-1, -1), (1, -1), (1, 1), (-1, 1)]  # counterclockwise
+    hole = [(-0.4, -0.4), (-0.4, 0.4), (0.4, 0.4), (0.4, -0.4)]  # clockwise
+    starts, directions = [], []
+    for loop in (outer, hole):
+        for k, (x, y) in enumerate(loop):
+            nx, ny = loop[(k + 1) % 4]
+            starts.append(Gf.Vec3d(x, y, 0.0))
+            directions.append(Gf.Vec3d(nx - x, ny - y, 0.0))
+    attr("brep:extent", t.Double3Array, [Gf.Vec3d(-1, -1, 0), Gf.Vec3d(1, 1, 0)])
+    attr("brep:regionCount", t.UIntArray, [2])
+    attr("region:type", t.TokenArray, ["voidRegion", "solidRegion"])
+    attr("region:shellCount", t.UIntArray, [1, 1])
+    attr("shell:faceuseCount", t.UIntArray, [1, 1])
+    attr("faceuse:faceIndex", t.UIntArray, [0, 0])
+    attr("faceuse:orientationType", t.TokenArray, ["same", "opposite"])
+    attr("face:surfaceType", t.TokenArray, ["BrepSurfacePlaneAPI"])
+    attr("face:range", t.Double2Array, [Gf.Vec2d(-1.0, -1.0), Gf.Vec2d(1.0, 1.0)])
+    attr("brep:surface:plane:origin", t.Point3dArray, [Gf.Vec3d(0.0)])
+    attr("brep:surface:plane:axis", t.Vector3dArray, [Gf.Vec3d(0.0, 0.0, 1.0)])
+    attr("brep:surface:plane:refDirection", t.Vector3dArray, [Gf.Vec3d(1.0, 0.0, 0.0)])
+    attr("face:trimType", t.TokenArray, ["general"])
+    attr("face:loopCount", t.UIntArray, [2])
+    attr("loop:edgeuseCount", t.UIntArray, [4, 4])
+    attr("edgeuse:edgeIndex", t.UIntArray, list(range(8)))
+    attr("edgeuse:orientationType", t.TokenArray, ["same"] * 8)
+    attr("edge:curveType", t.TokenArray, ["BrepCurve3dLineAPI"] * 8)
+    attr("edge:range", t.DoubleArray, [0.0, 1.0] * 8)
+    attr("brep:edge3dLine:curve3d:line:origin", t.Point3dArray, starts)
+    attr("brep:edge3dLine:curve3d:line:direction", t.Vector3dArray, directions)
+    stage.GetRootLayer().Save()
+
+
+@pytest.mark.gpu
+@pytest.mark.render
+def test_micromapped_planes_match_the_exact_plane_intersector(tmp_path, monkeypatch):
+    if not wp.is_cuda_available():
+        pytest.skip("CUDA device unavailable")
+    from warp_optix._src.pathtracing import scene as scene_module  # noqa: PLC0415
+    from warp_optix.pathtracing import PathTracer  # noqa: PLC0415
+
+    _write_holed_plate(tmp_path / "plate.usda")
+    depths = []
+    original = scene_module.Brep.__init__
+    for planes in (True, False):
+
+        def init(self, *args, planes=planes, **kwargs):
+            kwargs["planes"] = planes
+            original(self, *args, **kwargs)
+
+        monkeypatch.setattr(scene_module.Brep, "__init__", init)
+        api = PathTracer(width=96, height=96, denoiser="none", enable_set=False, backface_culling=False)
+        api.initialize()
+        try:
+            assert api.scene.load_from_usd(str(tmp_path / "plate.usda"))
+            assert (api.scene.geometry_count == 2) == planes  # the BRep, plus its plane triangles
+            api.build_scene()
+            if planes:  # the hole's edges make the plate's triangles carry micromaps
+                assert api.scene._meshes[1].micromaps is not None
+            # Looking straight down (USD z-up becomes y-up) at the whole plate.
+            api.set_camera_look_at((0.0, 3.0, 0.001), (0.0, 0.0, 0.0))
+            api.render_frame()
+            wp.synchronize()
+            depths.append(api.linear_depth_output.numpy().copy())
+        finally:
+            api.close()
+    hit = [np.isfinite(d) & (d > 0) & (d < 100.0) for d in depths]
+    assert np.array_equal(hit[0], hit[1])
+    h, w = hit[0].shape
+    # Across the middle row: plate, hole, plate, with the hole 0.8 / 2 of the plate's width.
+    row = np.nonzero(hit[0][h // 2])[0]
+    plate = row[-1] - row[0] + 1
+    hole = plate - len(row)
+    assert not hit[0][h // 2, w // 2] and plate > w // 2
+    assert abs(hole / plate - 0.4) < 0.03
+    both = hit[0] & hit[1]
+    assert np.allclose(depths[0][both], depths[1][both], rtol=1e-4)

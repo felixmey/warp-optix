@@ -70,6 +70,8 @@ class Pipeline:
     :meth:`close` or ``with``. Device memory is freed in stream order, like
     ``wp.array``; the native OptiX objects are destroyed once the launches
     submitted before the release have finished.
+
+    Set ``opacity_micromaps=True`` when tracing triangles with ``OpacityMicromaps``.
     """
 
     def __init__(
@@ -88,6 +90,7 @@ class Pipeline:
         max_callable_depth: int = 1,
         graph_flags: TraversableGraphFlags = TraversableGraphFlags.ALLOW_ANY,
         motion_blur: bool = False,
+        opacity_micromaps: bool = False,
         max_registers: int = native.COMPILE_DEFAULT_MAX_REGISTER_COUNT,
         module_options: dict | None = None,
         device: wp.DeviceLike = None,
@@ -153,6 +156,7 @@ class Pipeline:
                 pipelineLaunchParamsVariableName="params",
                 usesPrimitiveTypeFlags=_primitive_flags(hit_groups),
             )
+            native.setAllowOpacityMicromaps(pipeline_options, opacity_micromaps)
             # OptiX accepts full debug information only without optimization.
             debug = (options["mode"] or wp.config.mode) == "debug"
             compile_options = native.ModuleCompileOptions(

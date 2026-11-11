@@ -40,6 +40,7 @@ from warp_optix._src.enums import InstanceFlags as InstanceFlags
 from warp_optix._src.enums import PrimitiveType as PrimitiveType
 from warp_optix._src.enums import RayFlags as RayFlags
 from warp_optix._src.enums import TraversableGraphFlags as TraversableGraphFlags
+from warp_optix._src.micromaps import OpacityMicromaps as OpacityMicromaps
 from warp_optix._src.pipeline import Launch as Launch
 from warp_optix._src.pipeline import Pipeline as Pipeline
 from warp_optix._src.pipeline import launch as launch
@@ -65,6 +66,7 @@ __all__ = [
     "Instance",
     "InstanceFlags",
     "Launch",
+    "OpacityMicromaps",
     "Pipeline",
     "PrimitiveType",
     "ProgramKind",

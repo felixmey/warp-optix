@@ -23,6 +23,7 @@ import warp as wp
 import warp_optix as wo
 from warp_optix._src.enums import RayFlags
 
+from ..brep import device as brep_device
 from .func_common import Mat16f, Vec6f
 
 # Ray types of the path tracer's SBT, in record order. Traces use these indices as their SBT
@@ -211,6 +212,13 @@ class DeviceCameraState:
     previous_aspect: wp.float32
 
 
+# instance_geometry_types: 0 triangles, 1 linear curves, 2 cubic Bezier curves, 3 BReps,
+# 4 BRep shells (triangles enclosing bicubic BRep patches, refined to the exact surface).
+GEOMETRY_TYPE_BREP = 3
+GEOMETRY_TYPE_BREP_SHELL = 4
+GEOMETRY_TYPE_BREP_PLANE = 5
+
+
 @wp.struct
 class PathtraceLaunchParams:
     tlas: wp.uint64
@@ -276,6 +284,8 @@ class PathtraceLaunchParams:
     packed_texcoords1: wp.array(dtype=wp.float32)
     packed_prev_positions: wp.array(dtype=wp.float32)
     packed_material_ids: wp.array(dtype=wp.uint32)
+    # BRep custom primitives (experimental); a BRep geometry's indices hold global primitive ids.
+    brep: brep_device.BrepData
     material_count: wp.uint32
     textures: wp.array(dtype=wp.Texture2D)
     texture_count: wp.uint32
@@ -416,7 +426,7 @@ def _compute_ray_origin(params: PathtraceLaunchParams) -> wp.vec3:
 
 
 # ---------------------------------------------------------------------------
-# Physical sky model â€” 1:1 translation of Newton sky_common.h
+# Physical sky model — 1:1 translation of Newton sky_common.h
 # ---------------------------------------------------------------------------
 
 
@@ -504,7 +514,7 @@ def _sky_calc_sun_color(sun_dir_z: wp.float32, turbidity: wp.float32) -> wp.vec3
 
 @wp.func
 def _sky_luminance(d: wp.vec3, sun_dir: wp.vec3, turbidity: wp.float32) -> wp.float32:
-    """skyLuminance (sky_common.h line 198) â€” recomputes its own clamped cosGamma."""
+    """skyLuminance (sky_common.h line 198) — recomputes its own clamped cosGamma."""
     cos_gamma = wp.clamp(wp.dot(sun_dir, d), 0.0, 1.0)
     gamma = wp.acos(cos_gamma)
     cos_theta = d[2]
@@ -527,7 +537,7 @@ def _sky_color_xyz(
     turbidity: wp.float32,
     luminance: wp.float32,
 ) -> wp.vec3:
-    """skyColorXyz (sky_common.h line 141) â€” takes full float3 vectors like C++."""
+    """skyColorXyz (sky_common.h line 141) — takes full float3 vectors like C++."""
     cos_gamma = wp.dot(sun_pos, d)
     if cos_gamma > 1.0:
         cos_gamma = 2.0 - cos_gamma
@@ -1675,7 +1685,7 @@ def _payload_get_barycentrics(p: PrimaryPayload) -> wp.vec3:
 MICROFACET_MIN_ROUGHNESS = 0.0014142
 
 # ---------------------------------------------------------------------------
-# GGX microfacet BSDF â€” 1:1 translation of Newton pbr_common.h
+# GGX microfacet BSDF — 1:1 translation of Newton pbr_common.h
 # ---------------------------------------------------------------------------
 
 BSDF_EVENT_ABSORB = 0
@@ -1842,6 +1852,17 @@ def _build_tangent_frame(n: wp.vec3) -> wp.mat33:
     t = wp.normalize(wp.cross(up, n))
     b = wp.cross(n, t)
     return wp.mat33(t[0], t[1], t[2], b[0], b[1], b[2], n[0], n[1], n[2])
+
+
+@wp.func
+def _direction_coherence(d: wp.vec3) -> wp.uint32:
+    """Coherence hint for a bounce ray: its direction octant and a 4x4 bin within it."""
+    a = wp.abs(d)
+    s = a[0] + a[1] + a[2] + 1.0e-30
+    u = wp.clamp(int(a[0] / s * 4.0), 0, 3)
+    v = wp.clamp(int(a[1] / s * 4.0), 0, 3)
+    octant = int(d[0] > 0.0) | (int(d[1] > 0.0) << 1) | (int(d[2] > 0.0) << 2)
+    return wp.uint32((octant << 4) | (u << 2) | v)
 
 
 @wp.func
@@ -2396,7 +2417,7 @@ def _bsdf_sample(
     return result
 
 
-# cosineSampleHemisphere (func_common.h line 428) â€” returns local tangent-space direction
+# cosineSampleHemisphere (func_common.h line 428) — returns local tangent-space direction
 @wp.func
 def _sample_cosine_hemisphere_local(r1: wp.float32, r2: wp.float32) -> wp.vec3:
     r = wp.sqrt(r1)
@@ -2787,176 +2808,34 @@ def _evaluate_material_from_payload(
 
 # The renderer enables fast math for every program through the pipeline's module options. This avoids the
 # precise sin/cos range reduction, which spills to local memory and uses fp64 instructions.
-@wo.kernel(kind=wo.ProgramKind.RAYGEN)
-@wp.kernel(module="unique")
-def primary_raygen(params: PathtraceLaunchParams):
-    launch_idx = wp.optix_get_launch_index()
-    x = int(launch_idx[0])
-    y = int(launch_idx[1])
+def _make_primary_raygen(reorder_bounces: bool):
+    """The raygen program; ``reorder_bounces`` reorders threads by bounce direction before tracing
+    bounce rays (shader execution reordering). That pays off when intersection programs dominate
+    (BReps: 1.6x on a dense assembly), but triangle-only scenes run 10-20% slower even with the
+    reorder skipped at runtime, so it is compiled into a separate variant.
+    """
 
-    width = int(params.width)
-    height = int(params.height)
-    if x >= width or y >= height:
-        return
+    @wo.kernel(kind=wo.ProgramKind.RAYGEN)
+    @wp.kernel(module="unique")
+    def primary_raygen(params: PathtraceLaunchParams):
+        launch_idx = wp.optix_get_launch_index()
+        x = int(launch_idx[0])
+        y = int(launch_idx[1])
 
-    rng = _xxhash32(wp.uint32(x), wp.uint32(y), params.frame_index)
+        width = int(params.width)
+        height = int(params.height)
+        if x >= width or y >= height:
+            return
 
-    ray_origin = _compute_ray_origin(params)
-    org_dir = _compute_ray_dir(params, x, y)
+        rng = _xxhash32(wp.uint32(x), wp.uint32(y), params.frame_index)
 
-    origin = ray_origin
-    direction = org_dir
+        ray_origin = _compute_ray_origin(params)
+        org_dir = _compute_ray_dir(params, x, y)
 
-    ray_flags = _backface_culling_ray_flag(params)
-    payload = _init_primary_payload()
-    wp.optix_trace(
-        params.tlas,
-        origin,
-        direction,
-        1.0e32,
-        payload,
-        0.01,
-        0.0,
-        wp.uint32(255),
-        ray_flags,
-        PRIMARY_RAY,
-        RAY_STRIDE,
-        PRIMARY_RAY,
-    )
+        origin = ray_origin
+        direction = org_dir
 
-    hitT = _payload_get_hitT(payload)
-    hit_sky = wp.bool(hitT >= MISS_DISTANCE)
-
-    # PSR state tracking (matches C++ psrMirror / psrHitDist / isPsr / psrThroughput / psrDirectRadiance).
-    is_psr = wp.bool(False)
-    psr_hit_dist = wp.float32(0.0)
-    found_opaque_hit = wp.bool(False)
-    psr_mirror = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
-    psr_throughput = wp.vec3(1.0, 1.0, 1.0)
-    psr_direct_radiance = wp.vec3(0.0, 0.0, 0.0)
-    hit_pos = wp.vec3(0.0, 0.0, 0.0)
-    hit_instance_id = wp.int32(-1)
-    hit_primitive_id = wp.uint32(0)
-    hit_barycentrics = wp.vec3(0.0, 0.0, 0.0)
-    pbr = _make_invalid_shaded_hit()
-
-    psr_depth = wp.int32(0)
-    max_psr_depth = wp.int32(5)
-    while psr_depth < max_psr_depth:
-        hitT = _payload_get_hitT(payload)
-        hit_sky = wp.bool(hitT >= MISS_DISTANCE)
-
-        if hit_sky:
-            sky_color = _payload_get_normal(payload)
-            psr_direct_radiance = psr_direct_radiance + _mul_vec3(psr_throughput, sky_color)
-            break
-
-        psr_hit_dist = psr_hit_dist + hitT
-
-        hit_normal = _payload_get_normal(payload)
-        hit_tangent = _payload_get_tangent(payload)
-        hit_uv = _payload_get_uv(payload)
-        hit_uv1 = _payload_get_uv1(payload)
-        hit_mat_id = wp.int32(_payload_get_materialId(payload))
-        hit_bsign = _payload_get_bitangentSign(payload)
-        hit_instance_id = _payload_get_instanceId(payload)
-        hit_primitive_id = _payload_get_primitiveId(payload)
-        hit_barycentrics = _payload_get_barycentrics(payload)
-        hit_pos = origin + direction * hitT
-
-        pbr = _evaluate_material_from_payload(
-            params,
-            hit_mat_id,
-            hit_normal,
-            hit_tangent,
-            hit_bsign,
-            hit_uv,
-            hit_uv1,
-            hit_barycentrics[0],
-        )
-        pbr = _set_incident_medium_for_hit(pbr, _payload_get_front_face(payload))
-
-        # C++ line 253: origin = offsetRay(hitPos, pbrMat.Ng) â€” use geometric normal
-        origin = _offset_ray(hit_pos, pbr.Ng)
-
-        # C++ lines 273-277: non-mirror surface check
-        use_psr = (params.flags & wp.uint32(2)) != wp.uint32(0)
-        is_mirror_surface = wp.bool(False)
-        if pbr.valid == wp.uint32(1) and use_psr:
-            is_mirror_surface = wp.bool(
-                pbr.roughness <= (MICROFACET_MIN_ROUGHNESS * MICROFACET_MIN_ROUGHNESS + 0.001) and pbr.metallic >= 1.0
-            )
-
-        if not is_mirror_surface or pbr.valid == wp.uint32(0):
-            found_opaque_hit = wp.bool(True)
-            break
-
-        # C++ lines 280-308: mirror hit â€” accumulate PSR chain
-        is_psr = wp.bool(True)
-        found_opaque_hit = wp.bool(True)
-        psr_direct_radiance = psr_direct_radiance + _mul_vec3(psr_throughput, pbr.color)
-
-        rng = _pcg_advance(rng)
-        psr_xi0 = _pcg_rand01(rng)
-        rng = _pcg_advance(rng)
-        psr_xi1 = _pcg_rand01(rng)
-        rng = _pcg_advance(rng)
-        psr_xi2 = _pcg_rand01(rng)
-        spec_sample = _bsdf_sample(
-            -direction,
-            pbr.normal,
-            pbr.Ng,
-            pbr.Nc,
-            pbr.T,
-            pbr.B,
-            pbr.diffuse,
-            pbr.transmission_color,
-            pbr.specular,
-            pbr.roughness,
-            pbr.metallic,
-            pbr.specular_scalar,
-            pbr.sheen_roughness,
-            pbr.sheen_color,
-            pbr.ior1,
-            pbr.ior2,
-            pbr.transmission,
-            pbr.diffuse_transmission_factor,
-            pbr.diffuse_transmission_color,
-            pbr.clearcoat,
-            pbr.clearcoat_roughness,
-            pbr.is_thin_walled,
-            psr_xi0,
-            psr_xi1,
-            psr_xi2,
-        )
-        if spec_sample.event_type != BSDF_EVENT_GLOSSY_REFLECTION:
-            break
-        bop = spec_sample.bsdf_over_pdf
-        if bop[0] != bop[0] or bop[1] != bop[1] or bop[2] != bop[2]:
-            break
-
-        psr_throughput = _mul_vec3(psr_throughput, bop)
-
-        n_psr = pbr.normal
-        nx = n_psr[0]
-        ny = n_psr[1]
-        nz = n_psr[2]
-        mirror = wp.mat33(
-            1.0 - 2.0 * nx * nx,
-            -2.0 * nx * ny,
-            -2.0 * nx * nz,
-            -2.0 * ny * nx,
-            1.0 - 2.0 * ny * ny,
-            -2.0 * ny * nz,
-            -2.0 * nz * nx,
-            -2.0 * nz * ny,
-            1.0 - 2.0 * nz * nz,
-        )
-        psr_mirror = psr_mirror * mirror
-
-        direction = wp.normalize(spec_sample.direction)
-        psr_depth = psr_depth + wp.int32(1)
-
+        ray_flags = _backface_culling_ray_flag(params)
         payload = _init_primary_payload()
         wp.optix_trace(
             params.tlas,
@@ -2973,132 +2852,382 @@ def primary_raygen(params: PathtraceLaunchParams):
             PRIMARY_RAY,
         )
 
-    # Virtual origin for PSR depth computation (matches C++ reference).
-    virtual_origin = ray_origin + org_dir * psr_hit_dist
-    view_depth = _compute_view_z(params.view, virtual_origin)
+        hitT = _payload_get_hitT(payload)
+        hit_sky = wp.bool(hitT >= MISS_DISTANCE)
 
-    # Render-guide defaults.
-    aux_view_z = wp.float32(MISS_DISTANCE)
-    aux_motion = wp.vec2(0.0, 0.0)
-    aux_normal_roughness = wp.vec4(0.0, 0.0, 0.0, 0.0)
-    aux_diffuse_albedo = wp.vec4(0.0, 0.0, 0.0, 0.0)
-    aux_specular_albedo = wp.vec4(0.0, 0.0, 0.0, 0.0)
-    aux_spec_hit_dist = wp.float32(0.0)
+        # PSR state tracking (matches C++ psrMirror / psrHitDist / isPsr / psrThroughput / psrDirectRadiance).
+        is_psr = wp.bool(False)
+        psr_hit_dist = wp.float32(0.0)
+        found_opaque_hit = wp.bool(False)
+        psr_mirror = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+        psr_throughput = wp.vec3(1.0, 1.0, 1.0)
+        psr_direct_radiance = wp.vec3(0.0, 0.0, 0.0)
+        hit_pos = wp.vec3(0.0, 0.0, 0.0)
+        hit_instance_id = wp.int32(-1)
+        hit_primitive_id = wp.uint32(0)
+        hit_barycentrics = wp.vec3(0.0, 0.0, 0.0)
+        pbr = _make_invalid_shaded_hit()
 
-    pixel_center = _compute_pixel_center(params, x, y)
-    dim = wp.vec2(wp.float32(width), wp.float32(height))
+        psr_depth = wp.int32(0)
+        max_psr_depth = wp.int32(5)
+        while psr_depth < max_psr_depth:
+            hitT = _payload_get_hitT(payload)
+            hit_sky = wp.bool(hitT >= MISS_DISTANCE)
 
-    # Sky hit path (matches C++ early-out for hitSky).
-    if hit_sky:
-        sky_guide = _reinhard_max(psr_direct_radiance)
-        aux_diffuse_albedo = wp.vec4(sky_guide[0], sky_guide[1], sky_guide[2], 0.0)
+            if hit_sky:
+                sky_color = _payload_get_normal(payload)
+                psr_direct_radiance = psr_direct_radiance + _mul_vec3(psr_throughput, sky_color)
+                break
 
+            psr_hit_dist = psr_hit_dist + hitT
+
+            hit_normal = _payload_get_normal(payload)
+            hit_tangent = _payload_get_tangent(payload)
+            hit_uv = _payload_get_uv(payload)
+            hit_uv1 = _payload_get_uv1(payload)
+            hit_mat_id = wp.int32(_payload_get_materialId(payload))
+            hit_bsign = _payload_get_bitangentSign(payload)
+            hit_instance_id = _payload_get_instanceId(payload)
+            hit_primitive_id = _payload_get_primitiveId(payload)
+            hit_barycentrics = _payload_get_barycentrics(payload)
+            hit_pos = origin + direction * hitT
+
+            pbr = _evaluate_material_from_payload(
+                params,
+                hit_mat_id,
+                hit_normal,
+                hit_tangent,
+                hit_bsign,
+                hit_uv,
+                hit_uv1,
+                hit_barycentrics[0],
+            )
+            pbr = _set_incident_medium_for_hit(pbr, _payload_get_front_face(payload))
+
+            # C++ line 253: origin = offsetRay(hitPos, pbrMat.Ng) — use geometric normal
+            origin = _offset_ray(hit_pos, pbr.Ng)
+
+            # C++ lines 273-277: non-mirror surface check
+            use_psr = (params.flags & wp.uint32(2)) != wp.uint32(0)
+            is_mirror_surface = wp.bool(False)
+            if pbr.valid == wp.uint32(1) and use_psr:
+                is_mirror_surface = wp.bool(
+                    pbr.roughness <= (MICROFACET_MIN_ROUGHNESS * MICROFACET_MIN_ROUGHNESS + 0.001)
+                    and pbr.metallic >= 1.0
+                )
+
+            if not is_mirror_surface or pbr.valid == wp.uint32(0):
+                found_opaque_hit = wp.bool(True)
+                break
+
+            # C++ lines 280-308: mirror hit — accumulate PSR chain
+            is_psr = wp.bool(True)
+            found_opaque_hit = wp.bool(True)
+            psr_direct_radiance = psr_direct_radiance + _mul_vec3(psr_throughput, pbr.color)
+
+            rng = _pcg_advance(rng)
+            psr_xi0 = _pcg_rand01(rng)
+            rng = _pcg_advance(rng)
+            psr_xi1 = _pcg_rand01(rng)
+            rng = _pcg_advance(rng)
+            psr_xi2 = _pcg_rand01(rng)
+            spec_sample = _bsdf_sample(
+                -direction,
+                pbr.normal,
+                pbr.Ng,
+                pbr.Nc,
+                pbr.T,
+                pbr.B,
+                pbr.diffuse,
+                pbr.transmission_color,
+                pbr.specular,
+                pbr.roughness,
+                pbr.metallic,
+                pbr.specular_scalar,
+                pbr.sheen_roughness,
+                pbr.sheen_color,
+                pbr.ior1,
+                pbr.ior2,
+                pbr.transmission,
+                pbr.diffuse_transmission_factor,
+                pbr.diffuse_transmission_color,
+                pbr.clearcoat,
+                pbr.clearcoat_roughness,
+                pbr.is_thin_walled,
+                psr_xi0,
+                psr_xi1,
+                psr_xi2,
+            )
+            if spec_sample.event_type != BSDF_EVENT_GLOSSY_REFLECTION:
+                break
+            bop = spec_sample.bsdf_over_pdf
+            if bop[0] != bop[0] or bop[1] != bop[1] or bop[2] != bop[2]:
+                break
+
+            psr_throughput = _mul_vec3(psr_throughput, bop)
+
+            n_psr = pbr.normal
+            nx = n_psr[0]
+            ny = n_psr[1]
+            nz = n_psr[2]
+            mirror = wp.mat33(
+                1.0 - 2.0 * nx * nx,
+                -2.0 * nx * ny,
+                -2.0 * nx * nz,
+                -2.0 * ny * nx,
+                1.0 - 2.0 * ny * ny,
+                -2.0 * ny * nz,
+                -2.0 * nz * nx,
+                -2.0 * nz * ny,
+                1.0 - 2.0 * nz * nz,
+            )
+            psr_mirror = psr_mirror * mirror
+
+            direction = wp.normalize(spec_sample.direction)
+            psr_depth = psr_depth + wp.int32(1)
+
+            payload = _init_primary_payload()
+            wp.optix_trace(
+                params.tlas,
+                origin,
+                direction,
+                1.0e32,
+                payload,
+                0.01,
+                0.0,
+                wp.uint32(255),
+                ray_flags,
+                PRIMARY_RAY,
+                RAY_STRIDE,
+                PRIMARY_RAY,
+            )
+
+        # Virtual origin for PSR depth computation (matches C++ reference).
+        virtual_origin = ray_origin + org_dir * psr_hit_dist
+        view_depth = _compute_view_z(params.view, virtual_origin)
+
+        # Render-guide defaults.
+        aux_view_z = wp.float32(MISS_DISTANCE)
+        aux_motion = wp.vec2(0.0, 0.0)
+        aux_normal_roughness = wp.vec4(0.0, 0.0, 0.0, 0.0)
+        aux_diffuse_albedo = wp.vec4(0.0, 0.0, 0.0, 0.0)
+        aux_specular_albedo = wp.vec4(0.0, 0.0, 0.0, 0.0)
+        aux_spec_hit_dist = wp.float32(0.0)
+
+        pixel_center = _compute_pixel_center(params, x, y)
+        dim = wp.vec2(wp.float32(width), wp.float32(height))
+
+        # Sky hit path (matches C++ early-out for hitSky).
+        if hit_sky:
+            sky_guide = _reinhard_max(psr_direct_radiance)
+            aux_diffuse_albedo = wp.vec4(sky_guide[0], sky_guide[1], sky_guide[2], 0.0)
+
+            if is_psr:
+                aux_view_z = view_depth
+                motion_origin = wp.vec4(virtual_origin[0], virtual_origin[1], virtual_origin[2], 1.0)
+            else:
+                aux_view_z = wp.float32(MISS_DISTANCE)
+                motion_origin = wp.vec4(org_dir[0], org_dir[1], org_dir[2], 0.0)
+            aux_motion = _compute_camera_motion_vector(params, pixel_center, motion_origin, dim)
+
+            params.color_output[y, x] = wp.vec4(
+                psr_direct_radiance[0], psr_direct_radiance[1], psr_direct_radiance[2], 1.0
+            )
+            params.normal_roughness_output[y, x] = aux_normal_roughness
+            params.motion_output[y, x] = aux_motion
+            params.depth_output[y, x] = aux_view_z
+            params.diffuse_output[y, x] = aux_diffuse_albedo
+            params.specular_output[y, x] = aux_specular_albedo
+            params.spec_hit_dist_output[y, x] = aux_spec_hit_dist
+            return
+
+        # No opaque hit found after PSR chain (matches C++ !foundOpaqueHit path).
+        if not found_opaque_hit:
+            params.color_output[y, x] = wp.vec4(
+                psr_direct_radiance[0], psr_direct_radiance[1], psr_direct_radiance[2], 1.0
+            )
+            params.normal_roughness_output[y, x] = wp.vec4(0.0, 0.0, 0.0, 0.0)
+            params.motion_output[y, x] = wp.vec2(0.0, 0.0)
+            params.depth_output[y, x] = wp.float32(MISS_DISTANCE)
+            params.diffuse_output[y, x] = wp.vec4(0.0, 0.0, 0.0, 0.0)
+            params.specular_output[y, x] = wp.vec4(0.0, 0.0, 0.0, 0.0)
+            params.spec_hit_dist_output[y, x] = wp.float32(0.0)
+            return
+
+        # The PSR traversal already evaluated the terminal surface. Reuse it here;
+        # evaluating again repeats every material texture fetch for every pixel.
+        pbr_mat = pbr
+
+        # Guides describe the first camera-visible surface. Background geometry
+        # behind moving glass has different motion and causes flowing history.
+        # Keep the glass surface's stable depth, normal, and object motion.
+        guide_pbr = pbr_mat
+        guide_hit_pos = hit_pos
+        guide_instance_id = hit_instance_id
+        guide_primitive_id = hit_primitive_id
+        guide_barycentrics = hit_barycentrics
+        guide_view_z = view_depth
+
+        aux_view_z = guide_view_z
+
+        # Normal/Roughness buffer - transform through PSR mirror chain.
+        world_normal = wp.normalize(psr_mirror * guide_pbr.normal)
+        aux_normal_roughness = wp.vec4(
+            world_normal[0],
+            world_normal[1],
+            world_normal[2],
+            wp.sqrt(wp.max(guide_pbr.roughness, 0.0)),
+        )
+
+        # Tint material by accumulated PSR mirror throughput (matches C++ lines 388-391).
+        base_color = _mul_vec3(pbr_mat.diffuse, psr_throughput)
+        guide_base_color = _mul_vec3(guide_pbr.diffuse, psr_throughput)
+        specular_color = _mul_vec3(pbr_mat.specular, psr_throughput)
+        emissive_tinted = _mul_vec3(pbr_mat.color, psr_throughput) + psr_direct_radiance
+
+        # Motion Vector Buffer (matches C++ reference behavior).
         if is_psr:
-            aux_view_z = view_depth
-            motion_origin = wp.vec4(virtual_origin[0], virtual_origin[1], virtual_origin[2], 1.0)
+            aux_motion = _compute_camera_motion_vector(
+                params,
+                pixel_center,
+                wp.vec4(virtual_origin[0], virtual_origin[1], virtual_origin[2], 1.0),
+                dim,
+            )
         else:
-            aux_view_z = wp.float32(MISS_DISTANCE)
-            motion_origin = wp.vec4(org_dir[0], org_dir[1], org_dir[2], 0.0)
-        aux_motion = _compute_camera_motion_vector(params, pixel_center, motion_origin, dim)
+            aux_motion = _compute_object_motion_vector(
+                params,
+                pixel_center,
+                guide_hit_pos,
+                guide_instance_id,
+                int(guide_primitive_id),
+                guide_barycentrics[1],
+                guide_barycentrics[2],
+                dim,
+            )
 
-        params.color_output[y, x] = wp.vec4(psr_direct_radiance[0], psr_direct_radiance[1], psr_direct_radiance[2], 1.0)
-        params.normal_roughness_output[y, x] = aux_normal_roughness
-        params.motion_output[y, x] = aux_motion
-        params.depth_output[y, x] = aux_view_z
-        params.diffuse_output[y, x] = aux_diffuse_albedo
-        params.specular_output[y, x] = aux_specular_albedo
-        params.spec_hit_dist_output[y, x] = aux_spec_hit_dist
-        return
-
-    # No opaque hit found after PSR chain (matches C++ !foundOpaqueHit path).
-    if not found_opaque_hit:
-        params.color_output[y, x] = wp.vec4(psr_direct_radiance[0], psr_direct_radiance[1], psr_direct_radiance[2], 1.0)
-        params.normal_roughness_output[y, x] = wp.vec4(0.0, 0.0, 0.0, 0.0)
-        params.motion_output[y, x] = wp.vec2(0.0, 0.0)
-        params.depth_output[y, x] = wp.float32(MISS_DISTANCE)
-        params.diffuse_output[y, x] = wp.vec4(0.0, 0.0, 0.0, 0.0)
-        params.specular_output[y, x] = wp.vec4(0.0, 0.0, 0.0, 0.0)
-        params.spec_hit_dist_output[y, x] = wp.float32(0.0)
-        return
-
-    # The PSR traversal already evaluated the terminal surface. Reuse it here;
-    # evaluating again repeats every material texture fetch for every pixel.
-    pbr_mat = pbr
-
-    # Guides describe the first camera-visible surface. Background geometry
-    # behind moving glass has different motion and causes flowing history.
-    # Keep the glass surface's stable depth, normal, and object motion.
-    guide_pbr = pbr_mat
-    guide_hit_pos = hit_pos
-    guide_instance_id = hit_instance_id
-    guide_primitive_id = hit_primitive_id
-    guide_barycentrics = hit_barycentrics
-    guide_view_z = view_depth
-
-    aux_view_z = guide_view_z
-
-    # Normal/Roughness buffer - transform through PSR mirror chain.
-    world_normal = wp.normalize(psr_mirror * guide_pbr.normal)
-    aux_normal_roughness = wp.vec4(
-        world_normal[0],
-        world_normal[1],
-        world_normal[2],
-        wp.sqrt(wp.max(guide_pbr.roughness, 0.0)),
-    )
-
-    # Tint material by accumulated PSR mirror throughput (matches C++ lines 388-391).
-    base_color = _mul_vec3(pbr_mat.diffuse, psr_throughput)
-    guide_base_color = _mul_vec3(guide_pbr.diffuse, psr_throughput)
-    specular_color = _mul_vec3(pbr_mat.specular, psr_throughput)
-    emissive_tinted = _mul_vec3(pbr_mat.color, psr_throughput) + psr_direct_radiance
-
-    # Motion Vector Buffer (matches C++ reference behavior).
-    if is_psr:
-        aux_motion = _compute_camera_motion_vector(
-            params,
-            pixel_center,
-            wp.vec4(virtual_origin[0], virtual_origin[1], virtual_origin[2], 1.0),
-            dim,
-        )
-    else:
-        aux_motion = _compute_object_motion_vector(
-            params,
-            pixel_center,
-            guide_hit_pos,
-            guide_instance_id,
-            int(guide_primitive_id),
-            guide_barycentrics[1],
-            guide_barycentrics[2],
-            dim,
+        # BaseColor/Metalness buffer (matches C++ auxDiffuseAlbedo = baseColor + metallic).
+        aux_diffuse_albedo = wp.vec4(
+            guide_base_color[0],
+            guide_base_color[1],
+            guide_base_color[2],
+            guide_pbr.metallic,
         )
 
-    # BaseColor/Metalness buffer (matches C++ auxDiffuseAlbedo = baseColor + metallic).
-    aux_diffuse_albedo = wp.vec4(
-        guide_base_color[0],
-        guide_base_color[1],
-        guide_base_color[2],
-        guide_pbr.metallic,
-    )
-
-    # Direct lighting at primary hit (Step 2 - matches C++ HdrContrib with GGX BSDF).
-    to_eye = -direction
-    # Omniverse's sceneDb ambient light is diffuse irradiance, separate from
-    # the environment/DomeLight. AO modulates it and metals have no diffuse
-    # lobe in the glTF metallic-roughness model.
-    hdr_radiance = _mul_vec3(base_color, params.ambient_light) * ((1.0 - pbr_mat.metallic) * pbr_mat.occlusion)
-    rng = _pcg_advance(rng)
-    xi0_l = _pcg_rand01(rng)
-    rng = _pcg_advance(rng)
-    xi1_l = _pcg_rand01(rng)
-    rng = _pcg_advance(rng)
-    xi2_l = _pcg_rand01(rng)
-    ls = _sample_environment_light(params, xi0_l, xi1_l, xi2_l)
-    if ls.pdf > 1.0e-6 and (wp.dot(ls.direction, pbr_mat.normal) > 0.0 or pbr_mat.transmission > 0.0):
+        # Direct lighting at primary hit (Step 2 - matches C++ HdrContrib with GGX BSDF).
+        to_eye = -direction
+        # Omniverse's sceneDb ambient light is diffuse irradiance, separate from
+        # the environment/DomeLight. AO modulates it and metals have no diffuse
+        # lobe in the glTF metallic-roughness model.
+        hdr_radiance = _mul_vec3(base_color, params.ambient_light) * ((1.0 - pbr_mat.metallic) * pbr_mat.occlusion)
         rng = _pcg_advance(rng)
-        eval_xi_z = _pcg_rand01(rng)
-        bsdf_eval = _bsdf_evaluate(
+        xi0_l = _pcg_rand01(rng)
+        rng = _pcg_advance(rng)
+        xi1_l = _pcg_rand01(rng)
+        rng = _pcg_advance(rng)
+        xi2_l = _pcg_rand01(rng)
+        ls = _sample_environment_light(params, xi0_l, xi1_l, xi2_l)
+        if ls.pdf > 1.0e-6 and (wp.dot(ls.direction, pbr_mat.normal) > 0.0 or pbr_mat.transmission > 0.0):
+            rng = _pcg_advance(rng)
+            eval_xi_z = _pcg_rand01(rng)
+            bsdf_eval = _bsdf_evaluate(
+                to_eye,
+                ls.direction,
+                pbr_mat.normal,
+                pbr_mat.Ng,
+                pbr_mat.Nc,
+                pbr_mat.T,
+                pbr_mat.B,
+                base_color,
+                pbr_mat.transmission_color,
+                specular_color,
+                pbr_mat.roughness,
+                pbr_mat.metallic,
+                pbr_mat.specular_scalar,
+                pbr_mat.sheen_roughness,
+                pbr_mat.sheen_color,
+                pbr_mat.ior1,
+                pbr_mat.ior2,
+                pbr_mat.transmission,
+                pbr_mat.diffuse_transmission_factor,
+                pbr_mat.diffuse_transmission_color,
+                pbr_mat.clearcoat,
+                pbr_mat.clearcoat_roughness,
+                pbr_mat.occlusion,
+                pbr_mat.is_thin_walled,
+                eval_xi_z,
+            )
+            if bsdf_eval.pdf > 1.0e-6:
+                shadow = ShadowPayload()
+                shadow.visible = wp.uint32(0)
+                shadow.seed = wp.uint32(0)
+                shadow_origin = _offset_ray(hit_pos, pbr_mat.Ng)
+                wp.optix_trace(
+                    params.tlas,
+                    shadow_origin,
+                    ls.direction,
+                    MISS_DISTANCE,
+                    shadow,
+                    0.001,
+                    0.0,
+                    wp.uint32(255),
+                    wp.uint32(
+                        wp.uint32(RayFlags.TERMINATE_ON_FIRST_HIT | RayFlags.DISABLE_CLOSESTHIT)
+                        | _backface_culling_ray_flag(params)
+                    ),
+                    SECONDARY_RAY,
+                    RAY_STRIDE,
+                    SECONDARY_RAY,
+                )
+                if shadow.visible == wp.uint32(1):
+                    mis_weight = _power_heuristic(ls.pdf, bsdf_eval.pdf)
+                    bsdf_sum = bsdf_eval.bsdf_diffuse + bsdf_eval.bsdf_glossy
+                    hdr_radiance = hdr_radiance + _mul_vec3(bsdf_sum, ls.radiance) * (mis_weight / ls.pdf)
+
+        rng = _pcg_advance(rng)
+        sphere_xi0 = _pcg_rand01(rng)
+        rng = _pcg_advance(rng)
+        sphere_xi1 = _pcg_rand01(rng)
+        rng = _pcg_advance(rng)
+        sphere_xi2 = _pcg_rand01(rng)
+        rng = _pcg_advance(rng)
+        sphere_lobe_xi = _pcg_rand01(rng)
+        hdr_radiance = hdr_radiance + _sample_sphere_light_contribution(
+            params,
+            hit_pos,
+            pbr_mat,
             to_eye,
-            ls.direction,
+            base_color,
+            specular_color,
+            sphere_xi0,
+            sphere_xi1,
+            sphere_xi2,
+            sphere_lobe_xi,
+        )
+
+        if (
+            hdr_radiance[0] != hdr_radiance[0]
+            or hdr_radiance[1] != hdr_radiance[1]
+            or hdr_radiance[2] != hdr_radiance[2]
+        ):
+            hdr_radiance = wp.vec3(0.0, 0.0, 0.0)
+
+        # directLum = psrDirectRadiance + pbrMat.emissive (matches C++ line 508, where
+        # pbrMat.emissive was already set to emissive*psrThroughput + psrDirectRadiance on line 391).
+        direct_lum = psr_direct_radiance + emissive_tinted
+
+        # Step 3 - Indirect contribution (path tracing from primary surface).
+        radiance = hdr_radiance
+        path_length = wp.float32(0.0)
+
+        # Step 3.1 - Sample BSDF direction using GGX VNDF.
+        rng = _pcg_advance(rng)
+        xi_bsdf0 = _pcg_rand01(rng)
+        rng = _pcg_advance(rng)
+        xi_bsdf1 = _pcg_rand01(rng)
+        rng = _pcg_advance(rng)
+        xi_bsdf2 = _pcg_rand01(rng)
+        bsdf_sample = _bsdf_sample(
+            to_eye,
             pbr_mat.normal,
             pbr_mat.Ng,
             pbr_mat.Nc,
@@ -3119,210 +3248,205 @@ def primary_raygen(params: PathtraceLaunchParams):
             pbr_mat.diffuse_transmission_color,
             pbr_mat.clearcoat,
             pbr_mat.clearcoat_roughness,
-            pbr_mat.occlusion,
             pbr_mat.is_thin_walled,
-            eval_xi_z,
+            xi_bsdf0,
+            xi_bsdf1,
+            xi_bsdf2,
         )
-        if bsdf_eval.pdf > 1.0e-6:
-            shadow = ShadowPayload()
-            shadow.visible = wp.uint32(0)
-            shadow.seed = wp.uint32(0)
-            shadow_origin = _offset_ray(hit_pos, pbr_mat.Ng)
+
+        # NaN/Inf guard on bsdf_over_pdf (matches C++ line 526-527).
+        bop0 = bsdf_sample.bsdf_over_pdf
+        if bop0[0] != bop0[0] or bop0[1] != bop0[1] or bop0[2] != bop0[2]:
+            bsdf_sample.event_type = BSDF_EVENT_ABSORB
+
+        sec_direction = bsdf_sample.direction
+        sec_throughput = bsdf_sample.bsdf_over_pdf
+        bsdf_pdf = wp.max(bsdf_sample.pdf, 0.0001)
+        sec_event_type = bsdf_sample.event_type
+        is_glossy_reflection = wp.bool(bsdf_sample.event_type == BSDF_EVENT_GLOSSY_REFLECTION)
+        bsdf_absorbed = wp.bool(bsdf_sample.event_type == BSDF_EVENT_ABSORB)
+
+        sec_origin = _offset_ray_for_direction(hit_pos, pbr_mat.Ng, sec_direction)
+        max_depth = wp.int32(params.max_bounces) if params.max_bounces > wp.uint32(0) else wp.int32(1)
+        depth = wp.int32(1)
+        use_path_reg = (params.flags & FLAGS_USE_PATH_REGULARIZATION) != wp.uint32(0)
+        max_roughness = float(0.0)  # noqa: UP018
+        while depth < max_depth:
+            if bsdf_absorbed:
+                break
+
+            sec_payload = _init_primary_payload()
+            if wp.static(reorder_bounces):
+                wp.optix_make_nop_hit_object()
+                wp.optix_reorder(_direction_coherence(sec_direction), wp.uint32(7))
             wp.optix_trace(
                 params.tlas,
-                shadow_origin,
-                ls.direction,
-                MISS_DISTANCE,
-                shadow,
+                sec_origin,
+                sec_direction,
+                1.0e16,
+                sec_payload,
                 0.001,
                 0.0,
                 wp.uint32(255),
-                wp.uint32(
-                    wp.uint32(RayFlags.TERMINATE_ON_FIRST_HIT | RayFlags.DISABLE_CLOSESTHIT)
-                    | _backface_culling_ray_flag(params)
-                ),
-                SECONDARY_RAY,
+                wp.uint32(0) if (sec_event_type & BSDF_EVENT_TRANSMISSION) != 0 else ray_flags,
+                PRIMARY_RAY,
                 RAY_STRIDE,
-                SECONDARY_RAY,
+                PRIMARY_RAY,
             )
-            if shadow.visible == wp.uint32(1):
-                mis_weight = _power_heuristic(ls.pdf, bsdf_eval.pdf)
-                bsdf_sum = bsdf_eval.bsdf_diffuse + bsdf_eval.bsdf_glossy
-                hdr_radiance = hdr_radiance + _mul_vec3(bsdf_sum, ls.radiance) * (mis_weight / ls.pdf)
 
-    rng = _pcg_advance(rng)
-    sphere_xi0 = _pcg_rand01(rng)
-    rng = _pcg_advance(rng)
-    sphere_xi1 = _pcg_rand01(rng)
-    rng = _pcg_advance(rng)
-    sphere_xi2 = _pcg_rand01(rng)
-    rng = _pcg_advance(rng)
-    sphere_lobe_xi = _pcg_rand01(rng)
-    hdr_radiance = hdr_radiance + _sample_sphere_light_contribution(
-        params,
-        hit_pos,
-        pbr_mat,
-        to_eye,
-        base_color,
-        specular_color,
-        sphere_xi0,
-        sphere_xi1,
-        sphere_xi2,
-        sphere_lobe_xi,
-    )
+            t_sec = _payload_get_hitT(sec_payload)
+            sphere_hit = _intersect_sphere_lights(params, sec_origin, sec_direction, t_sec)
+            if sphere_hit.pdf > 0.0:
+                sphere_mis = _power_heuristic(bsdf_pdf, sphere_hit.pdf)
+                radiance = radiance + _mul_vec3(sec_throughput, sphere_hit.radiance) * sphere_mis
+                break
 
-    if hdr_radiance[0] != hdr_radiance[0] or hdr_radiance[1] != hdr_radiance[1] or hdr_radiance[2] != hdr_radiance[2]:
-        hdr_radiance = wp.vec3(0.0, 0.0, 0.0)
+            miss = wp.bool(t_sec >= MISS_DISTANCE * 0.99)
 
-    # directLum = psrDirectRadiance + pbrMat.emissive (matches C++ line 508, where
-    # pbrMat.emissive was already set to emissive*psrThroughput + psrDirectRadiance on line 391).
-    direct_lum = psr_direct_radiance + emissive_tinted
+            if depth == 1 and is_glossy_reflection:
+                path_length = wp.abs(t_sec)
 
-    # Step 3 - Indirect contribution (path tracing from primary surface).
-    radiance = hdr_radiance
-    path_length = wp.float32(0.0)
+            if miss:
+                env_color = _sample_environment(params, sec_direction)
+                env_pdf = _environment_pdf_for_direction(params, sec_direction)
+                mis_weight = _power_heuristic(bsdf_pdf, wp.max(env_pdf, 0.0001))
+                if mis_weight != mis_weight:
+                    mis_weight = 0.0
+                radiance = radiance + _mul_vec3(sec_throughput, env_color) * mis_weight
+                break
 
-    # Step 3.1 - Sample BSDF direction using GGX VNDF.
-    rng = _pcg_advance(rng)
-    xi_bsdf0 = _pcg_rand01(rng)
-    rng = _pcg_advance(rng)
-    xi_bsdf1 = _pcg_rand01(rng)
-    rng = _pcg_advance(rng)
-    xi_bsdf2 = _pcg_rand01(rng)
-    bsdf_sample = _bsdf_sample(
-        to_eye,
-        pbr_mat.normal,
-        pbr_mat.Ng,
-        pbr_mat.Nc,
-        pbr_mat.T,
-        pbr_mat.B,
-        base_color,
-        pbr_mat.transmission_color,
-        specular_color,
-        pbr_mat.roughness,
-        pbr_mat.metallic,
-        pbr_mat.specular_scalar,
-        pbr_mat.sheen_roughness,
-        pbr_mat.sheen_color,
-        pbr_mat.ior1,
-        pbr_mat.ior2,
-        pbr_mat.transmission,
-        pbr_mat.diffuse_transmission_factor,
-        pbr_mat.diffuse_transmission_color,
-        pbr_mat.clearcoat,
-        pbr_mat.clearcoat_roughness,
-        pbr_mat.is_thin_walled,
-        xi_bsdf0,
-        xi_bsdf1,
-        xi_bsdf2,
-    )
+            sec_normal = wp.normalize(_payload_get_normal(sec_payload))
+            sec_tangent = _payload_get_tangent(sec_payload)
+            sec_uv = _payload_get_uv(sec_payload)
+            sec_uv1 = _payload_get_uv1(sec_payload)
+            sec_mat_id = wp.int32(_payload_get_materialId(sec_payload))
+            sec_bsign = _payload_get_bitangentSign(sec_payload)
 
-    # NaN/Inf guard on bsdf_over_pdf (matches C++ line 526-527).
-    bop0 = bsdf_sample.bsdf_over_pdf
-    if bop0[0] != bop0[0] or bop0[1] != bop0[1] or bop0[2] != bop0[2]:
-        bsdf_sample.event_type = BSDF_EVENT_ABSORB
+            sec_pbr = _evaluate_material_from_payload(
+                params,
+                sec_mat_id,
+                sec_normal,
+                sec_tangent,
+                sec_bsign,
+                sec_uv,
+                sec_uv1,
+                _payload_get_barycentrics(sec_payload)[0],
+            )
+            sec_pbr = _set_incident_medium_for_hit(sec_pbr, _payload_get_front_face(sec_payload))
 
-    sec_direction = bsdf_sample.direction
-    sec_throughput = bsdf_sample.bsdf_over_pdf
-    bsdf_pdf = wp.max(bsdf_sample.pdf, 0.0001)
-    sec_event_type = bsdf_sample.event_type
-    is_glossy_reflection = wp.bool(bsdf_sample.event_type == BSDF_EVENT_GLOSSY_REFLECTION)
-    bsdf_absorbed = wp.bool(bsdf_sample.event_type == BSDF_EVENT_ABSORB)
+            # C++ secondary_rchit.h lines 278-283: path regularization
+            if use_path_reg:
+                max_roughness = wp.max(sec_pbr.roughness, max_roughness)
+                sec_pbr.roughness = max_roughness
 
-    sec_origin = _offset_ray_for_direction(hit_pos, pbr_mat.Ng, sec_direction)
-    max_depth = wp.int32(params.max_bounces) if params.max_bounces > wp.uint32(0) else wp.int32(1)
-    depth = wp.int32(1)
-    use_path_reg = (params.flags & FLAGS_USE_PATH_REGULARIZATION) != wp.uint32(0)
-    max_roughness = float(0.0)  # noqa: UP018
-    while depth < max_depth:
-        if bsdf_absorbed:
-            break
+            sec_hit_pos = sec_origin + sec_direction * t_sec
+            radiance = radiance + _mul_vec3(sec_throughput, sec_pbr.color)
 
-        sec_payload = _init_primary_payload()
-        wp.optix_trace(
-            params.tlas,
-            sec_origin,
-            sec_direction,
-            1.0e16,
-            sec_payload,
-            0.001,
-            0.0,
-            wp.uint32(255),
-            wp.uint32(0) if (sec_event_type & BSDF_EVENT_TRANSMISSION) != 0 else ray_flags,
-            PRIMARY_RAY,
-            RAY_STRIDE,
-            PRIMARY_RAY,
-        )
+            sec_base_color = sec_pbr.diffuse
+            sec_specular_color = sec_pbr.specular
+            sec_to_eye = -sec_direction
 
-        t_sec = _payload_get_hitT(sec_payload)
-        sphere_hit = _intersect_sphere_lights(params, sec_origin, sec_direction, t_sec)
-        if sphere_hit.pdf > 0.0:
-            sphere_mis = _power_heuristic(bsdf_pdf, sphere_hit.pdf)
-            radiance = radiance + _mul_vec3(sec_throughput, sphere_hit.radiance) * sphere_mis
-            break
+            sec_ambient = _mul_vec3(sec_base_color, params.ambient_light) * (
+                (1.0 - sec_pbr.metallic) * sec_pbr.occlusion
+            )
+            radiance = radiance + _mul_vec3(sec_throughput, sec_ambient)
 
-        miss = wp.bool(t_sec >= MISS_DISTANCE * 0.99)
-
-        if depth == 1 and is_glossy_reflection:
-            path_length = wp.abs(t_sec)
-
-        if miss:
-            env_color = _sample_environment(params, sec_direction)
-            env_pdf = _environment_pdf_for_direction(params, sec_direction)
-            mis_weight = _power_heuristic(bsdf_pdf, wp.max(env_pdf, 0.0001))
-            if mis_weight != mis_weight:
-                mis_weight = 0.0
-            radiance = radiance + _mul_vec3(sec_throughput, env_color) * mis_weight
-            break
-
-        sec_normal = wp.normalize(_payload_get_normal(sec_payload))
-        sec_tangent = _payload_get_tangent(sec_payload)
-        sec_uv = _payload_get_uv(sec_payload)
-        sec_uv1 = _payload_get_uv1(sec_payload)
-        sec_mat_id = wp.int32(_payload_get_materialId(sec_payload))
-        sec_bsign = _payload_get_bitangentSign(sec_payload)
-
-        sec_pbr = _evaluate_material_from_payload(
-            params,
-            sec_mat_id,
-            sec_normal,
-            sec_tangent,
-            sec_bsign,
-            sec_uv,
-            sec_uv1,
-            _payload_get_barycentrics(sec_payload)[0],
-        )
-        sec_pbr = _set_incident_medium_for_hit(sec_pbr, _payload_get_front_face(sec_payload))
-
-        # C++ secondary_rchit.h lines 278-283: path regularization
-        if use_path_reg:
-            max_roughness = wp.max(sec_pbr.roughness, max_roughness)
-            sec_pbr.roughness = max_roughness
-
-        sec_hit_pos = sec_origin + sec_direction * t_sec
-        radiance = radiance + _mul_vec3(sec_throughput, sec_pbr.color)
-
-        sec_base_color = sec_pbr.diffuse
-        sec_specular_color = sec_pbr.specular
-        sec_to_eye = -sec_direction
-
-        sec_ambient = _mul_vec3(sec_base_color, params.ambient_light) * ((1.0 - sec_pbr.metallic) * sec_pbr.occlusion)
-        radiance = radiance + _mul_vec3(sec_throughput, sec_ambient)
-
-        # Direct lighting at secondary hit (GGX BSDF).
-        rng = _pcg_advance(rng)
-        xi0_s = _pcg_rand01(rng)
-        rng = _pcg_advance(rng)
-        xi1_s = _pcg_rand01(rng)
-        rng = _pcg_advance(rng)
-        xi2_s = _pcg_rand01(rng)
-        sec_ls = _sample_environment_light(params, xi0_s, xi1_s, xi2_s)
-        if sec_ls.pdf > 1.0e-6 and (wp.dot(sec_ls.direction, sec_pbr.normal) > 0.0 or sec_pbr.transmission > 0.0):
+            # Direct lighting at secondary hit (GGX BSDF).
             rng = _pcg_advance(rng)
-            sec_eval_xi_z = _pcg_rand01(rng)
-            sec_bsdf_eval = _bsdf_evaluate(
+            xi0_s = _pcg_rand01(rng)
+            rng = _pcg_advance(rng)
+            xi1_s = _pcg_rand01(rng)
+            rng = _pcg_advance(rng)
+            xi2_s = _pcg_rand01(rng)
+            sec_ls = _sample_environment_light(params, xi0_s, xi1_s, xi2_s)
+            if sec_ls.pdf > 1.0e-6 and (wp.dot(sec_ls.direction, sec_pbr.normal) > 0.0 or sec_pbr.transmission > 0.0):
+                rng = _pcg_advance(rng)
+                sec_eval_xi_z = _pcg_rand01(rng)
+                sec_bsdf_eval = _bsdf_evaluate(
+                    sec_to_eye,
+                    sec_ls.direction,
+                    sec_pbr.normal,
+                    sec_pbr.Ng,
+                    sec_pbr.Nc,
+                    sec_pbr.T,
+                    sec_pbr.B,
+                    sec_base_color,
+                    sec_pbr.transmission_color,
+                    sec_specular_color,
+                    sec_pbr.roughness,
+                    sec_pbr.metallic,
+                    sec_pbr.specular_scalar,
+                    sec_pbr.sheen_roughness,
+                    sec_pbr.sheen_color,
+                    sec_pbr.ior1,
+                    sec_pbr.ior2,
+                    sec_pbr.transmission,
+                    sec_pbr.diffuse_transmission_factor,
+                    sec_pbr.diffuse_transmission_color,
+                    sec_pbr.clearcoat,
+                    sec_pbr.clearcoat_roughness,
+                    sec_pbr.occlusion,
+                    sec_pbr.is_thin_walled,
+                    sec_eval_xi_z,
+                )
+                if sec_bsdf_eval.pdf > 1.0e-6:
+                    sec_shadow = ShadowPayload()
+                    sec_shadow.visible = wp.uint32(0)
+                    sec_shadow.seed = wp.uint32(0)
+                    wp.optix_trace(
+                        params.tlas,
+                        _offset_ray(sec_hit_pos, sec_pbr.Ng),
+                        sec_ls.direction,
+                        MISS_DISTANCE,
+                        sec_shadow,
+                        0.001,
+                        0.0,
+                        wp.uint32(255),
+                        wp.uint32(
+                            wp.uint32(RayFlags.TERMINATE_ON_FIRST_HIT | RayFlags.DISABLE_CLOSESTHIT)
+                            | _backface_culling_ray_flag(params)
+                        ),
+                        SECONDARY_RAY,
+                        RAY_STRIDE,
+                        SECONDARY_RAY,
+                    )
+                    if sec_shadow.visible == wp.uint32(1):
+                        sec_mis = _power_heuristic(sec_ls.pdf, sec_bsdf_eval.pdf)
+                        sec_bsdf_sum = sec_bsdf_eval.bsdf_diffuse + sec_bsdf_eval.bsdf_glossy
+                        sec_light_contrib = _mul_vec3(sec_bsdf_sum, sec_ls.radiance) * (sec_mis / sec_ls.pdf)
+                        radiance = radiance + _mul_vec3(sec_throughput, sec_light_contrib)
+
+            rng = _pcg_advance(rng)
+            sec_sphere_xi0 = _pcg_rand01(rng)
+            rng = _pcg_advance(rng)
+            sec_sphere_xi1 = _pcg_rand01(rng)
+            rng = _pcg_advance(rng)
+            sec_sphere_xi2 = _pcg_rand01(rng)
+            rng = _pcg_advance(rng)
+            sec_sphere_lobe_xi = _pcg_rand01(rng)
+            sec_sphere_contrib = _sample_sphere_light_contribution(
+                params,
+                sec_hit_pos,
+                sec_pbr,
                 sec_to_eye,
-                sec_ls.direction,
+                sec_base_color,
+                sec_specular_color,
+                sec_sphere_xi0,
+                sec_sphere_xi1,
+                sec_sphere_xi2,
+                sec_sphere_lobe_xi,
+            )
+            radiance = radiance + _mul_vec3(sec_throughput, sec_sphere_contrib)
+
+            # Sample next bounce direction (GGX VNDF).
+            rng = _pcg_advance(rng)
+            sxi0 = _pcg_rand01(rng)
+            rng = _pcg_advance(rng)
+            sxi1 = _pcg_rand01(rng)
+            rng = _pcg_advance(rng)
+            sxi2 = _pcg_rand01(rng)
+            sec_sample = _bsdf_sample(
+                sec_to_eye,
                 sec_pbr.normal,
                 sec_pbr.Ng,
                 sec_pbr.Nc,
@@ -3343,193 +3467,119 @@ def primary_raygen(params: PathtraceLaunchParams):
                 sec_pbr.diffuse_transmission_color,
                 sec_pbr.clearcoat,
                 sec_pbr.clearcoat_roughness,
-                sec_pbr.occlusion,
                 sec_pbr.is_thin_walled,
-                sec_eval_xi_z,
+                sxi0,
+                sxi1,
+                sxi2,
             )
-            if sec_bsdf_eval.pdf > 1.0e-6:
-                sec_shadow = ShadowPayload()
-                sec_shadow.visible = wp.uint32(0)
-                sec_shadow.seed = wp.uint32(0)
-                wp.optix_trace(
-                    params.tlas,
-                    _offset_ray(sec_hit_pos, sec_pbr.Ng),
-                    sec_ls.direction,
-                    MISS_DISTANCE,
-                    sec_shadow,
-                    0.001,
-                    0.0,
-                    wp.uint32(255),
-                    wp.uint32(
-                        wp.uint32(RayFlags.TERMINATE_ON_FIRST_HIT | RayFlags.DISABLE_CLOSESTHIT)
-                        | _backface_culling_ray_flag(params)
-                    ),
-                    SECONDARY_RAY,
-                    RAY_STRIDE,
-                    SECONDARY_RAY,
-                )
-                if sec_shadow.visible == wp.uint32(1):
-                    sec_mis = _power_heuristic(sec_ls.pdf, sec_bsdf_eval.pdf)
-                    sec_bsdf_sum = sec_bsdf_eval.bsdf_diffuse + sec_bsdf_eval.bsdf_glossy
-                    sec_light_contrib = _mul_vec3(sec_bsdf_sum, sec_ls.radiance) * (sec_mis / sec_ls.pdf)
-                    radiance = radiance + _mul_vec3(sec_throughput, sec_light_contrib)
 
-        rng = _pcg_advance(rng)
-        sec_sphere_xi0 = _pcg_rand01(rng)
-        rng = _pcg_advance(rng)
-        sec_sphere_xi1 = _pcg_rand01(rng)
-        rng = _pcg_advance(rng)
-        sec_sphere_xi2 = _pcg_rand01(rng)
-        rng = _pcg_advance(rng)
-        sec_sphere_lobe_xi = _pcg_rand01(rng)
-        sec_sphere_contrib = _sample_sphere_light_contribution(
-            params,
-            sec_hit_pos,
-            sec_pbr,
-            sec_to_eye,
-            sec_base_color,
-            sec_specular_color,
-            sec_sphere_xi0,
-            sec_sphere_xi1,
-            sec_sphere_xi2,
-            sec_sphere_lobe_xi,
-        )
-        radiance = radiance + _mul_vec3(sec_throughput, sec_sphere_contrib)
-
-        # Sample next bounce direction (GGX VNDF).
-        rng = _pcg_advance(rng)
-        sxi0 = _pcg_rand01(rng)
-        rng = _pcg_advance(rng)
-        sxi1 = _pcg_rand01(rng)
-        rng = _pcg_advance(rng)
-        sxi2 = _pcg_rand01(rng)
-        sec_sample = _bsdf_sample(
-            sec_to_eye,
-            sec_pbr.normal,
-            sec_pbr.Ng,
-            sec_pbr.Nc,
-            sec_pbr.T,
-            sec_pbr.B,
-            sec_base_color,
-            sec_pbr.transmission_color,
-            sec_specular_color,
-            sec_pbr.roughness,
-            sec_pbr.metallic,
-            sec_pbr.specular_scalar,
-            sec_pbr.sheen_roughness,
-            sec_pbr.sheen_color,
-            sec_pbr.ior1,
-            sec_pbr.ior2,
-            sec_pbr.transmission,
-            sec_pbr.diffuse_transmission_factor,
-            sec_pbr.diffuse_transmission_color,
-            sec_pbr.clearcoat,
-            sec_pbr.clearcoat_roughness,
-            sec_pbr.is_thin_walled,
-            sxi0,
-            sxi1,
-            sxi2,
-        )
-
-        # C++ lines 655-661: absorb or NaN/Inf guard on bsdf_over_pdf and throughput.
-        bop = sec_sample.bsdf_over_pdf
-        if sec_sample.event_type == BSDF_EVENT_ABSORB:
-            break
-        if bop[0] != bop[0] or bop[1] != bop[1] or bop[2] != bop[2]:
-            break
-        sec_throughput = _mul_vec3(sec_throughput, bop)
-        if (
-            sec_throughput[0] != sec_throughput[0]
-            or sec_throughput[1] != sec_throughput[1]
-            or sec_throughput[2] != sec_throughput[2]
-        ):
-            break
-
-        completed_thick_exit = wp.bool(
-            sec_pbr.is_thin_walled == 0
-            and _payload_get_front_face(sec_payload) == wp.uint32(0)
-            and (sec_sample.event_type & BSDF_EVENT_TRANSMISSION) != 0
-        )
-
-        # Russian roulette.
-        if depth >= int(params.russian_roulette_start_bounce) and not completed_thick_exit:
-            max_comp = wp.max(sec_throughput[0], wp.max(sec_throughput[1], sec_throughput[2]))
-            rr_prob = wp.clamp(wp.max(max_comp, 0.05), 0.05, 0.99)
-            rng = _pcg_advance(rng)
-            if _pcg_rand01(rng) > rr_prob:
+            # C++ lines 655-661: absorb or NaN/Inf guard on bsdf_over_pdf and throughput.
+            bop = sec_sample.bsdf_over_pdf
+            if sec_sample.event_type == BSDF_EVENT_ABSORB:
                 break
-            sec_throughput = sec_throughput / rr_prob
+            if bop[0] != bop[0] or bop[1] != bop[1] or bop[2] != bop[2]:
+                break
+            sec_throughput = _mul_vec3(sec_throughput, bop)
+            if (
+                sec_throughput[0] != sec_throughput[0]
+                or sec_throughput[1] != sec_throughput[1]
+                or sec_throughput[2] != sec_throughput[2]
+            ):
+                break
 
-        sec_origin = _offset_ray_for_direction(sec_hit_pos, sec_pbr.Ng, sec_sample.direction)
-        sec_direction = wp.normalize(sec_sample.direction)
-        sec_event_type = sec_sample.event_type
-        bsdf_pdf = wp.max(sec_sample.pdf, 0.0001)
-        if not completed_thick_exit:
-            depth = depth + wp.int32(1)
+            completed_thick_exit = wp.bool(
+                sec_pbr.is_thin_walled == 0
+                and _payload_get_front_face(sec_payload) == wp.uint32(0)
+                and (sec_sample.event_type & BSDF_EVENT_TRANSMISSION) != 0
+            )
 
-    # Normal-incidence specular reflectance for the debug output.
-    guide_f0 = _mul_vec3(
-        _material_f0(
-            guide_pbr.diffuse,
-            guide_pbr.specular,
-            guide_pbr.specular_scalar,
-            guide_pbr.metallic,
-            guide_pbr.ior1,
-            guide_pbr.ior2,
-            guide_pbr.clearcoat,
-        ),
-        psr_throughput,
-    )
-    aux_specular_albedo = wp.vec4(guide_f0[0], guide_f0[1], guide_f0[2], 0.0)
-    aux_spec_hit_dist = path_length
+            # Russian roulette.
+            if depth >= int(params.russian_roulette_start_bounce) and not completed_thick_exit:
+                max_comp = wp.max(sec_throughput[0], wp.max(sec_throughput[1], sec_throughput[2]))
+                rr_prob = wp.clamp(wp.max(max_comp, 0.05), 0.05, 0.99)
+                rng = _pcg_advance(rng)
+                if _pcg_rand01(rng) > rr_prob:
+                    break
+                sec_throughput = sec_throughput / rr_prob
 
-    # Guard against NaN/Inf (matches C++ lines 688-693).
-    if radiance[0] != radiance[0] or radiance[1] != radiance[1] or radiance[2] != radiance[2]:
-        radiance = wp.vec3(0.0, 0.0, 0.0)
-    if direct_lum[0] != direct_lum[0] or direct_lum[1] != direct_lum[1] or direct_lum[2] != direct_lum[2]:
-        direct_lum = wp.vec3(0.0, 0.0, 0.0)
-    color = radiance + direct_lum
+            sec_origin = _offset_ray_for_direction(sec_hit_pos, sec_pbr.Ng, sec_sample.direction)
+            sec_direction = wp.normalize(sec_sample.direction)
+            sec_event_type = sec_sample.event_type
+            bsdf_pdf = wp.max(sec_sample.pdf, 0.0001)
+            if not completed_thick_exit:
+                depth = depth + wp.int32(1)
 
-    # Debug visualization modes (matches C++ outputMode enums).
-    out_color = color
-    if params.output_mode == 2:  # DEPTH
-        depth_vis = 0.0 if aux_view_z >= MISS_DISTANCE else wp.exp(-0.075 * aux_view_z)
-        out_color = wp.vec3(depth_vis, depth_vis, depth_vis)
-    elif params.output_mode == 3:  # MOTION
-        out_color = wp.vec3(
-            wp.clamp(0.5 + aux_motion[0] * 8.0, 0.0, 1.0),
-            wp.clamp(0.5 + aux_motion[1] * 8.0, 0.0, 1.0),
-            0.0,
+        # Normal-incidence specular reflectance for the debug output.
+        guide_f0 = _mul_vec3(
+            _material_f0(
+                guide_pbr.diffuse,
+                guide_pbr.specular,
+                guide_pbr.specular_scalar,
+                guide_pbr.metallic,
+                guide_pbr.ior1,
+                guide_pbr.ior2,
+                guide_pbr.clearcoat,
+            ),
+            psr_throughput,
         )
-    elif params.output_mode == 4:  # NORMAL
-        out_color = wp.vec3(
-            0.5 * (world_normal[0] + 1.0),
-            0.5 * (world_normal[1] + 1.0),
-            0.5 * (world_normal[2] + 1.0),
-        )
-    elif params.output_mode == 5:  # ROUGHNESS
-        out_color = wp.vec3(aux_normal_roughness[3], aux_normal_roughness[3], aux_normal_roughness[3])
-    elif params.output_mode == 6:  # DIFFUSE
-        out_color = base_color
-    elif params.output_mode == 7:  # SPECULAR (viewer uses metallic visualization)
-        out_color = wp.vec3(pbr_mat.metallic, pbr_mat.metallic, pbr_mat.metallic)
-    elif params.output_mode == 8:  # SPEC_HITDIST
-        vis = 1.0 - wp.exp(-0.05 * wp.max(aux_spec_hit_dist, 0.0))
-        out_color = wp.vec3(vis, vis, vis)
+        aux_specular_albedo = wp.vec4(guide_f0[0], guide_f0[1], guide_f0[2], 0.0)
+        aux_spec_hit_dist = path_length
 
-    params.color_output[y, x] = wp.vec4(out_color[0], out_color[1], out_color[2], pbr_mat.opacity)
-    params.normal_roughness_output[y, x] = aux_normal_roughness
-    params.motion_output[y, x] = aux_motion
-    params.depth_output[y, x] = aux_view_z
-    params.diffuse_output[y, x] = aux_diffuse_albedo
-    params.specular_output[y, x] = aux_specular_albedo
-    params.spec_hit_dist_output[y, x] = aux_spec_hit_dist
+        # Guard against NaN/Inf (matches C++ lines 688-693).
+        if radiance[0] != radiance[0] or radiance[1] != radiance[1] or radiance[2] != radiance[2]:
+            radiance = wp.vec3(0.0, 0.0, 0.0)
+        if direct_lum[0] != direct_lum[0] or direct_lum[1] != direct_lum[1] or direct_lum[2] != direct_lum[2]:
+            direct_lum = wp.vec3(0.0, 0.0, 0.0)
+        color = radiance + direct_lum
+
+        # Debug visualization modes (matches C++ outputMode enums).
+        out_color = color
+        if params.output_mode == 2:  # DEPTH
+            depth_vis = 0.0 if aux_view_z >= MISS_DISTANCE else wp.exp(-0.075 * aux_view_z)
+            out_color = wp.vec3(depth_vis, depth_vis, depth_vis)
+        elif params.output_mode == 3:  # MOTION
+            out_color = wp.vec3(
+                wp.clamp(0.5 + aux_motion[0] * 8.0, 0.0, 1.0),
+                wp.clamp(0.5 + aux_motion[1] * 8.0, 0.0, 1.0),
+                0.0,
+            )
+        elif params.output_mode == 4:  # NORMAL
+            out_color = wp.vec3(
+                0.5 * (world_normal[0] + 1.0),
+                0.5 * (world_normal[1] + 1.0),
+                0.5 * (world_normal[2] + 1.0),
+            )
+        elif params.output_mode == 5:  # ROUGHNESS
+            out_color = wp.vec3(aux_normal_roughness[3], aux_normal_roughness[3], aux_normal_roughness[3])
+        elif params.output_mode == 6:  # DIFFUSE
+            out_color = base_color
+        elif params.output_mode == 7:  # SPECULAR (viewer uses metallic visualization)
+            out_color = wp.vec3(pbr_mat.metallic, pbr_mat.metallic, pbr_mat.metallic)
+        elif params.output_mode == 8:  # SPEC_HITDIST
+            vis = 1.0 - wp.exp(-0.05 * wp.max(aux_spec_hit_dist, 0.0))
+            out_color = wp.vec3(vis, vis, vis)
+
+        params.color_output[y, x] = wp.vec4(out_color[0], out_color[1], out_color[2], pbr_mat.opacity)
+        params.normal_roughness_output[y, x] = aux_normal_roughness
+        params.motion_output[y, x] = aux_motion
+        params.depth_output[y, x] = aux_view_z
+        params.diffuse_output[y, x] = aux_diffuse_albedo
+        params.specular_output[y, x] = aux_specular_albedo
+        params.spec_hit_dist_output[y, x] = aux_spec_hit_dist
+
+    return primary_raygen
+
+
+primary_raygen = _make_primary_raygen(False)
+primary_raygen_reorder = _make_primary_raygen(True)
 
 
 @wo.kernel(kind=wo.ProgramKind.MISS)
 @wp.kernel(module="unique")
 def primary_miss(params: PathtraceLaunchParams):
     """Miss shader: set hitT = MISS_DISTANCE and store sky color in normal/envRad fields."""
+    if wp.optix_uint32_as_float(wp.optix_get_payload(0)) < MISS_DISTANCE:
+        return  # a BRep shell any-hit recorded an exact hit (it is not accepted when it is an exit)
     rd = wp.normalize(wp.optix_get_world_ray_direction())
     sky = _sample_environment(params, rd)
     miss_payload = PrimaryMissPayload()
@@ -3836,6 +3886,11 @@ def _compute_any_hit_alpha(params: PathtraceLaunchParams) -> AnyHitAlphaResult:
     rp = render_primitives[render_prim_id]
     geometry_types = params.instance_geometry_types
     is_curve = geometry_types.shape[0] > 0 and geometry_types[inst_id] != wp.uint32(0)
+    is_brep = geometry_types.shape[0] > 0 and (
+        geometry_types[inst_id] == wp.uint32(GEOMETRY_TYPE_BREP)
+        or geometry_types[inst_id] == wp.uint32(GEOMETRY_TYPE_BREP_SHELL)
+        or geometry_types[inst_id] == wp.uint32(GEOMETRY_TYPE_BREP_PLANE)
+    )
     primitive_count = int(rp.num_indices) if is_curve else int(rp.num_indices) // 3
     if primitive_id < 0 or primitive_id >= primitive_count:
         return out
@@ -3852,6 +3907,15 @@ def _compute_any_hit_alpha(params: PathtraceLaunchParams) -> AnyHitAlphaResult:
 
     if mat.alpha_mode == wp.int32(0):
         out.alpha = 1.0
+        return out
+    if is_brep:  # no textures to sample: coverage is the material's own opacity
+        launch_index = wp.optix_get_launch_index()
+        pixel_frame_seed = _xxhash32(wp.uint32(launch_index[0]), wp.uint32(launch_index[1]), params.frame_index)
+        out.coverage_seed = _xxhash32(wp.uint32(inst_id), wp.uint32(primitive_id), pixel_frame_seed)
+        alpha = wp.clamp(mat.opacity, 0.0, 1.0)
+        if mat.alpha_mode == wp.int32(1):
+            alpha = 1.0 if alpha >= mat.alpha_cutoff else 0.0
+        out.alpha = alpha
         return out
 
     if is_curve:
@@ -3897,8 +3961,24 @@ def _store_primary_hit_payload(
     parameter_1: wp.float32,
 ):
     """Store the geometry-neutral payload consumed by the shared PBR raygen."""
+    # A BRep shell any-hit may already have recorded a nearer exact hit (see brep_shell_any_hit).
+    if wp.optix_uint32_as_float(wp.optix_get_payload(0)) < wp.optix_get_ray_tmax():
+        return
+    _write_primary_payload(geo, inst_id, primitive_id, front_face, parameter_0, parameter_1, wp.optix_get_ray_tmax())
+
+
+@wp.func
+def _write_primary_payload(
+    geo: HitGeometry,
+    inst_id: wp.int32,
+    primitive_id: wp.int32,
+    front_face: wp.uint32,
+    parameter_0: wp.float32,
+    parameter_1: wp.float32,
+    hit_t: wp.float32,
+):
     payload = PrimaryPayload()
-    payload.hit_t = wp.optix_get_ray_tmax()
+    payload.hit_t = hit_t
     payload.normal = geo.normal
     payload.tangent = geo.tangent
     payload.uv = geo.uv
@@ -3942,6 +4022,249 @@ def curve_primary_closest_hit(params: PathtraceLaunchParams):
 
 
 @wp.func
+def _brep_primitive(params: PathtraceLaunchParams, inst_id: int, primitive_id: int) -> int:
+    """Global BRep primitive id of the hit: BRep geometries store them as their indices."""
+    rp = params.render_primitives[int(params.instance_render_prim_ids[inst_id])]
+    return int(params.packed_indices[int(rp.index_offset) + primitive_id])
+
+
+@wo.kernel(kind=wo.ProgramKind.INTERSECTION)
+@wp.kernel(module="unique")
+def brep_intersection(params: PathtraceLaunchParams):
+    """Exact ray/BRep-face intersection (analytic surfaces, trimmed NURBS sub-patches)."""
+    prim = _brep_primitive(params, int(wp.optix_get_instance_id()), int(wp.optix_get_primitive_index()))
+    brep_device.intersect(params.brep, prim, wp.optix_get_object_ray_origin(), wp.optix_get_object_ray_direction())
+
+
+@wo.kernel(kind=wo.ProgramKind.CLOSEST_HIT)
+@wp.kernel(module="unique")
+def brep_primary_closest_hit(params: PathtraceLaunchParams):
+    """Adapt a BRep hit (attributes u, v, outward normal, face) to the shared PBR payload."""
+    inst_id = int(wp.optix_get_instance_id())
+    primitive_id = int(wp.optix_get_primitive_index())
+    u = wp.optix_uint32_as_float(wp.optix_get_attribute(0))
+    v = wp.optix_uint32_as_float(wp.optix_get_attribute(1))
+    n_obj = wp.vec3(
+        wp.optix_uint32_as_float(wp.optix_get_attribute(2)),
+        wp.optix_uint32_as_float(wp.optix_get_attribute(3)),
+        wp.optix_uint32_as_float(wp.optix_get_attribute(4)),
+    )
+    geo = HitGeometry()
+    geo.texture_lod = 0.0
+    geo.uv = wp.vec2(u, v)
+    geo.uv1 = geo.uv
+    geo.bitangent_sign = 1.0
+    outward = wp.normalize(wp.optix_transform_normal_object_to_world(n_obj))
+    direction = wp.normalize(wp.optix_get_world_ray_direction())
+    front_face = wp.uint32(1) if wp.dot(outward, direction) < 0.0 else wp.uint32(0)
+    # Face-forward against the view direction, like triangle hits.
+    geo.normal = outward
+    if wp.dot(geo.normal, direction) > 0.0:
+        geo.normal = -geo.normal
+    helper = wp.vec3(1.0, 0.0, 0.0)
+    if wp.abs(geo.normal[0]) > 0.9:
+        helper = wp.vec3(0.0, 1.0, 0.0)
+    geo.tangent = wp.normalize(wp.cross(helper, geo.normal))
+    render_prim_id = int(params.instance_render_prim_ids[inst_id])
+    rp = params.render_primitives[render_prim_id]
+    geo.material_id = _resolve_material_id(params, inst_id, render_prim_id, primitive_id, int(rp.num_indices))
+    _store_primary_hit_payload(geo, wp.int32(inst_id), wp.int32(primitive_id), front_face, u, v)
+
+
+@wp.func
+def _brep_shell_hit(
+    params: PathtraceLaunchParams, inst_id: int, primitive_id: int, origin: wp.vec3, direction: wp.vec3
+):
+    """Exact hit behind shell triangle ``primitive_id``: its render primitive's position offset
+    holds the geometry's first shell triangle in ``params.brep``."""
+    rp = params.render_primitives[int(params.instance_render_prim_ids[inst_id])]
+    tri = int(rp.vertex_buffer.position_offset) + primitive_id
+    return brep_device.proxy_hit(params.brep, tri, wp.optix_get_triangle_barycentrics(), origin, direction)
+
+
+@wo.kernel(kind=wo.ProgramKind.ANY_HIT)
+@wp.kernel(module="unique")
+def brep_shell_any_hit(params: PathtraceLaunchParams):
+    """Refine a shell crossing to the exact BRep surface and record the nearest exact hit.
+
+    OptiX orders candidates by the shell triangle's t, and a shell can reach in front of another
+    surface (thin walls). So the payload keeps the nearest exact hit, and only entries are
+    accepted (shrinking tmax): an exit may hide an entry in front of it, so traversal continues.
+    The miss and closest-hit programs keep a recorded hit that is nearer than theirs.
+    """
+    inst_id = int(wp.optix_get_instance_id())
+    primitive_id = int(wp.optix_get_primitive_index())
+    direction = wp.optix_get_object_ray_direction()
+    ok, hit_t, u, v, n_obj, face, exact = _brep_shell_hit(
+        params, inst_id, primitive_id, wp.optix_get_object_ray_origin(), direction
+    )
+    if not ok:
+        wp.optix_ignore_intersection()
+        return
+    alpha_hit = _compute_any_hit_alpha(params)
+    if alpha_hit.valid != wp.uint32(0) and alpha_hit.alpha < 0.999:
+        if alpha_hit.alpha <= 0.001 or _pcg_rand01(_any_hit_rng(alpha_hit.coverage_seed)) > alpha_hit.alpha:
+            wp.optix_ignore_intersection()
+            return
+    leaving = wp.dot(n_obj, direction) > 0.0
+    if hit_t < wp.optix_uint32_as_float(wp.optix_get_payload(0)):
+        world_direction = wp.normalize(wp.optix_get_world_ray_direction())
+        outward = wp.normalize(wp.optix_transform_normal_object_to_world(n_obj))
+        geo = HitGeometry()
+        geo.texture_lod = 0.0
+        geo.uv = wp.vec2(u, v)
+        geo.uv1 = geo.uv
+        geo.bitangent_sign = 1.0
+        geo.normal = outward
+        if wp.dot(geo.normal, world_direction) > 0.0:
+            geo.normal = -geo.normal
+        helper = wp.vec3(1.0, 0.0, 0.0)
+        if wp.abs(geo.normal[0]) > 0.9:
+            helper = wp.vec3(0.0, 1.0, 0.0)
+        geo.tangent = wp.normalize(wp.cross(helper, geo.normal))
+        render_prim_id = int(params.instance_render_prim_ids[inst_id])
+        rp = params.render_primitives[render_prim_id]
+        geo.material_id = _resolve_material_id(params, inst_id, render_prim_id, primitive_id, int(rp.num_indices))
+        front_face = wp.uint32(1) if wp.dot(outward, world_direction) < 0.0 else wp.uint32(0)
+        _write_primary_payload(geo, wp.int32(inst_id), wp.int32(primitive_id), front_face, u, v, hit_t)
+    if leaving and not exact:  # an exact (planar) hit is ordered correctly even as an exit
+        wp.optix_ignore_intersection()
+
+
+@wo.kernel(kind=wo.ProgramKind.CLOSEST_HIT)
+@wp.kernel(module="unique")
+def brep_shell_closest_hit(params: PathtraceLaunchParams):
+    """The shell any-hits already left the nearest exact hit in the payload."""
+    pass
+
+
+@wo.kernel(kind=wo.ProgramKind.ANY_HIT)
+@wp.kernel(module="unique")
+def brep_shell_secondary_any_hit(params: PathtraceLaunchParams):
+    """Shadow rays: occluded only where the ray really crosses the exact BRep surface."""
+    ok, hit_t, u, v, n_obj, face, exact = _brep_shell_hit(
+        params,
+        int(wp.optix_get_instance_id()),
+        int(wp.optix_get_primitive_index()),
+        wp.optix_get_object_ray_origin(),
+        wp.optix_get_object_ray_direction(),
+    )
+    if not ok:
+        wp.optix_ignore_intersection()
+        return
+    _secondary_any_hit(params)
+
+
+@wp.func
+def _brep_plane_uv(params: PathtraceLaunchParams, inst_id: int, primitive_id: int, origin: wp.vec3, direction: wp.vec3):
+    """Face and (u, v) of a BRep plane triangle's hit (object-space ray). The render primitive's
+    position offset holds the geometry's first plane triangle in ``params.brep``."""
+    rp = params.render_primitives[int(params.instance_render_prim_ids[inst_id])]
+    tri = int(rp.vertex_buffer.position_offset) + primitive_id
+    face = params.brep.prim_face[params.brep.proxy_prim[tri]]
+    rel = origin + wp.optix_get_ray_tmax() * direction - params.brep.face_origin[face]
+    return face, wp.dot(rel, params.brep.face_x[face]), wp.dot(rel, params.brep.face_y[face])
+
+
+@wp.func
+def _brep_plane_hit_inside(params: PathtraceLaunchParams) -> bool:
+    """Any-hit on a plane triangle: whether the hit lies inside its face's trims."""
+    face, u, v = _brep_plane_uv(
+        params,
+        int(wp.optix_get_instance_id()),
+        int(wp.optix_get_primitive_index()),
+        wp.optix_get_object_ray_origin(),
+        wp.optix_get_object_ray_direction(),
+    )
+    return brep_device.inside_trim(params.brep, face, u, v)
+
+
+@wo.kernel(kind=wo.ProgramKind.ANY_HIT)
+@wp.kernel(module="unique")
+def brep_plane_any_hit(params: PathtraceLaunchParams):
+    """Opaque materials, micro-triangles on a trim edge: the exact trim test only."""
+    if not _brep_plane_hit_inside(params):
+        wp.optix_ignore_intersection()
+
+
+@wo.kernel(kind=wo.ProgramKind.ANY_HIT)
+@wp.kernel(module="unique")
+def brep_plane_alpha_any_hit(params: PathtraceLaunchParams):
+    """Non-opaque materials, every hit: the exact trim test, then the material's coverage."""
+    if not _brep_plane_hit_inside(params):
+        wp.optix_ignore_intersection()
+        return
+    alpha_hit = _compute_any_hit_alpha(params)
+    if alpha_hit.valid != wp.uint32(0) and alpha_hit.alpha < 0.999:
+        if alpha_hit.alpha <= 0.001 or _pcg_rand01(_any_hit_rng(alpha_hit.coverage_seed)) > alpha_hit.alpha:
+            wp.optix_ignore_intersection()
+
+
+@wo.kernel(kind=wo.ProgramKind.ANY_HIT)
+@wp.kernel(module="unique")
+def brep_plane_secondary_any_hit(params: PathtraceLaunchParams):
+    """Shadow rays, opaque materials: occluded inside the face's trims."""
+    if not _brep_plane_hit_inside(params):
+        wp.optix_ignore_intersection()
+        return
+    payload = ShadowPayload()
+    wp.optix_load_payload(payload)
+    payload.visible = wp.uint32(0)
+    wp.optix_store_payload(payload)
+    wp.optix_terminate_ray()
+
+
+@wo.kernel(kind=wo.ProgramKind.ANY_HIT)
+@wp.kernel(module="unique")
+def brep_plane_alpha_secondary_any_hit(params: PathtraceLaunchParams):
+    """Shadow rays, non-opaque materials: inside the face's trims, blocked by its coverage."""
+    if not _brep_plane_hit_inside(params):
+        wp.optix_ignore_intersection()
+        return
+    _secondary_any_hit(params)
+
+
+@wo.kernel(kind=wo.ProgramKind.CLOSEST_HIT)
+@wp.kernel(module="unique")
+def brep_plane_closest_hit(params: PathtraceLaunchParams):
+    """Adapt a BRep plane triangle hit to the shared PBR payload, as an exact plane hit would."""
+    inst_id = int(wp.optix_get_instance_id())
+    primitive_id = int(wp.optix_get_primitive_index())
+    # Object-space ray queries are unavailable in closest-hit programs: transform the world ray.
+    # The hit is inside the trims already (micromap or any-hit): no trim test here.
+    world_direction = wp.optix_get_world_ray_direction()
+    face, u, v = _brep_plane_uv(
+        params,
+        inst_id,
+        primitive_id,
+        wp.optix_transform_point_world_to_object(wp.optix_get_world_ray_origin()),
+        wp.optix_transform_vector_world_to_object(world_direction),
+    )
+    n_obj = params.brep.face_axis[face]
+    if (params.brep.face_flags[face] & brep_device.FLAG_FLIP) != 0:
+        n_obj = -n_obj
+    geo = HitGeometry()
+    geo.texture_lod = 0.0
+    geo.uv = wp.vec2(u, v)
+    geo.uv1 = geo.uv
+    geo.bitangent_sign = 1.0
+    outward = wp.normalize(wp.optix_transform_normal_object_to_world(n_obj))
+    direction = wp.normalize(world_direction)
+    front_face = wp.uint32(1) if wp.dot(outward, direction) < 0.0 else wp.uint32(0)
+    geo.normal = outward
+    if wp.dot(geo.normal, direction) > 0.0:
+        geo.normal = -geo.normal
+    helper = wp.vec3(1.0, 0.0, 0.0)
+    if wp.abs(geo.normal[0]) > 0.9:
+        helper = wp.vec3(0.0, 1.0, 0.0)
+    geo.tangent = wp.normalize(wp.cross(helper, geo.normal))
+    render_prim_id = int(params.instance_render_prim_ids[inst_id])
+    rp = params.render_primitives[render_prim_id]
+    geo.material_id = _resolve_material_id(params, inst_id, render_prim_id, primitive_id, int(rp.num_indices))
+    _store_primary_hit_payload(geo, wp.int32(inst_id), wp.int32(primitive_id), front_face, u, v)
+
+
+@wp.func
 def _any_hit_rng(coverage_seed: wp.uint32) -> wp.uint32:
     return _pcg_advance(coverage_seed)
 
@@ -3981,6 +4304,11 @@ def secondary_closest_hit(params: PathtraceLaunchParams):
 @wo.kernel(kind=wo.ProgramKind.ANY_HIT)
 @wp.kernel(module="unique")
 def secondary_any_hit(params: PathtraceLaunchParams):
+    _secondary_any_hit(params)
+
+
+@wp.func
+def _secondary_any_hit(params: PathtraceLaunchParams):
     alpha_hit = _compute_any_hit_alpha(params)
     if alpha_hit.valid == wp.uint32(1):
         blocking = alpha_hit.alpha * (1.0 - alpha_hit.transmission)
@@ -4011,10 +4339,14 @@ DYNAMIC_BUILD_FLAGS = (
 )
 
 
-def _hit_groups(primary_closest_hit, builtin=None, build_flags=wo.BuildFlags.PREFER_FAST_TRACE):
+def _hit_groups(primary_closest_hit, builtin=None, build_flags=wo.BuildFlags.PREFER_FAST_TRACE, intersection=None):
     return {
-        "primary": wo.HitGroup(primary_closest_hit, primary_any_hit, builtin=builtin, build_flags=build_flags),
-        "secondary": wo.HitGroup(secondary_closest_hit, secondary_any_hit, builtin=builtin, build_flags=build_flags),
+        "primary": wo.HitGroup(
+            primary_closest_hit, primary_any_hit, intersection, builtin=builtin, build_flags=build_flags
+        ),
+        "secondary": wo.HitGroup(
+            secondary_closest_hit, secondary_any_hit, intersection, builtin=builtin, build_flags=build_flags
+        ),
     }
 
 
@@ -4034,5 +4366,20 @@ SBT = wo.SbtLayout(
         "round_cubic_bezier_dynamic": _hit_groups(
             curve_primary_closest_hit, wo.PrimitiveType.ROUND_CUBIC_BEZIER, DYNAMIC_BUILD_FLAGS
         ),
+        "brep": _hit_groups(brep_primary_closest_hit, intersection=brep_intersection),
+        "brep_shell": {
+            "primary": wo.HitGroup(brep_shell_closest_hit, brep_shell_any_hit),
+            "secondary": wo.HitGroup(secondary_closest_hit, brep_shell_secondary_any_hit),
+        },
+        # Any-hit of the coverage evaluation costs bounce rays up to 10% on a dense assembly even
+        # where unused, so opaque planes get the trim test alone.
+        "brep_plane": {
+            "primary": wo.HitGroup(brep_plane_closest_hit, brep_plane_any_hit),
+            "secondary": wo.HitGroup(secondary_closest_hit, brep_plane_secondary_any_hit),
+        },
+        "brep_plane_alpha": {
+            "primary": wo.HitGroup(brep_plane_closest_hit, brep_plane_alpha_any_hit),
+            "secondary": wo.HitGroup(secondary_closest_hit, brep_plane_alpha_secondary_any_hit),
+        },
     },
 )

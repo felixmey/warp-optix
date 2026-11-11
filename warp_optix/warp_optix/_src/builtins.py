@@ -233,6 +233,12 @@ def register_addon_builtins() -> None:
     invoke_doc = "Run the closest-hit or miss program of the current hit object, optionally with a payload."
     add("optix_invoke", input_types={}, value_type=None, doc=invoke_doc)
     add("optix_invoke", input_types={"payload": Any}, value_type=None, doc=invoke_doc)
+    add(
+        "optix_make_nop_hit_object",
+        input_types={},
+        value_type=None,
+        doc="Reset the hit object to a no-op, e.g. to reorder threads by a coherence hint before traversal.",
+    )
     reorder_doc = "Reorder threads by their hit objects (shader execution reordering), optionally with a hint."
     add("optix_reorder", input_types={}, value_type=None, doc=reorder_doc)
     add(
@@ -264,6 +270,14 @@ def register_addon_builtins() -> None:
 
 def builtin_names() -> list[str]:
     """Names of every registered builtin, for documentation and tests."""
-    names = [*_QUERIES, *_FUNCTIONS, "optix_trace", "optix_traverse", "optix_invoke", "optix_reorder"]
+    names = [
+        *_QUERIES,
+        *_FUNCTIONS,
+        "optix_trace",
+        "optix_traverse",
+        "optix_invoke",
+        "optix_reorder",
+        "optix_make_nop_hit_object",
+    ]
     names += ["optix_throw_exception", "optix_report_intersection", *(n for n, _, _ in _coop_vec_builtins())]
     return sorted(set(names), key=lambda n: [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", n)])
