@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #pragma once
 
-// PyOptiX 9.1.1 does not export native handles or a C API. These
+// PyOptiX 9.1.1 does not export native handles or a C API. These four
 // upstream wrapper definitions provide a deliberately version-pinned pybind11
 // bridge. No PyOptiX types are registered by our extension. At import we verify
 // the registered type identities, sizes, and binding ABI before accessing them.
@@ -11,11 +11,6 @@ namespace pyoptix {
 struct DeviceContext {
     OptixDeviceContext deviceContext = 0;
     py::object logCallbackFunction;
-};
-
-struct PipelineCompileOptions {
-    std::string pipelineLaunchParamsVariableName;
-    OptixPipelineCompileOptions options{};
 };
 
 struct ModuleCompileBoundValueEntry {
@@ -131,14 +126,6 @@ struct ModuleCompileOptions {
     std::vector<pyoptix::PayloadType> pypayloadTypes;
     std::vector<OptixPayloadType> payloadTypes;
 #endif
-};
-
-// Mirror of pyoptix's triangle build input: its build_input is copied into every accel build, so
-// fields pyoptix does not bind (opacityMicromap) can be written here before the build.
-struct BuildInputTriangleArray {
-    std::vector<unsigned int> flags;
-    std::vector<CUdeviceptr> vertexBuffers;
-    OptixBuildInputTriangleArray build_input{};
 };
 
 } // namespace pyoptix

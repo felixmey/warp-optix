@@ -25,7 +25,6 @@ from warp._src import context as _warp_context
 from warp_optix import config, native
 from warp_optix._src.context import CAPTURE_ERROR, resolve
 from warp_optix._src.enums import BuildFlags, GeometryFlags, PrimitiveType
-from warp_optix._src.micromaps import OpacityMicromaps
 
 # ---------------------------------------------------------------------------
 # Instances
@@ -203,8 +202,6 @@ def triangles(
     *,
     flags: GeometryFlags = GeometryFlags.DISABLE_ANYHIT,
     validate: bool = True,
-    opacity_micromaps: OpacityMicromaps | None = None,
-    micromap_indices: np.ndarray | None = None,
 ) -> BuildInput:
     """Triangle build input from ``vec3``/``float32[N, 3]`` points and int32/uint32 index triplets.
 
@@ -212,11 +209,6 @@ def triangles(
     input reads indices back once to validate bounds; pass ``validate=False``
     to skip that synchronization for indices already known to be in range. Keep
     indices unchanged while reusing the input for builds and refits.
-
-    ``opacity_micromaps`` attaches an :class:`OpacityMicromaps` array: triangle k uses micromap
-    ``micromap_indices[k]`` (an int32 host array; negative values are the predefined
-    ``INDEX_FULLY_*`` states), or micromap k without indices. Unknown micro-triangle states run
-    the any-hit program, so pass ``flags`` without ``DISABLE_ANYHIT`` for them.
     """
     keys = [points] if isinstance(points, wp.array) else list(points)
     num_vertices = _vertex_count(keys)
@@ -234,28 +226,7 @@ def triangles(
     build_input.indexBuffer = 0 if empty else indices.ptr
     build_input.flags = [int(flags)]
     build_input.numSbtRecords = 1
-    arrays = (*keys, indices)
-    if opacity_micromaps is not None and not empty:
-        triangle_count = build_input.numIndexTriplets
-        if micromap_indices is None:
-            if len(opacity_micromaps) != triangle_count:
-                raise ValueError("without micromap_indices, every triangle needs its own micromap")
-            mode, index_ptr, index_size = native.OPACITY_MICROMAP_ARRAY_INDEXING_MODE_LINEAR, 0, 0
-            host = None
-        else:
-            host = np.ascontiguousarray(micromap_indices, dtype=np.int32)
-            if host.shape != (triangle_count,):
-                raise ValueError("micromap_indices needs one int32 per triangle")
-            if host.size and (host.max() >= len(opacity_micromaps) or host.min() < -4):
-                raise ValueError("micromap_indices must reference micromaps or predefined states")
-            index_array = wp.array(host, dtype=wp.int32, device=keys[0].device)
-            arrays = (*arrays, index_array)
-            mode, index_ptr, index_size = native.OPACITY_MICROMAP_ARRAY_INDEXING_MODE_INDEXED, index_array.ptr, 4
-        native.setTriangleOpacityMicromap(
-            build_input, mode, opacity_micromaps.buffer.ptr, index_ptr, index_size, 0, 0, opacity_micromaps.usage(host)
-        )
-        arrays = (*arrays, opacity_micromaps.buffer)
-    return BuildInput(build_input, arrays)
+    return BuildInput(build_input, (*keys, indices))
 
 
 @wp.kernel(module="unique", enable_backward=False)

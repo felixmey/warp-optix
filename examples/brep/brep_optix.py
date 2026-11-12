@@ -18,9 +18,7 @@ from __future__ import annotations
 
 import numpy as np
 import warp as wp
-from warp_optix._src import micromaps as wo_micromaps
 from warp_optix._src.brep import device as bd
-from warp_optix._src.brep import planes as brep_planes
 from warp_optix._src.brep import proxy as brep_proxy
 from warp_optix._src.brep.loader import KIND_NAMES, BrepPrim
 
@@ -110,48 +108,6 @@ def proxy_any_hit(brep: BrepData):
 @wp.kernel(module="unique")
 def proxy_closest_hit():
     pass  # the any-hits left the nearest exact hit in the payload
-
-
-@wp.func
-def plane_hit(brep: BrepData):
-    """A planar face's triangle hit: its BRep primitive, (u, v) and the ray direction."""
-    tri = int(wp.optix_get_instance_id()) + int(wp.optix_get_primitive_index())
-    prim = brep.proxy_prim[tri]
-    # Object-space ray queries are unavailable in closest-hit programs: transform the world ray.
-    origin = wp.optix_transform_point_world_to_object(wp.optix_get_world_ray_origin())
-    direction = wp.optix_transform_vector_world_to_object(wp.optix_get_world_ray_direction())
-    rel = origin + wp.optix_get_ray_tmax() * direction - brep.prims[prim].origin
-    return prim, wp.dot(rel, brep.prims[prim].x), wp.dot(rel, brep.prims[prim].y), direction
-
-
-@wp.kernel(module="unique")
-def plane_any_hit(brep: BrepData):
-    """Unknown micro-triangles only: the exact trim test (opaque and transparent ones never get here)."""
-    prim, u, v, direction = plane_hit(brep)
-    inside, _u, _v = bd.accept_uv(brep, prim, u, v)
-    if not inside:
-        wp.optix_ignore_intersection()
-
-
-@wp.kernel(module="unique")
-def plane_closest_hit(brep: BrepData):
-    prim, u, v, direction = plane_hit(brep)
-    n = brep.prims[prim].axis
-    if (brep.prims[prim].flags & bd.FLAG_FLIP) != 0:
-        n = -n
-    payload = HitPayload()
-    payload.t = wp.optix_get_ray_tmax()
-    world_n = wp.normalize(wp.optix_transform_normal_object_to_world(n))
-    payload.nx = world_n[0]
-    payload.ny = world_n[1]
-    payload.nz = world_n[2]
-    payload.face = brep.prims[prim].face
-    payload.inside = wp.int32(0)
-    if wp.dot(n, direction) > 0.0 and (brep.prims[prim].flags & bd.FLAG_SOLID) != 0:
-        payload.inside = wp.int32(1)
-    payload.u = u
-    payload.v = v
-    wp.optix_store_payload(payload)
 
 
 INTERSECTORS = (isect_quadric, isect_quadric, isect_quadric, isect_quadric, isect_torus, isect_nurbs)
@@ -277,9 +233,8 @@ def _array(values, dtype, device):
 class BrepScene:
     """GPU scene: one custom-primitive GAS per BrepArray prim, instanced with its USD transform."""
 
-    def __init__(self, prims: list[BrepPrim], device=None, proxy: bool = False, micromaps: bool = False):
-        """``proxy``: trace bicubic NURBS patches through triangle shells (hardware traversal).
-        ``micromaps``: trace planar faces as triangles with opacity micromaps of their trims."""
+    def __init__(self, prims: list[BrepPrim], device=None, proxy: bool = False):
+        """``proxy``: trace bicubic NURBS patches through triangle shells (hardware traversal)."""
         self.device = wp.get_device(device)
         dev = self.device
         # Placements of one prototype share its arrays: pack and build each prototype once.
@@ -298,28 +253,14 @@ class BrepScene:
             for name, fn in zip(KIND_NAMES, INTERSECTORS)
         }
         hit_groups["proxy"] = wo.HitGroup(closest_hit=proxy_closest_hit, any_hit=proxy_any_hit)
-        hit_groups["plane_triangles"] = wo.HitGroup(closest_hit=plane_closest_hit, any_hit=plane_any_hit)
         sbt = wo.SbtLayout(miss=miss, hit_groups=hit_groups)
         proxy_offset = sbt.get_sbt_offset("proxy")
-        plane_offset = sbt.get_sbt_offset("plane_triangles")
-        planes = [brep_planes.plane_triangles(p) for p in prototypes] if micromaps else None
-        self.micromap_bytes = 0
-        if micromaps:
-            # Plane triangles (two per plane) are numbered after any shell triangles; proxy_prim maps
-            # them to their primitives.
-            first = len(self.data.proxy_prim) if proxy else 0
-            plane_bases = (first + np.cumsum([0] + [len(t.indices) for t in planes])[:-1]).tolist()
-            plane_prims = [np.repeat(t.prims, 2) + bases[n] for n, t in enumerate(planes)]
-            existing = [self.data.proxy_prim.numpy()] if proxy else []
-            self.data.proxy_prim = _array(np.concatenate(existing + plane_prims).astype(np.int32), wp.int32, dev)
         self.gases, self.buffers = [], []
         gas_records = []  # per prototype: (aabb gas, prim base, triangle gas or None, triangle base)
         for n, prototype in enumerate(prototypes):
             bounds = prototype.prim_bounds.astype(np.float32).reshape(-1, 6).copy()
             if proxy:
                 bounds[proxies[n].patches] = np.nan  # inactive: these patches use their shells
-            if micromaps:
-                bounds[planes[n].prims] = np.nan  # inactive: these faces use their triangles
             gas_bounds = _array(bounds, wp.float32, dev)
             kinds = _array(prototype.prim_kind.astype(np.uint32), wp.uint32, dev)
             flags = [wo.GeometryFlags.DISABLE_ANYHIT] * len(KIND_NAMES)
@@ -332,41 +273,13 @@ class BrepScene:
                 self.buffers += [pts, idx]
                 tris = wo.Accel([wo.triangles(pts, idx, flags=wo.GeometryFlags.NONE)], compact=True, device=dev)
                 self.gases.append(tris)
-            plane_gas = None
-            if micromaps and len(planes[n].indices):
-                t = planes[n]
-                pts = _array(t.points, wp.vec3, dev)
-                idx = _array(t.indices.ravel(), wp.uint32, dev)
-                self.buffers += [pts, idx]
-                if np.all(t.micromap_indices == wo_micromaps.INDEX_FULLY_OPAQUE):
-                    # untrimmed planes only: plain opaque triangles
-                    build = wo.triangles(pts, idx, flags=wo.GeometryFlags.DISABLE_ANYHIT)
-                else:
-                    # indexed micromaps need an array even when every triangle uses a predefined state
-                    states = t.states or [np.array([wo_micromaps.UNKNOWN_OPAQUE], np.uint8)]
-                    maps = wo.OpacityMicromaps(states, device=dev)
-                    self.buffers.append(maps)
-                    self.micromap_bytes += maps.buffer.size
-                    build = wo.triangles(
-                        pts,
-                        idx,
-                        flags=wo.GeometryFlags.NONE,
-                        opacity_micromaps=maps,
-                        micromap_indices=t.micromap_indices,
-                    )
-                plane_gas = wo.Accel([build], compact=True, device=dev)
-                self.gases.append(plane_gas)
-            gas_records.append(
-                (aabb, bases[n], tris, tri_bases[n] if proxy else 0, plane_gas, plane_bases[n] if micromaps else 0)
-            )
+            gas_records.append((aabb, bases[n], tris, tri_bases[n] if proxy else 0))
         records = []  # (world, gas, instance id base, sbt offset)
         for p in prims:
-            aabb, base, tris, tri_base, plane_gas, plane_base = gas_records[unique[id(p.face_kind)]]
+            aabb, base, tris, tri_base = gas_records[unique[id(p.face_kind)]]
             records.append((p.world, aabb, base, 0))
             if tris is not None:
                 records.append((p.world, tris, tri_base, proxy_offset))
-            if plane_gas is not None:
-                records.append((p.world, plane_gas, plane_base, plane_offset))
         self.instances = wp.empty(len(records), dtype=wo.Instance, device=dev)
         mats = _array(np.array([r[0] for r in records], dtype=np.float32), wp.mat44, dev)
         ids = _array(np.array([r[1].id for r in records], dtype=np.uint64), wp.uint64, dev)
@@ -380,12 +293,11 @@ class BrepScene:
             payload_words=8,
             attribute_words=bd.ATTRIBUTE_WORDS,
             graph_flags=wo.TraversableGraphFlags.ALLOW_SINGLE_LEVEL_INSTANCING,
-            opacity_micromaps=micromaps,
             device=dev,
         )
 
     def accel_bytes(self) -> int:
-        return sum(g._buffer.size for g in self.gases) + self.ias._buffer.size + self.micromap_bytes
+        return sum(g._buffer.size for g in self.gases) + self.ias._buffer.size
 
     def data_bytes(self) -> int:
         return sum(getattr(self.data, k).capacity for k in BrepData.vars)
