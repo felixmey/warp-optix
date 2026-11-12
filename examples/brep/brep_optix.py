@@ -128,7 +128,7 @@ def plane_hit(brep: BrepData):
 def plane_any_hit(brep: BrepData):
     """Unknown micro-triangles only: the exact trim test (opaque and transparent ones never get here)."""
     prim, u, v, direction = plane_hit(brep)
-    inside, uw, vw = bd.accept_uv(brep, prim, u, v)
+    inside, _u, _v = bd.accept_uv(brep, prim, u, v)
     if not inside:
         wp.optix_ignore_intersection()
 
@@ -303,6 +303,7 @@ class BrepScene:
         proxy_offset = sbt.get_sbt_offset("proxy")
         plane_offset = sbt.get_sbt_offset("plane_triangles")
         planes = [brep_planes.plane_triangles(p) for p in prototypes] if micromaps else None
+        self.micromap_bytes = 0
         if micromaps:
             # Plane triangles (two per plane) are numbered after any shell triangles; proxy_prim maps
             # them to their primitives.
@@ -311,7 +312,6 @@ class BrepScene:
             plane_prims = [np.repeat(t.prims, 2) + bases[n] for n, t in enumerate(planes)]
             existing = [self.data.proxy_prim.numpy()] if proxy else []
             self.data.proxy_prim = _array(np.concatenate(existing + plane_prims).astype(np.int32), wp.int32, dev)
-            self.micromap_bytes = 0
         self.gases, self.buffers = [], []
         gas_records = []  # per prototype: (aabb gas, prim base, triangle gas or None, triangle base)
         for n, prototype in enumerate(prototypes):
@@ -385,7 +385,7 @@ class BrepScene:
         )
 
     def accel_bytes(self) -> int:
-        return sum(g._buffer.size for g in self.gases) + self.ias._buffer.size
+        return sum(g._buffer.size for g in self.gases) + self.ias._buffer.size + self.micromap_bytes
 
     def data_bytes(self) -> int:
         return sum(getattr(self.data, k).capacity for k in BrepData.vars)
@@ -501,13 +501,6 @@ def orbit_camera(target, distance, azimuth, elevation, width, height, up="Z", fo
 def frame_distance(lo: np.ndarray, hi: np.ndarray, fov=35.0) -> float:
     """Orbit distance at which the bounding sphere of [lo, hi] fills the view."""
     return 0.5 * float(np.linalg.norm(hi - lo)) / np.tan(np.radians(fov) * 0.5) * 1.05
-
-
-def make_camera(
-    lo: np.ndarray, hi: np.ndarray, width: int, height: int, azimuth=35.0, elevation=30.0, up="Z", fov=35.0
-):
-    center = 0.5 * (lo + hi)
-    return orbit_camera(center, frame_distance(lo, hi, fov), azimuth, elevation, width, height, up, fov)[0]
 
 
 @wp.func

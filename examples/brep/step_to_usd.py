@@ -27,7 +27,9 @@ renderer in this directory reads, in the omniSolid schema's conventions:
   the face range and pcurves;
 - B-spline and Bezier faces keep their parameterization and pcurves; other surfaces (revolution,
   extrusion, offset) become NURBS without pcurves, since conversion may reparameterize them; the
-  reader then projects the 3D edges instead.
+  reader then projects the 3D edges instead;
+- faces of the part's solids bound one solid region (the reader's "inside" side); faces of open
+  shells or bare faces are sheets, with the void region on both sides.
 
 This is a minimal writer for rendering experiments: edges are shared per part, but the radial
 edgeuse ordering is not computed, so the result is not meant for modeling kernels.
@@ -56,7 +58,7 @@ from OCP.STEPCAFControl import STEPCAFControl_Reader
 from OCP.TCollection import TCollection_AsciiString, TCollection_ExtendedString
 from OCP.TDF import TDF_Label, TDF_Tool
 from OCP.TDocStd import TDocStd_Document
-from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_REVERSED, TopAbs_VERTEX, TopAbs_WIRE
+from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_REVERSED, TopAbs_SOLID, TopAbs_VERTEX, TopAbs_WIRE
 from OCP.TopExp import TopExp, TopExp_Explorer
 from OCP.TopLoc import TopLoc_Location
 from OCP.TopoDS import TopoDS
@@ -107,6 +109,13 @@ class PartWriter:
         TopExp.MapShapes_s(shape, TopAbs_VERTEX, self.vertices)
         self.a = defaultdict(list)
         self.written_edges = set()
+        # Faces of the part's solids bound its solid region; other faces (open shells, bare faces)
+        # are sheets, with void on both sides.
+        self.solid_faces = TopTools_IndexedMapOfShape()
+        ex = TopExp_Explorer(shape, TopAbs_SOLID)
+        while ex.More():
+            TopExp.MapShapes_s(ex.Current(), TopAbs_FACE, self.solid_faces)
+            ex.Next()
 
     def surface(self, face):
         """Append the face's surface; returns (affine (su, sv), flips normal, pcurves usable) or None."""
@@ -204,6 +213,7 @@ class PartWriter:
         a["face:range"] += [(u[0], v[0]), (u[1], v[1])]
         # Outward = the face's normal; it is the schema surface normal unless one of these flips.
         a["flip"].append((face.Orientation() == TopAbs_REVERSED) != native_flip)
+        a["solid"].append(self.solid_faces.Contains(face))
         outer = BRepTools.OuterWire_s(face)
         wires = [outer]
         ex = TopExp_Explorer(face, TopAbs_WIRE)
@@ -252,17 +262,27 @@ class PartWriter:
         lo, hi = np.min(points, axis=0), np.max(points, axis=0)
         attr("brep:extent", t.Double3Array, Vt.Vec3dArray([Gf.Vec3d(*lo), Gf.Vec3d(*hi)]))
         attr("brep:intersectTol3d", t.DoubleArray, [1.0e-6 * float(np.linalg.norm(hi - lo) + 1.0)])
-        attr("brep:regionCount", t.UIntArray, [2])
-        attr("region:type", t.TokenArray, ["voidRegion", "solidRegion"])
-        attr("region:shellCount", t.UIntArray, [1, 1])
-        attr("shell:faceuseCount", t.UIntArray, [nfaces, nfaces])
-        attr("shell:wireEdgeCount", t.UIntArray, [0, 0])
-        attr("shell:pointType", t.TokenArray, ["none", "none"])
-        attr("faceuse:faceIndex", t.UIntArray, list(range(nfaces)) * 2)
-        # The void region's faceuse sees the outward side.
-        void = ["opposite" if f else "same" for f in a["flip"]]
-        solid = ["same" if f else "opposite" for f in a["flip"]]
-        attr("faceuse:orientationType", t.TokenArray, void + solid)
+        # The void region sees every face's outward side, and both sides of a sheet; the solid
+        # region (when the part has solids) the inward side of their faces.
+        inward = [i for i in range(nfaces) if a["solid"][i]]
+        sheets = [i for i in range(nfaces) if not a["solid"][i]]
+        void = list(range(nfaces)) + sheets
+        regions = [("voidRegion", void, [a["flip"][i] for i in range(nfaces)] + [not a["flip"][i] for i in sheets])]
+        if inward:
+            regions.append(("solidRegion", inward, [not a["flip"][i] for i in inward]))
+        attr("brep:regionCount", t.UIntArray, [len(regions)])
+        attr("region:type", t.TokenArray, [kind for kind, _, _ in regions])
+        attr("region:shellCount", t.UIntArray, [1] * len(regions))
+        attr("shell:faceuseCount", t.UIntArray, [len(faces) for _, faces, _ in regions])
+        attr("shell:wireEdgeCount", t.UIntArray, [0] * len(regions))
+        attr("shell:pointType", t.TokenArray, ["none"] * len(regions))
+        attr("faceuse:faceIndex", t.UIntArray, [i for _, faces, _ in regions for i in faces])
+        # "opposite": the faceuse sees the side the surface normal points away from.
+        attr(
+            "faceuse:orientationType",
+            t.TokenArray,
+            ["opposite" if flipped else "same" for _, _, flips in regions for flipped in flips],
+        )
         attr("face:surfaceType", t.TokenArray, a["face:surfaceType"])
         attr("face:trimType", t.TokenArray, ["general"] * nfaces)
         attr("face:loopCount", t.UIntArray, a["face:loopCount"])

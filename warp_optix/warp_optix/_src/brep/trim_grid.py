@@ -242,7 +242,7 @@ def _write_pairs(
     o = wp.tid()
     if pairs[o] == 1:
         face, k0, col0 = _endpoint(seg_start, work_start, odd[o])
-        face1, k1, col1 = _endpoint(seg_start, work_start, odd[o + 1])
+        _face, k1, col1 = _endpoint(seg_start, work_start, odd[o + 1])
         parallel[position[o]] = wp.vec4(segs[k0, col0], segs[k0, col0 + 1], segs[k1, col1], segs[k1, col1 + 1])
         wp.atomic_add(parallel_count, face, 1)
 

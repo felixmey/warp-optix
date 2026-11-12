@@ -370,45 +370,87 @@ def _write_holed_plate(path):
 
 @pytest.mark.gpu
 @pytest.mark.render
-def test_micromapped_planes_match_the_exact_plane_intersector(tmp_path, monkeypatch):
+def test_path_traced_plate_shows_its_hole(tmp_path):
     if not wp.is_cuda_available():
         pytest.skip("CUDA device unavailable")
-    from warp_optix._src.pathtracing import scene as scene_module  # noqa: PLC0415
     from warp_optix.pathtracing import PathTracer  # noqa: PLC0415
 
     _write_holed_plate(tmp_path / "plate.usda")
-    depths = []
-    original = scene_module.Brep.__init__
-    for planes in (True, False):
-
-        def init(self, *args, planes=planes, **kwargs):
-            kwargs["planes"] = planes
-            original(self, *args, **kwargs)
-
-        monkeypatch.setattr(scene_module.Brep, "__init__", init)
-        api = PathTracer(width=96, height=96, denoiser="none", enable_set=False, backface_culling=False)
-        api.initialize()
-        try:
-            assert api.scene.load_from_usd(str(tmp_path / "plate.usda"))
-            assert (api.scene.geometry_count == 2) == planes  # the BRep, plus its plane triangles
-            api.build_scene()
-            if planes:  # the hole's edges make the plate's triangles carry micromaps
-                assert api.scene._meshes[1].micromaps is not None
-            # Looking straight down (USD z-up becomes y-up) at the whole plate.
-            api.set_camera_look_at((0.0, 3.0, 0.001), (0.0, 0.0, 0.0))
-            api.render_frame()
-            wp.synchronize()
-            depths.append(api.linear_depth_output.numpy().copy())
-        finally:
-            api.close()
-    hit = [np.isfinite(d) & (d > 0) & (d < 100.0) for d in depths]
-    assert np.array_equal(hit[0], hit[1])
-    h, w = hit[0].shape
+    api = PathTracer(width=96, height=96, denoiser="none", enable_set=False, backface_culling=False)
+    api.initialize()
+    try:
+        assert api.scene.load_from_usd(str(tmp_path / "plate.usda"))
+        api.build_scene()
+        # Looking straight down (USD z-up becomes y-up) at the whole plate.
+        api.set_camera_look_at((0.0, 3.0, 0.001), (0.0, 0.0, 0.0))
+        api.render_frame()
+        wp.synchronize()
+        depth = api.linear_depth_output.numpy().copy()
+    finally:
+        api.close()
+    hit = np.isfinite(depth) & (depth > 0) & (depth < 100.0)
+    h, w = hit.shape
     # Across the middle row: plate, hole, plate, with the hole 0.8 / 2 of the plate's width.
-    row = np.nonzero(hit[0][h // 2])[0]
+    row = np.nonzero(hit[h // 2])[0]
     plate = row[-1] - row[0] + 1
     hole = plate - len(row)
-    assert not hit[0][h // 2, w // 2] and plate > w // 2
+    assert not hit[h // 2, w // 2] and plate > w // 2
     assert abs(hole / plate - 0.4) < 0.03
-    both = hit[0] & hit[1]
-    assert np.allclose(depths[0][both], depths[1][both], rtol=1e-4)
+
+
+def _write_flat_cone_ring(path, slope):
+    """A one-face sheet: the cone r = 1 + slope * z between radii 1 and 0.5, nearly flat for a steep slope
+    (CAD booleans leave such cones; BoltMBox1's step ring has slope -687)."""
+    stage = Usd.Stage.CreateNew(str(path))
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+    UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+    prim = stage.DefinePrim("/Ring", "BrepArray")
+
+    def attr(name, type_name, value):
+        prim.CreateAttribute(name, type_name, custom=False, variability=Sdf.VariabilityUniform).Set(value)
+
+    t = Sdf.ValueTypeNames
+    lo, hi = sorted((0.0, -0.5 / slope))
+    attr("brep:extent", t.Double3Array, [Gf.Vec3d(-1, -1, lo), Gf.Vec3d(1, 1, hi)])
+    attr("brep:regionCount", t.UIntArray, [2])
+    attr("region:type", t.TokenArray, ["voidRegion", "voidRegion"])
+    attr("region:shellCount", t.UIntArray, [1, 1])
+    attr("shell:faceuseCount", t.UIntArray, [1, 1])
+    attr("faceuse:faceIndex", t.UIntArray, [0, 0])
+    attr("faceuse:orientationType", t.TokenArray, ["same", "opposite"])
+    attr("face:surfaceType", t.TokenArray, ["BrepSurfaceConeAPI"])
+    attr("face:range", t.Double2Array, [Gf.Vec2d(0.0, lo), Gf.Vec2d(2 * math.pi, hi)])
+    attr("brep:surface:cone:origin", t.Point3dArray, [Gf.Vec3d(0.0)])
+    attr("brep:surface:cone:axis", t.Vector3dArray, [Gf.Vec3d(0.0, 0.0, 1.0)])
+    attr("brep:surface:cone:refDirection", t.Vector3dArray, [Gf.Vec3d(1.0, 0.0, 0.0)])
+    attr("brep:surface:cone:radius", t.DoubleArray, [1.0])
+    attr("brep:surface:cone:semiAngle", t.DoubleArray, [math.atan(slope)])
+    attr("face:trimType", t.TokenArray, ["rectangular"])
+    attr("face:loopCount", t.UIntArray, [0])
+    stage.GetRootLayer().Save()
+
+
+@pytest.mark.gpu
+@pytest.mark.render
+def test_path_traced_near_flat_cone_has_no_cracks(tmp_path):
+    if not wp.is_cuda_available():
+        pytest.skip("CUDA device unavailable")
+    from warp_optix.pathtracing import PathTracer  # noqa: PLC0415
+
+    _write_flat_cone_ring(tmp_path / "ring.usda", slope=-5000.0)
+    api = PathTracer(width=192, height=192, denoiser="none", enable_set=False, backface_culling=False)
+    api.initialize()
+    try:
+        assert api.scene.load_from_usd(str(tmp_path / "ring.usda"))
+        api.build_scene()
+        for eye in ((0.0, 2.0, 1.6), (1.4, 1.4, 1.4)):  # oblique views (USD z-up becomes y-up)
+            api.set_camera_look_at(eye, (0.0, 0.0, 0.0))
+            api.render_frame()
+            wp.synchronize()
+            depth = api.linear_depth_output.numpy().copy()
+            hit = np.isfinite(depth) & (depth > 0) & (depth < 100.0)
+            # Every image row crosses the ring at most twice: holes would split a crossing in two.
+            runs = [np.count_nonzero(np.diff(np.r_[0, row.astype(np.int8), 0]) == 1) for row in hit]
+            assert max(runs) == 2 and hit.mean() > 0.15
+    finally:
+        api.close()

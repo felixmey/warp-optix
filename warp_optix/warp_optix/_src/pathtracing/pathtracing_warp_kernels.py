@@ -216,7 +216,6 @@ class DeviceCameraState:
 # 4 BRep shells (triangles enclosing bicubic BRep patches, refined to the exact surface).
 GEOMETRY_TYPE_BREP = 3
 GEOMETRY_TYPE_BREP_SHELL = 4
-GEOMETRY_TYPE_BREP_PLANE = 5
 
 
 @wp.struct
@@ -1865,6 +1864,13 @@ def _direction_coherence(d: wp.vec3) -> wp.uint32:
     return wp.uint32((octant << 4) | (u << 2) | v)
 
 
+# Camera rays and rays from offset surface points (_offset_ray moves an origin off the surface,
+# relative to its coordinates' magnitude) need no minimum distance. A fixed one skips real occluders
+# within it: 1 mm (formerly) leaked light through concave corners of centimetre-scale parts, and
+# camera rays clipped walls within 1 cm.
+RAY_TMIN = wp.constant(0.0)
+
+
 @wp.func
 def _offset_ray(p: wp.vec3, n: wp.vec3) -> wp.vec3:
     """Matches C++ offsetRay (pbr_common.h line 70)."""
@@ -2571,7 +2577,7 @@ def _sample_sphere_light_contribution(
         sample.direction,
         wp.max(sample.distance - 0.001, 0.001),
         shadow,
-        0.001,
+        RAY_TMIN,
         0.0,
         wp.uint32(255),
         wp.uint32(RayFlags.TERMINATE_ON_FIRST_HIT | RayFlags.DISABLE_CLOSESTHIT),
@@ -2843,7 +2849,7 @@ def _make_primary_raygen(reorder_bounces: bool):
             direction,
             1.0e32,
             payload,
-            0.01,
+            RAY_TMIN,
             0.0,
             wp.uint32(255),
             ray_flags,
@@ -2993,7 +2999,7 @@ def _make_primary_raygen(reorder_bounces: bool):
                 direction,
                 1.0e32,
                 payload,
-                0.01,
+                RAY_TMIN,
                 0.0,
                 wp.uint32(255),
                 ray_flags,
@@ -3167,7 +3173,7 @@ def _make_primary_raygen(reorder_bounces: bool):
                     ls.direction,
                     MISS_DISTANCE,
                     shadow,
-                    0.001,
+                    RAY_TMIN,
                     0.0,
                     wp.uint32(255),
                     wp.uint32(
@@ -3285,7 +3291,7 @@ def _make_primary_raygen(reorder_bounces: bool):
                 sec_direction,
                 1.0e16,
                 sec_payload,
-                0.001,
+                RAY_TMIN,
                 0.0,
                 wp.uint32(255),
                 wp.uint32(0) if (sec_event_type & BSDF_EVENT_TRANSMISSION) != 0 else ray_flags,
@@ -3399,7 +3405,7 @@ def _make_primary_raygen(reorder_bounces: bool):
                         sec_ls.direction,
                         MISS_DISTANCE,
                         sec_shadow,
-                        0.001,
+                        RAY_TMIN,
                         0.0,
                         wp.uint32(255),
                         wp.uint32(
@@ -3889,7 +3895,6 @@ def _compute_any_hit_alpha(params: PathtraceLaunchParams) -> AnyHitAlphaResult:
     is_brep = geometry_types.shape[0] > 0 and (
         geometry_types[inst_id] == wp.uint32(GEOMETRY_TYPE_BREP)
         or geometry_types[inst_id] == wp.uint32(GEOMETRY_TYPE_BREP_SHELL)
-        or geometry_types[inst_id] == wp.uint32(GEOMETRY_TYPE_BREP_PLANE)
     )
     if is_brep and geometry_types[inst_id] == wp.uint32(GEOMETRY_TYPE_BREP):
         primitive_id = primitive_id - int(params.packed_indices[int(rp.index_offset)])  # see _brep_local_primitive
@@ -4173,97 +4178,6 @@ def brep_shell_secondary_any_hit(params: PathtraceLaunchParams):
 
 
 @wp.func
-def _brep_plane_uv(params: PathtraceLaunchParams, inst_id: int, primitive_id: int, origin: wp.vec3, direction: wp.vec3):
-    """BRep primitive and (u, v) of a plane triangle's hit (object-space ray). The render primitive's
-    position offset holds the geometry's first plane triangle in ``params.brep``."""
-    rp = params.render_primitives[int(params.instance_render_prim_ids[inst_id])]
-    prim = params.brep.proxy_prim[int(rp.vertex_buffer.position_offset) + primitive_id]
-    rel = origin + wp.optix_get_ray_tmax() * direction - params.brep.prims[prim].origin
-    return prim, wp.dot(rel, params.brep.prims[prim].x), wp.dot(rel, params.brep.prims[prim].y)
-
-
-@wp.func
-def _brep_plane_hit_inside(params: PathtraceLaunchParams) -> bool:
-    """Any-hit on a plane triangle: whether the hit lies inside its face's trims."""
-    prim, u, v = _brep_plane_uv(
-        params,
-        int(wp.optix_get_instance_id()),
-        int(wp.optix_get_primitive_index()),
-        wp.optix_get_object_ray_origin(),
-        wp.optix_get_object_ray_direction(),
-    )
-    return brep_device.inside_trim(params.brep, prim, u, v)
-
-
-@wo.kernel(kind=wo.ProgramKind.ANY_HIT)
-@wp.kernel(module="unique")
-def brep_plane_any_hit(params: PathtraceLaunchParams):
-    """Opaque materials, micro-triangles on a trim edge: the exact trim test only."""
-    if not _brep_plane_hit_inside(params):
-        wp.optix_ignore_intersection()
-
-
-@wo.kernel(kind=wo.ProgramKind.ANY_HIT)
-@wp.kernel(module="unique")
-def brep_plane_alpha_any_hit(params: PathtraceLaunchParams):
-    """Non-opaque materials, every hit: the exact trim test, then the material's coverage."""
-    if not _brep_plane_hit_inside(params):
-        wp.optix_ignore_intersection()
-        return
-    alpha_hit = _compute_any_hit_alpha(params)
-    if alpha_hit.valid != wp.uint32(0) and alpha_hit.alpha < 0.999:
-        if alpha_hit.alpha <= 0.001 or _pcg_rand01(_any_hit_rng(alpha_hit.coverage_seed)) > alpha_hit.alpha:
-            wp.optix_ignore_intersection()
-
-
-@wo.kernel(kind=wo.ProgramKind.ANY_HIT)
-@wp.kernel(module="unique")
-def brep_plane_secondary_any_hit(params: PathtraceLaunchParams):
-    """Shadow rays, opaque materials: occluded inside the face's trims."""
-    if not _brep_plane_hit_inside(params):
-        wp.optix_ignore_intersection()
-        return
-    payload = ShadowPayload()
-    wp.optix_load_payload(payload)
-    payload.visible = wp.uint32(0)
-    wp.optix_store_payload(payload)
-    wp.optix_terminate_ray()
-
-
-@wo.kernel(kind=wo.ProgramKind.ANY_HIT)
-@wp.kernel(module="unique")
-def brep_plane_alpha_secondary_any_hit(params: PathtraceLaunchParams):
-    """Shadow rays, non-opaque materials: inside the face's trims, blocked by its coverage."""
-    if not _brep_plane_hit_inside(params):
-        wp.optix_ignore_intersection()
-        return
-    _secondary_any_hit(params)
-
-
-@wo.kernel(kind=wo.ProgramKind.CLOSEST_HIT)
-@wp.kernel(module="unique")
-def brep_plane_closest_hit(params: PathtraceLaunchParams):
-    """Adapt a BRep plane triangle hit to the shared PBR payload, as an exact plane hit would."""
-    inst_id = int(wp.optix_get_instance_id())
-    primitive_id = int(wp.optix_get_primitive_index())
-    # Object-space ray queries are unavailable in closest-hit programs: transform the world ray.
-    # The hit is inside the trims already (micromap or any-hit): no trim test here.
-    world_direction = wp.optix_get_world_ray_direction()
-    prim, u, v = _brep_plane_uv(
-        params,
-        inst_id,
-        primitive_id,
-        wp.optix_transform_point_world_to_object(wp.optix_get_world_ray_origin()),
-        wp.optix_transform_vector_world_to_object(world_direction),
-    )
-    n_obj = params.brep.prims[prim].axis
-    if (params.brep.prims[prim].flags & brep_device.FLAG_FLIP) != 0:
-        n_obj = -n_obj
-    geo, front_face = _brep_hit_geometry(params, inst_id, primitive_id, u, v, n_obj, world_direction)
-    _store_primary_hit_payload(geo, wp.int32(inst_id), wp.int32(primitive_id), front_face, u, v)
-
-
-@wp.func
 def _any_hit_rng(coverage_seed: wp.uint32) -> wp.uint32:
     return _pcg_advance(coverage_seed)
 
@@ -4371,16 +4285,6 @@ SBT = wo.SbtLayout(
         "brep_shell": {
             "primary": wo.HitGroup(brep_shell_closest_hit, brep_shell_any_hit),
             "secondary": wo.HitGroup(secondary_closest_hit, brep_shell_secondary_any_hit),
-        },
-        # Any-hit of the coverage evaluation costs bounce rays up to 10% on a dense assembly even
-        # where unused, so opaque planes get the trim test alone.
-        "brep_plane": {
-            "primary": wo.HitGroup(brep_plane_closest_hit, brep_plane_any_hit),
-            "secondary": wo.HitGroup(secondary_closest_hit, brep_plane_secondary_any_hit),
-        },
-        "brep_plane_alpha": {
-            "primary": wo.HitGroup(brep_plane_closest_hit, brep_plane_alpha_any_hit),
-            "secondary": wo.HitGroup(secondary_closest_hit, brep_plane_alpha_secondary_any_hit),
         },
     },
 )

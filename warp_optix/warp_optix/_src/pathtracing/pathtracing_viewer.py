@@ -759,13 +759,19 @@ class Renderer:
     def _pipeline_registers(self) -> int:
         """The register limit for the scene: BRep intersection spills at the default limit.
 
-        Measured on 1920x1080 path tracing: BRep scenes (NURBS shells, analytic faces) run
-        1.3-1.6x faster at 168 registers than at the default (and slightly faster than at 255),
-        while triangle-only scenes run 20-30% slower when raised, so only BRep scenes raise it.
+        Measured on 1920x1080 path tracing of a dense assembly: 15% faster at 168 registers than at
+        the default and 20% faster than at 255, where fewer warps stay resident to hide memory
+        latency (160 and 176 are 8% and 30% slower). A NURBS-heavy scene runs 8% faster at 255.
+        Triangle-only scenes run 20-30% slower when raised, so only BRep scenes raise it.
         """
         if self._scene is not None and self._scene.brep_count > 0:
             return 168
         return wo.native.COMPILE_DEFAULT_MAX_REGISTER_COUNT
+
+    def _pipeline_config(self) -> tuple[int, bool]:
+        """What the pipeline is specialized on: the register limit, and whether the scene has BReps
+        (the raygen that reorders bounce rays)."""
+        return self._pipeline_registers(), self._scene is not None and self._scene.brep_count > 0
 
     def _create_pipeline(self):
         """Create the OptiX pipeline with primary and shadow/visibility ray types.
@@ -774,9 +780,9 @@ class Renderer:
         ``pwk.SBT`` layout. Bounces iterate in raygen, so hit and miss programs
         never trace recursively.
         """
-        self._pipeline_register_limit = self._pipeline_registers()
+        self._pipeline_key = self._pipeline_config()
+        self._pipeline_register_limit, has_breps = self._pipeline_key
         # BRep scenes reorder bounce rays by direction: their intersection programs diverge.
-        has_breps = self._scene is not None and self._scene.brep_count > 0
         self._pipeline = wo.Pipeline(
             pwk.primary_raygen_reorder if has_breps else pwk.primary_raygen,
             sbt=pwk.SBT,
@@ -785,7 +791,6 @@ class Renderer:
             attribute_words=brep_device.ATTRIBUTE_WORDS,
             max_registers=self._pipeline_register_limit,
             graph_flags=wo.TraversableGraphFlags.ALLOW_SINGLE_LEVEL_INSTANCING,
-            opacity_micromaps=has_breps,  # BRep planar faces carry trim micromaps
             module_options={"fast_math": True},
             device=self._device,
         )
@@ -1200,7 +1205,7 @@ class Renderer:
         if self._pipeline is None:
             logger.error("Pipeline not built. Call build() first.")
             return
-        if self._pipeline_registers() != self._pipeline_register_limit:
+        if self._pipeline_config() != self._pipeline_key:
             # The scene gained or lost BReps since the pipeline was built.
             self._pipeline.close()
             self._create_pipeline()
