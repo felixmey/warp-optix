@@ -253,6 +253,17 @@ def _write_nurbs_dome(path):
     stage.GetRootLayer().Save()
 
 
+def _bicubic(pw, s, t):
+    """Reference: a bicubic rational Bezier patch, (4, 4, 4) homogeneous control points, at (s, t)."""
+
+    def bernstein(x):
+        y = 1.0 - x
+        return np.stack([y**3, 3 * x * y**2, 3 * x**2 * y, x**3], axis=-1)
+
+    h = np.einsum("ni,nj,ijk->nk", bernstein(s), bernstein(t), pw)
+    return h[:, :3] / h[:, 3:]
+
+
 def test_shell_proxies_enclose_bicubic_patches(tmp_path):
     from warp_optix._src.brep import proxy  # noqa: PLC0415
 
@@ -260,19 +271,23 @@ def test_shell_proxies_enclose_bicubic_patches(tmp_path):
     (prim,) = loader.load_stage(str(tmp_path / "dome.usda"))
     shells = proxy.build_proxy(prim)
     assert len(shells.patches) == len(prim.prim_kind) > 0
+    assert len(shells.indices) == len(shells.tri_prim) == len(shells.patches) * len(proxy.SHELL_TRIANGLES)
+    m = proxy.GRID + 1
+    layers = shells.points.reshape(len(shells.patches), 2, m, m, 3)  # outer, inner
     rng = np.random.default_rng(0)
-    for p in shells.patches:
+    for k, p in enumerate(shells.patches):
         pw = prim.cvs[prim.prim_cv[p] : prim.prim_cv[p] + 16].reshape(4, 4, 4)
-        points, _, _ = proxy.shell(pw, margin=0.0)
-        n = len(points) // 2
-        outer, inner = points[:n].reshape(5, 5, 3), points[n:].reshape(5, 5, 3)
+        outer, inner = layers[k, 0].astype(np.float64), layers[k, 1].astype(np.float64)
         mid, half = 0.5 * (outer + inner), 0.5 * np.linalg.norm(outer - inner, axis=-1).min()
+        # The surface lies within half the shell's thickness of its mid layer, over the patch.
         s, t = rng.uniform(0.0, 1.0, 200), rng.uniform(0.0, 1.0, 200)
-        i, j = np.minimum((s * 4).astype(int), 3), np.minimum((t * 4).astype(int), 3)
-        a, b = (s * 4 - i)[:, None], (t * 4 - j)[:, None]
+        cells = proxy.GRID / (1.0 + 2.0 * proxy.MARGIN)
+        gs, gt = (s + proxy.MARGIN) * cells, (t + proxy.MARGIN) * cells
+        i, j = np.minimum(gs.astype(int), proxy.GRID - 1), np.minimum(gt.astype(int), proxy.GRID - 1)
+        a, b = (gs - i)[:, None], (gt - j)[:, None]
         p00, p10, p01, p11 = mid[i, j], mid[i + 1, j], mid[i, j + 1], mid[i + 1, j + 1]
         linear = np.where(a >= b, p00 + a * (p10 - p00) + b * (p11 - p10), p00 + b * (p01 - p00) + a * (p11 - p01))
-        assert np.linalg.norm(proxy._eval(pw, s, t) - linear, axis=1).max() < half
+        assert np.linalg.norm(_bicubic(pw, s, t) - linear, axis=1).max() < half
 
 
 @pytest.mark.gpu

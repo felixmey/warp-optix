@@ -3891,6 +3891,8 @@ def _compute_any_hit_alpha(params: PathtraceLaunchParams) -> AnyHitAlphaResult:
         or geometry_types[inst_id] == wp.uint32(GEOMETRY_TYPE_BREP_SHELL)
         or geometry_types[inst_id] == wp.uint32(GEOMETRY_TYPE_BREP_PLANE)
     )
+    if is_brep and geometry_types[inst_id] == wp.uint32(GEOMETRY_TYPE_BREP):
+        primitive_id = primitive_id - int(params.packed_indices[int(rp.index_offset)])  # see _brep_local_primitive
     primitive_count = int(rp.num_indices) if is_curve else int(rp.num_indices) // 3
     if primitive_id < 0 or primitive_id >= primitive_count:
         return out
@@ -4022,42 +4024,59 @@ def curve_primary_closest_hit(params: PathtraceLaunchParams):
 
 
 @wp.func
-def _brep_primitive(params: PathtraceLaunchParams, inst_id: int, primitive_id: int) -> int:
-    """Global BRep primitive id of the hit: BRep geometries store them as their indices."""
+def _brep_local_primitive(params: PathtraceLaunchParams, inst_id: int) -> int:
+    """Index of the hit primitive within its BRep geometry: BRep GASes offset primitive indices
+    by their first global primitive id, which is also the geometry's first index."""
     rp = params.render_primitives[int(params.instance_render_prim_ids[inst_id])]
-    return int(params.packed_indices[int(rp.index_offset) + primitive_id])
+    return int(wp.optix_get_primitive_index()) - int(params.packed_indices[int(rp.index_offset)])
 
 
 @wo.kernel(kind=wo.ProgramKind.INTERSECTION)
 @wp.kernel(module="unique")
 def brep_intersection(params: PathtraceLaunchParams):
-    """Exact ray/BRep-face intersection (analytic surfaces, trimmed NURBS sub-patches)."""
-    prim = _brep_primitive(params, int(wp.optix_get_instance_id()), int(wp.optix_get_primitive_index()))
-    brep_device.intersect(params.brep, prim, wp.optix_get_object_ray_origin(), wp.optix_get_object_ray_direction())
-
-
-@wo.kernel(kind=wo.ProgramKind.CLOSEST_HIT)
-@wp.kernel(module="unique")
-def brep_primary_closest_hit(params: PathtraceLaunchParams):
-    """Adapt a BRep hit (attributes u, v, outward normal, face) to the shared PBR payload."""
-    inst_id = int(wp.optix_get_instance_id())
-    primitive_id = int(wp.optix_get_primitive_index())
-    u = wp.optix_uint32_as_float(wp.optix_get_attribute(0))
-    v = wp.optix_uint32_as_float(wp.optix_get_attribute(1))
-    n_obj = wp.vec3(
-        wp.optix_uint32_as_float(wp.optix_get_attribute(2)),
-        wp.optix_uint32_as_float(wp.optix_get_attribute(3)),
-        wp.optix_uint32_as_float(wp.optix_get_attribute(4)),
+    """Exact ray/BRep-face intersection: planes, cylinders, cones and spheres. The primitive index is
+    global: BRep GASes offset their primitive indices."""
+    brep_device.intersect_quadric(
+        params.brep,
+        int(wp.optix_get_primitive_index()),
+        wp.optix_get_object_ray_origin(),
+        wp.optix_get_object_ray_direction(),
     )
+
+
+@wo.kernel(kind=wo.ProgramKind.INTERSECTION)
+@wp.kernel(module="unique")
+def brep_curved_intersection(params: PathtraceLaunchParams):
+    """Exact ray/BRep-face intersection: tori and trimmed NURBS sub-patches (see intersect_curved)."""
+    brep_device.intersect_curved(
+        params.brep,
+        int(wp.optix_get_primitive_index()),
+        wp.optix_get_object_ray_origin(),
+        wp.optix_get_object_ray_direction(),
+    )
+
+
+@wp.func
+def _brep_hit_geometry(
+    params: PathtraceLaunchParams,
+    inst_id: int,
+    primitive_id: int,
+    u: float,
+    v: float,
+    n_obj: wp.vec3,
+    world_direction: wp.vec3,
+):
+    """The shared PBR hit geometry of an exact BRep hit (face (u, v), outward object-space normal):
+    the world normal face-forwarded like a triangle hit's, and whether the ray meets the outward
+    side (front face, so glass tracks entering and leaving the medium)."""
     geo = HitGeometry()
     geo.texture_lod = 0.0
     geo.uv = wp.vec2(u, v)
     geo.uv1 = geo.uv
     geo.bitangent_sign = 1.0
     outward = wp.normalize(wp.optix_transform_normal_object_to_world(n_obj))
-    direction = wp.normalize(wp.optix_get_world_ray_direction())
+    direction = wp.normalize(world_direction)
     front_face = wp.uint32(1) if wp.dot(outward, direction) < 0.0 else wp.uint32(0)
-    # Face-forward against the view direction, like triangle hits.
     geo.normal = outward
     if wp.dot(geo.normal, direction) > 0.0:
         geo.normal = -geo.normal
@@ -4068,18 +4087,41 @@ def brep_primary_closest_hit(params: PathtraceLaunchParams):
     render_prim_id = int(params.instance_render_prim_ids[inst_id])
     rp = params.render_primitives[render_prim_id]
     geo.material_id = _resolve_material_id(params, inst_id, render_prim_id, primitive_id, int(rp.num_indices))
+    return geo, front_face
+
+
+@wo.kernel(kind=wo.ProgramKind.CLOSEST_HIT)
+@wp.kernel(module="unique")
+def brep_primary_closest_hit(params: PathtraceLaunchParams):
+    """Adapt a BRep hit (attributes u, v, outward normal, face) to the shared PBR payload."""
+    inst_id = int(wp.optix_get_instance_id())
+    primitive_id = _brep_local_primitive(params, inst_id)
+    u = wp.optix_uint32_as_float(wp.optix_get_attribute(0))
+    v = wp.optix_uint32_as_float(wp.optix_get_attribute(1))
+    n_obj = wp.vec3(
+        wp.optix_uint32_as_float(wp.optix_get_attribute(2)),
+        wp.optix_uint32_as_float(wp.optix_get_attribute(3)),
+        wp.optix_uint32_as_float(wp.optix_get_attribute(4)),
+    )
+    geo, front_face = _brep_hit_geometry(params, inst_id, primitive_id, u, v, n_obj, wp.optix_get_world_ray_direction())
     _store_primary_hit_payload(geo, wp.int32(inst_id), wp.int32(primitive_id), front_face, u, v)
 
 
 @wp.func
-def _brep_shell_hit(
-    params: PathtraceLaunchParams, inst_id: int, primitive_id: int, origin: wp.vec3, direction: wp.vec3
-):
-    """Exact hit behind shell triangle ``primitive_id``: its render primitive's position offset
-    holds the geometry's first shell triangle in ``params.brep``."""
+def _brep_shell_hit(params: PathtraceLaunchParams):
+    """Exact hit behind the crossed shell triangle: its render primitive's position offset holds
+    the geometry's first shell triangle in ``params.brep``."""
+    inst_id = int(wp.optix_get_instance_id())
+    primitive_id = int(wp.optix_get_primitive_index())
     rp = params.render_primitives[int(params.instance_render_prim_ids[inst_id])]
-    tri = int(rp.vertex_buffer.position_offset) + primitive_id
-    return brep_device.proxy_hit(params.brep, tri, wp.optix_get_triangle_barycentrics(), origin, direction)
+    return brep_device.proxy_hit(
+        params.brep,
+        int(rp.vertex_buffer.position_offset) + primitive_id,
+        primitive_id,
+        wp.optix_get_triangle_barycentrics(),
+        wp.optix_get_object_ray_origin(),
+        wp.optix_get_object_ray_direction(),
+    )
 
 
 @wo.kernel(kind=wo.ProgramKind.ANY_HIT)
@@ -4092,12 +4134,7 @@ def brep_shell_any_hit(params: PathtraceLaunchParams):
     accepted (shrinking tmax): an exit may hide an entry in front of it, so traversal continues.
     The miss and closest-hit programs keep a recorded hit that is nearer than theirs.
     """
-    inst_id = int(wp.optix_get_instance_id())
-    primitive_id = int(wp.optix_get_primitive_index())
-    direction = wp.optix_get_object_ray_direction()
-    ok, hit_t, u, v, n_obj, face, exact = _brep_shell_hit(
-        params, inst_id, primitive_id, wp.optix_get_object_ray_origin(), direction
-    )
+    ok, hit_t, u, v, n_obj, face = _brep_shell_hit(params)
     if not ok:
         wp.optix_ignore_intersection()
         return
@@ -4106,28 +4143,14 @@ def brep_shell_any_hit(params: PathtraceLaunchParams):
         if alpha_hit.alpha <= 0.001 or _pcg_rand01(_any_hit_rng(alpha_hit.coverage_seed)) > alpha_hit.alpha:
             wp.optix_ignore_intersection()
             return
-    leaving = wp.dot(n_obj, direction) > 0.0
     if hit_t < wp.optix_uint32_as_float(wp.optix_get_payload(0)):
-        world_direction = wp.normalize(wp.optix_get_world_ray_direction())
-        outward = wp.normalize(wp.optix_transform_normal_object_to_world(n_obj))
-        geo = HitGeometry()
-        geo.texture_lod = 0.0
-        geo.uv = wp.vec2(u, v)
-        geo.uv1 = geo.uv
-        geo.bitangent_sign = 1.0
-        geo.normal = outward
-        if wp.dot(geo.normal, world_direction) > 0.0:
-            geo.normal = -geo.normal
-        helper = wp.vec3(1.0, 0.0, 0.0)
-        if wp.abs(geo.normal[0]) > 0.9:
-            helper = wp.vec3(0.0, 1.0, 0.0)
-        geo.tangent = wp.normalize(wp.cross(helper, geo.normal))
-        render_prim_id = int(params.instance_render_prim_ids[inst_id])
-        rp = params.render_primitives[render_prim_id]
-        geo.material_id = _resolve_material_id(params, inst_id, render_prim_id, primitive_id, int(rp.num_indices))
-        front_face = wp.uint32(1) if wp.dot(outward, world_direction) < 0.0 else wp.uint32(0)
+        inst_id = int(wp.optix_get_instance_id())
+        primitive_id = int(wp.optix_get_primitive_index())
+        geo, front_face = _brep_hit_geometry(
+            params, inst_id, primitive_id, u, v, n_obj, wp.optix_get_world_ray_direction()
+        )
         _write_primary_payload(geo, wp.int32(inst_id), wp.int32(primitive_id), front_face, u, v, hit_t)
-    if leaving and not exact:  # an exact (planar) hit is ordered correctly even as an exit
+    if wp.dot(n_obj, wp.optix_get_object_ray_direction()) > 0.0:  # leaving the surface
         wp.optix_ignore_intersection()
 
 
@@ -4142,13 +4165,7 @@ def brep_shell_closest_hit(params: PathtraceLaunchParams):
 @wp.kernel(module="unique")
 def brep_shell_secondary_any_hit(params: PathtraceLaunchParams):
     """Shadow rays: occluded only where the ray really crosses the exact BRep surface."""
-    ok, hit_t, u, v, n_obj, face, exact = _brep_shell_hit(
-        params,
-        int(wp.optix_get_instance_id()),
-        int(wp.optix_get_primitive_index()),
-        wp.optix_get_object_ray_origin(),
-        wp.optix_get_object_ray_direction(),
-    )
+    ok, hit_t, u, v, n_obj, face = _brep_shell_hit(params)
     if not ok:
         wp.optix_ignore_intersection()
         return
@@ -4157,26 +4174,25 @@ def brep_shell_secondary_any_hit(params: PathtraceLaunchParams):
 
 @wp.func
 def _brep_plane_uv(params: PathtraceLaunchParams, inst_id: int, primitive_id: int, origin: wp.vec3, direction: wp.vec3):
-    """Face and (u, v) of a BRep plane triangle's hit (object-space ray). The render primitive's
+    """BRep primitive and (u, v) of a plane triangle's hit (object-space ray). The render primitive's
     position offset holds the geometry's first plane triangle in ``params.brep``."""
     rp = params.render_primitives[int(params.instance_render_prim_ids[inst_id])]
-    tri = int(rp.vertex_buffer.position_offset) + primitive_id
-    face = params.brep.prim_face[params.brep.proxy_prim[tri]]
-    rel = origin + wp.optix_get_ray_tmax() * direction - params.brep.face_origin[face]
-    return face, wp.dot(rel, params.brep.face_x[face]), wp.dot(rel, params.brep.face_y[face])
+    prim = params.brep.proxy_prim[int(rp.vertex_buffer.position_offset) + primitive_id]
+    rel = origin + wp.optix_get_ray_tmax() * direction - params.brep.prims[prim].origin
+    return prim, wp.dot(rel, params.brep.prims[prim].x), wp.dot(rel, params.brep.prims[prim].y)
 
 
 @wp.func
 def _brep_plane_hit_inside(params: PathtraceLaunchParams) -> bool:
     """Any-hit on a plane triangle: whether the hit lies inside its face's trims."""
-    face, u, v = _brep_plane_uv(
+    prim, u, v = _brep_plane_uv(
         params,
         int(wp.optix_get_instance_id()),
         int(wp.optix_get_primitive_index()),
         wp.optix_get_object_ray_origin(),
         wp.optix_get_object_ray_direction(),
     )
-    return brep_device.inside_trim(params.brep, face, u, v)
+    return brep_device.inside_trim(params.brep, prim, u, v)
 
 
 @wo.kernel(kind=wo.ProgramKind.ANY_HIT)
@@ -4233,34 +4249,17 @@ def brep_plane_closest_hit(params: PathtraceLaunchParams):
     # Object-space ray queries are unavailable in closest-hit programs: transform the world ray.
     # The hit is inside the trims already (micromap or any-hit): no trim test here.
     world_direction = wp.optix_get_world_ray_direction()
-    face, u, v = _brep_plane_uv(
+    prim, u, v = _brep_plane_uv(
         params,
         inst_id,
         primitive_id,
         wp.optix_transform_point_world_to_object(wp.optix_get_world_ray_origin()),
         wp.optix_transform_vector_world_to_object(world_direction),
     )
-    n_obj = params.brep.face_axis[face]
-    if (params.brep.face_flags[face] & brep_device.FLAG_FLIP) != 0:
+    n_obj = params.brep.prims[prim].axis
+    if (params.brep.prims[prim].flags & brep_device.FLAG_FLIP) != 0:
         n_obj = -n_obj
-    geo = HitGeometry()
-    geo.texture_lod = 0.0
-    geo.uv = wp.vec2(u, v)
-    geo.uv1 = geo.uv
-    geo.bitangent_sign = 1.0
-    outward = wp.normalize(wp.optix_transform_normal_object_to_world(n_obj))
-    direction = wp.normalize(world_direction)
-    front_face = wp.uint32(1) if wp.dot(outward, direction) < 0.0 else wp.uint32(0)
-    geo.normal = outward
-    if wp.dot(geo.normal, direction) > 0.0:
-        geo.normal = -geo.normal
-    helper = wp.vec3(1.0, 0.0, 0.0)
-    if wp.abs(geo.normal[0]) > 0.9:
-        helper = wp.vec3(0.0, 1.0, 0.0)
-    geo.tangent = wp.normalize(wp.cross(helper, geo.normal))
-    render_prim_id = int(params.instance_render_prim_ids[inst_id])
-    rp = params.render_primitives[render_prim_id]
-    geo.material_id = _resolve_material_id(params, inst_id, render_prim_id, primitive_id, int(rp.num_indices))
+    geo, front_face = _brep_hit_geometry(params, inst_id, primitive_id, u, v, n_obj, world_direction)
     _store_primary_hit_payload(geo, wp.int32(inst_id), wp.int32(primitive_id), front_face, u, v)
 
 
@@ -4367,6 +4366,8 @@ SBT = wo.SbtLayout(
             curve_primary_closest_hit, wo.PrimitiveType.ROUND_CUBIC_BEZIER, DYNAMIC_BUILD_FLAGS
         ),
         "brep": _hit_groups(brep_primary_closest_hit, intersection=brep_intersection),
+        # Must follow "brep": a BRep primitive's SBT index 1 selects it (tori, NURBS sub-patches).
+        "brep_curved": _hit_groups(brep_primary_closest_hit, intersection=brep_curved_intersection),
         "brep_shell": {
             "primary": wo.HitGroup(brep_shell_closest_hit, brep_shell_any_hit),
             "secondary": wo.HitGroup(secondary_closest_hit, brep_shell_secondary_any_hit),

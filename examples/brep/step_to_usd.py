@@ -113,6 +113,9 @@ class PartWriter:
         surf = BRep_Tool.Surface_s(face)  # with the face's location applied
         while isinstance(surf, Geom_RectangularTrimmedSurface):
             surf = surf.BasisSurface()
+        if surf is None:  # a face without geometry (seen in exported preview models)
+            self.stats["skipped_faces"] += 1
+            return None
         ad = GeomAdaptor_Surface(surf)
         kind = ad.GetType()
         a = self.a

@@ -22,7 +22,7 @@ import numpy as np
 import warp as wp
 
 from . import trim_grid
-from .loader import CONE, CYLINDER, FLAG_FLIP, FLAG_SOLID, FLAG_SWAP, FLAG_TRIMMED, NURBS, PLANE, SPHERE, TORUS
+from .loader import CONE, FLAG_FLIP, FLAG_SOLID, FLAG_SWAP, FLAG_TRIMMED, PLANE, SPHERE, TORUS
 
 NEWTON_ITERATIONS = 10
 # Retry a sub-patch from more seeds after finding the ray's exit only when the ray meets the
@@ -34,40 +34,52 @@ GRID_REF_C = wp.constant(trim_grid.REF_C)
 
 
 @wp.struct
+class Surface:
+    """A primitive's surface frame and its face's trim lookup in one 128-byte record (one cache
+    line), so an intersection needs a single dependent load for all of it. The primitives of one
+    face (NURBS sub-patches) repeat the face's record."""
+
+    origin: wp.vec3
+    x: wp.vec3
+    y: wp.vec3
+    axis: wp.vec3
+    params: wp.vec2
+    range: wp.vec4
+    period: wp.vec2
+    flags: wp.int32  # the face's FLAG_* bits, and the surface kind from bit KIND_SHIFT
+    face: wp.int32
+    # Trim cell grid (see trim_grid.py): (cell base, cells along a, cells along c) and (lo a, lo c,
+    # cells per unit a, cells per unit c). A trimmed face without a grid (no cells along a) has
+    # (first slab, 0, slab count) and (lo a, slabs per unit a, 0, 0) for the slab test instead.
+    grid: wp.vec3i
+    grid_map: wp.vec4
+    reserved: wp.vec3i  # pads the record to 128 bytes
+
+
+KIND_SHIFT = wp.constant(8)
+
+
+@wp.struct
 class BrepData:
-    face_origin: wp.array[wp.vec3]
-    face_x: wp.array[wp.vec3]
-    face_y: wp.array[wp.vec3]
-    face_axis: wp.array[wp.vec3]
-    face_params: wp.array[wp.vec2]
-    face_range: wp.array[wp.vec4]
-    face_period: wp.array[wp.vec2]
-    face_flags: wp.array[wp.int32]
-    face_slab: wp.array[wp.vec2i]
-    face_slab_map: wp.array[wp.vec2]
+    prims: wp.array[Surface]
     slab_start: wp.array[wp.int32]
     slab_segments: wp.array[wp.int32]
     segments: wp.array[wp.vec4]
     segment_bulge: wp.array[wp.float32]
-    # Trim cell grids (see trim_grid.py): per face (cell base, cells along a, cells along c; 0
-    # cells: slab test) and (lo a, lo c, cells per unit a, cells per unit c); per cell (first
-    # member, member count << 1 | parity at its reference point); members are chord copies.
-    face_grid: wp.array[wp.vec3i]
-    face_grid_map: wp.array[wp.vec4]
+    # Trim cell grids (see Surface): per cell (first member, member count << 1 | parity at its
+    # reference point); members are chord copies.
     cell_info: wp.array[wp.vec2i]
     cell_chords: wp.array[wp.vec4]
     cell_bulges: wp.array[wp.float32]
-    prim_kind: wp.array[wp.int32]
-    prim_face: wp.array[wp.int32]
     prim_cv: wp.array[wp.int32]
     prim_degree: wp.array[wp.vec2i]
     prim_uv: wp.array[wp.vec4]
     prim_tol: wp.array[wp.float32]
     cvs: wp.array[wp.vec4]
-    # Triangle shells (see proxy.py): each shell triangle's global primitive (its patch) and the
-    # patch parameters (s, t) at its three corners.
+    # Triangle shells (see proxy.py): each shell triangle's global primitive (its patch), and the
+    # patch parameters (s, t) at the corners of one shell's triangles (the same for every shell).
     proxy_prim: wp.array[wp.int32]
-    proxy_st: wp.array[wp.vec2]
+    shell_st: wp.array[wp.vec2]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -103,11 +115,11 @@ def in_bulge(seg: wp.vec4, h: float, a: float, c: float) -> bool:
 
 
 @wp.func
-def inside_trim_slab(b: BrepData, face: int, a: float, c: float) -> bool:
+def inside_trim_slab(b: BrepData, prim: int, a: float, c: float) -> bool:
     """Crossings of a ray toward +c against the chords of the point's slab."""
-    slab = b.face_slab[face]
-    smap = b.face_slab_map[face]
-    s = slab[0] + wp.clamp(int(wp.floor((a - smap[0]) * smap[1])), 0, slab[1] - 1)
+    slab = b.prims[prim].grid  # (first slab, 0, slab count) without a cell grid
+    smap = b.prims[prim].grid_map
+    s = slab[0] + wp.clamp(int(wp.floor((a - smap[0]) * smap[1])), 0, slab[2] - 1)
     crossings = int(0)
     for k in range(b.slab_start[s], b.slab_start[s + 1]):
         index = b.slab_segments[k]
@@ -122,8 +134,8 @@ def inside_trim_slab(b: BrepData, face: int, a: float, c: float) -> bool:
 
 
 @wp.func
-def inside_trim(b: BrepData, face: int, u: float, v: float) -> bool:
-    flags = b.face_flags[face]
+def inside_trim(b: BrepData, prim: int, u: float, v: float) -> bool:
+    flags = b.prims[prim].flags
     if (flags & FLAG_TRIMMED) == 0:
         return True
     a = u
@@ -131,10 +143,10 @@ def inside_trim(b: BrepData, face: int, u: float, v: float) -> bool:
     if (flags & FLAG_SWAP) != 0:
         a = v
         c = u
-    grid = b.face_grid[face]
+    grid = b.prims[prim].grid
     if grid[1] == 0:
-        return inside_trim_slab(b, face, a, c)
-    m = b.face_grid_map[face]
+        return inside_trim_slab(b, prim, a, c)
+    m = b.prims[prim].grid_map
     i = wp.clamp(int(wp.floor((a - m[0]) * m[2])), 0, grid[1] - 1)
     j = wp.clamp(int(wp.floor((c - m[1]) * m[3])), 0, grid[2] - 1)
     info = b.cell_info[grid[0] + j * grid[1] + i]
@@ -167,31 +179,42 @@ def inside_trim(b: BrepData, face: int, u: float, v: float) -> bool:
 
 
 @wp.func
-def accept_uv(b: BrepData, face: int, u_in: float, v_in: float):
+def accept_uv(b: BrepData, prim: int, u_in: float, v_in: float):
     """Whether (u, v) lies in the face (range and trim); returns (inside, wrapped u, wrapped v)."""
-    rng = b.face_range[face]
-    period = b.face_period[face]
+    rng = b.prims[prim].range
+    period = b.prims[prim].period
     u = wrap(u_in, rng[0], period[0])
     v = wrap(v_in, rng[2], period[1])
     eu = 1.0e-5 * (rng[1] - rng[0]) + 1.0e-7
     ev = 1.0e-5 * (rng[3] - rng[2]) + 1.0e-7
     if u < rng[0] - eu or u > rng[1] + eu or v < rng[2] - ev or v > rng[3] + ev:
         return False, u, v
-    return inside_trim(b, face, u, v), u, v
+    return inside_trim(b, prim, u, v), u, v
 
 
 @wp.func
-def try_report(b: BrepData, face: int, t: float, u_in: float, v_in: float, normal: wp.vec3, direction: wp.vec3) -> bool:
-    if t < wp.optix_get_ray_tmin() or t > wp.optix_get_ray_tmax():
+def in_ray(t: float) -> bool:
+    return t >= wp.optix_get_ray_tmin() and t <= wp.optix_get_ray_tmax()
+
+
+@wp.func
+def try_report(b: BrepData, prim: int, t: float, u_in: float, v_in: float, normal: wp.vec3, direction: wp.vec3) -> bool:
+    if not in_ray(t):
         return False
-    inside, u, v = accept_uv(b, face, u_in, v_in)
+    inside, u, v = accept_uv(b, prim, u_in, v_in)
     if not inside:
         return False
+    return report(b, prim, t, u, v, normal, direction)
+
+
+@wp.func
+def report(b: BrepData, prim: int, t: float, u: float, v: float, normal: wp.vec3, direction: wp.vec3) -> bool:
+    """Report a hit inside the face (u, v wrapped into its range) with its outward normal."""
     n = wp.normalize(normal)
-    if (b.face_flags[face] & FLAG_FLIP) != 0:
+    if (b.prims[prim].flags & FLAG_FLIP) != 0:
         n = -n
     kind = wp.uint32(0)
-    if wp.dot(n, direction) > 0.0 and (b.face_flags[face] & FLAG_SOLID) != 0:
+    if wp.dot(n, direction) > 0.0 and (b.prims[prim].flags & FLAG_SOLID) != 0:
         kind = wp.uint32(1)  # leaving the solid: the ray started inside or a trim leaks
     return wp.optix_report_intersection(
         t,
@@ -201,17 +224,17 @@ def try_report(b: BrepData, face: int, t: float, u_in: float, v_in: float, norma
         wp.optix_float_as_uint32(n[0]),
         wp.optix_float_as_uint32(n[1]),
         wp.optix_float_as_uint32(n[2]),
-        wp.uint32(face),
+        wp.uint32(b.prims[prim].face),
     )
 
 
 @wp.func
-def local_ray(b: BrepData, face: int, origin: wp.vec3, direction: wp.vec3):
+def local_ray(b: BrepData, prim: int, origin: wp.vec3, direction: wp.vec3):
     """Ray in the face frame, re-centered near the surface origin for float32 precision."""
-    o = b.face_origin[face]
-    x = b.face_x[face]
-    y = b.face_y[face]
-    a = b.face_axis[face]
+    o = b.prims[prim].origin
+    x = b.prims[prim].x
+    y = b.prims[prim].y
+    a = b.prims[prim].axis
     shift = wp.dot(o - origin, direction) / wp.dot(direction, direction)
     rel = origin + shift * direction - o
     return (
@@ -222,24 +245,13 @@ def local_ray(b: BrepData, face: int, origin: wp.vec3, direction: wp.vec3):
 
 
 @wp.func
-def to_object(b: BrepData, face: int, n: wp.vec3) -> wp.vec3:
-    return n[0] * b.face_x[face] + n[1] * b.face_y[face] + n[2] * b.face_axis[face]
+def to_object(b: BrepData, prim: int, n: wp.vec3) -> wp.vec3:
+    return n[0] * b.prims[prim].x + n[1] * b.prims[prim].y + n[2] * b.prims[prim].axis
 
 
 # ---------------------------------------------------------------------------------------------
-# Intersection programs, one per surface kind
+# Intersection: quadrics (plane, cylinder, cone, sphere), torus, NURBS
 # ---------------------------------------------------------------------------------------------
-
-
-@wp.func
-def intersect_plane(brep: BrepData, prim: int, origin: wp.vec3, direction: wp.vec3):
-    face = brep.prim_face[prim]
-    a = brep.face_axis[face]
-    denom = wp.dot(direction, a)
-    if wp.abs(denom) > 1.0e-20:
-        t = wp.dot(brep.face_origin[face] - origin, a) / denom
-        rel = origin + t * direction - brep.face_origin[face]
-        try_report(brep, face, t, wp.dot(rel, brep.face_x[face]), wp.dot(rel, brep.face_y[face]), a, direction)
 
 
 @wp.func
@@ -263,72 +275,58 @@ def solve_quadratic(a: float, half_b: float, c: float):
 
 
 @wp.func
-def intersect_cylinder(brep: BrepData, prim: int, origin: wp.vec3, direction: wp.vec3):
-    face = brep.prim_face[prim]
-    o, d, shift = local_ray(brep, face, origin, direction)
-    r = brep.face_params[face][0]
+def quadric_hit(brep: BrepData, prim: int, origin: wp.vec3, direction: wp.vec3, first_root: int):
+    """The nearest root from ``first_root`` (0 near, 1 far) of a plane, cylinder, cone or sphere that
+    lies in the ray's range and inside the face: (hit, t, u, v, object normal, root).
+
+    All four kinds are one quadric in the face frame, Q(p) = a (x^2 + y^2) + e z^2 + h z - (g + k z)^2,
+    whose half gradient is the normal, so rays of a warp hitting mixed kinds share one path."""
+    kind = brep.prims[prim].flags >> KIND_SHIFT
+    o, d, shift = local_ray(brep, prim, origin, direction)
+    fp = brep.prims[prim].params
+    plane = kind == PLANE
+    a = wp.where(plane, 0.0, 1.0)
+    e = wp.where(kind == SPHERE, 1.0, 0.0)
+    h = wp.where(plane, 1.0, 0.0)
+    g = wp.where(plane, 0.0, fp[0])
+    k = wp.where(kind == CONE, fp[1], 0.0)
+    ro = g + k * o[2]
     count, t0, t1 = solve_quadratic(
-        d[0] * d[0] + d[1] * d[1], o[0] * d[0] + o[1] * d[1], o[0] * o[0] + o[1] * o[1] - r * r
+        a * (d[0] * d[0] + d[1] * d[1]) + (e - k * k) * d[2] * d[2],
+        a * (o[0] * d[0] + o[1] * d[1]) + (e * o[2] + 0.5 * h - k * ro) * d[2],
+        a * (o[0] * o[0] + o[1] * o[1]) + (e * o[2] + h) * o[2] - ro * ro,
     )
-    for i in range(count):
-        t = t0
-        if i == 1:
-            t = t1
-        p = o + t * d
-        if try_report(
-            brep,
-            face,
-            t + shift,
-            wp.atan2(p[1], p[0]),
-            p[2],
-            to_object(brep, face, wp.vec3(p[0], p[1], 0.0)),
-            direction,
-        ):
-            break
+    for i in range(first_root, count):
+        t = wp.where(i == 1, t1, t0)
+        if in_ray(t + shift):
+            p = o + t * d
+            rho = g + k * p[2]
+            u = p[0]
+            v = p[1]
+            if not plane:
+                s = wp.where(rho < 0.0, -1.0, 1.0)  # a cone past its apex: the angle of the mirrored point
+                u = wp.atan2(s * p[1], s * p[0])
+                v = p[2]
+                if kind == SPHERE:
+                    v = wp.asin(wp.clamp(p[2] / g, -1.0, 1.0))
+            inside, u, v = accept_uv(brep, prim, u, v)
+            if inside:
+                n = to_object(brep, prim, wp.vec3(a * p[0], a * p[1], e * p[2] + 0.5 * h - k * rho))
+                return True, t + shift, u, v, n, i
+    return False, 0.0, 0.0, 0.0, wp.vec3(), count
 
 
 @wp.func
-def intersect_cone(brep: BrepData, prim: int, origin: wp.vec3, direction: wp.vec3):
-    face = brep.prim_face[prim]
-    o, d, shift = local_ray(brep, face, origin, direction)
-    r = brep.face_params[face][0]
-    k = brep.face_params[face][1]
-    ro = r + k * o[2]
-    count, t0, t1 = solve_quadratic(
-        d[0] * d[0] + d[1] * d[1] - k * k * d[2] * d[2],
-        o[0] * d[0] + o[1] * d[1] - k * ro * d[2],
-        o[0] * o[0] + o[1] * o[1] - ro * ro,
-    )
-    for i in range(count):
-        t = t0
-        if i == 1:
-            t = t1
-        p = o + t * d
-        radius = r + k * p[2]
-        u = wp.atan2(p[1], p[0])
-        if radius < 0.0:
-            u = wp.atan2(-p[1], -p[0])
-        er = wp.vec3(wp.cos(u), wp.sin(u), 0.0)
-        # Su x Sv = R(v) (e_r - k e_z)
-        n = radius * (er - wp.vec3(0.0, 0.0, k))
-        if try_report(brep, face, t + shift, u, p[2], to_object(brep, face, n), direction):
-            break
-
-
-@wp.func
-def intersect_sphere(brep: BrepData, prim: int, origin: wp.vec3, direction: wp.vec3):
-    face = brep.prim_face[prim]
-    o, d, shift = local_ray(brep, face, origin, direction)
-    r = brep.face_params[face][0]
-    count, t0, t1 = solve_quadratic(wp.dot(d, d), wp.dot(o, d), wp.dot(o, o) - r * r)
-    for i in range(count):
-        t = t0
-        if i == 1:
-            t = t1
-        p = o + t * d
-        v = wp.asin(wp.clamp(p[2] / r, -1.0, 1.0))
-        if try_report(brep, face, t + shift, wp.atan2(p[1], p[0]), v, to_object(brep, face, p), direction):
-            break
+def intersect_quadric(brep: BrepData, prim: int, origin: wp.vec3, direction: wp.vec3):
+    """Report the nearest root inside the face. Both roots are tested before reporting: state live
+    across optixReportIntersection would be saved to the stack on every call."""
+    hit, t, u, v, n, root = quadric_hit(brep, prim, origin, direction, 0)
+    if hit and not report(brep, prim, t, u, v, n, direction) and root == 0:
+        # An any-hit rejected the near root (coverage): try the far one, recomputed from the ray.
+        direction = wp.optix_get_object_ray_direction()
+        hit, t, u, v, n, root = quadric_hit(brep, prim, wp.optix_get_object_ray_origin(), direction, 1)
+        if hit:
+            report(brep, prim, t, u, v, n, direction)
 
 
 class vec5(wp.types.vector(length=5, dtype=wp.float32)):
@@ -362,86 +360,100 @@ def bisect(c: vec5, order: int, lo_in: float, hi_in: float) -> float:
 
 
 @wp.func
-def monotone_split(c: vec5, order: int, pts: vec5, n: int):
-    """Roots of poly_eval(order) on the monotone pieces [pts[i], pts[i+1]] -> new breakpoints."""
-    out = vec5(0.0)
-    out[0] = 0.0
-    m = int(1)
-    for i in range(n - 1):
-        a = pts[i]
-        b = pts[i + 1]
-        fa = poly_eval(c, order, a)
-        fb = poly_eval(c, order, b)
-        if (fa < 0.0) != (fb < 0.0):
-            out[m] = bisect(c, order, a, b)
-            m += 1
-    out[m] = 1.0
-    return out, m + 1
+def changes_sign(c: vec5, order: int, lo: float, hi: float) -> bool:
+    return (poly_eval(c, order, lo) < 0.0) != (poly_eval(c, order, hi) < 0.0)
+
+
+@wp.func
+def derivative_root(c: vec5, lo: float, hi: float, previous: float) -> float:
+    """The root of f' in [lo, hi] (where f' is monotone) if it changes sign there, else ``previous``."""
+    if changes_sign(c, 1, lo, hi):
+        return bisect(c, 1, lo, hi)
+    return previous
+
+
+@wp.func
+def breakpoint_at(b: vec5, i: int) -> float:
+    """b[i] by selects: a runtime index into a vector would move it to local memory."""
+    if i == 0:
+        return b[0]
+    if i == 1:
+        return b[1]
+    if i == 2:
+        return b[2]
+    if i == 3:
+        return b[3]
+    return b[4]
 
 
 @wp.func
 def intersect_torus(brep: BrepData, prim: int, origin: wp.vec3, direction: wp.vec3):
-    face = brep.prim_face[prim]
-    o, d, shift = local_ray(brep, face, origin, direction)
-    major = brep.face_params[face][0]
-    minor = brep.face_params[face][1]
+    o, d, shift = local_ray(brep, prim, origin, direction)
+    major = brep.prims[prim].params[0]
+    minor = brep.prims[prim].params[1]
     bound = major + minor
     count, ta, tb = solve_quadratic(wp.dot(d, d), wp.dot(o, d), wp.dot(o, o) - bound * bound)
     ta = wp.max(ta, wp.optix_get_ray_tmin() - shift)
     tb = wp.min(tb, wp.optix_get_ray_tmax() - shift)
-    if count == 2 and tb > ta:
-        # Quartic in s on the clipped segment P(s) = A + s B, scaled so |P| <= 1.
-        inv = 1.0 / bound
-        A = (o + ta * d) * inv
-        B = (tb - ta) * d * inv
-        R = major * inv
-        k = R * R - minor * minor * inv * inv
-        a2 = wp.dot(B, B)
-        a1 = 2.0 * wp.dot(A, B)
-        g0 = wp.dot(A, A) + k
-        b2 = B[0] * B[0] + B[1] * B[1]
-        b1 = 2.0 * (A[0] * B[0] + A[1] * B[1])
-        b0 = A[0] * A[0] + A[1] * A[1]
-        fr = 4.0 * R * R
-        c = vec5(g0 * g0 - fr * b0, 2.0 * a1 * g0 - fr * b1, a1 * a1 + 2.0 * a2 * g0 - fr * b2, 2.0 * a2 * a1, a2 * a2)
-        # Isolate roots through the derivatives: f'' (quadratic, closed form) splits [0, 1]
-        # into pieces where f' is monotone; f' roots split it where f is monotone.
-        pts = vec5(0.0)
-        n = int(1)
-        qc, q0, q1 = solve_quadratic(12.0 * c[4], 3.0 * c[3], 2.0 * c[2])
-        for i in range(qc):
-            r = q0
-            if i == 1:
-                r = q1
-            if r > 0.0 and r < 1.0:
-                pts[n] = r
-                n += 1
-        pts[n] = 1.0
-        n += 1
-        crit, m = monotone_split(c, 1, pts, n)
-        for i in range(m - 1):
-            fa = poly_eval(c, 0, crit[i])
-            fb = poly_eval(c, 0, crit[i + 1])
-            if (fa < 0.0) != (fb < 0.0):
-                s = bisect(c, 0, crit[i], crit[i + 1])
-                df = poly_eval(c, 1, s)
-                if df != 0.0:
-                    s = wp.clamp(s - poly_eval(c, 0, s) / df, crit[i], crit[i + 1])
-                t = ta + s * (tb - ta)
-                p = o + t * d
-                rho = wp.sqrt(p[0] * p[0] + p[1] * p[1])
-                nrm = p - wp.vec3(p[0], p[1], 0.0) * (major / wp.max(rho, 1.0e-30))
-                if try_report(
-                    brep,
-                    face,
-                    t + shift,
-                    wp.atan2(p[1], p[0]),
-                    wp.atan2(p[2], rho - major),
-                    to_object(brep, face, nrm),
-                    direction,
-                ):
-                    break
+    if count < 2 or tb <= ta:
+        return
+    # Quartic in s on the clipped segment P(s) = A + s B, scaled so |P| <= 1.
+    inv = 1.0 / bound
+    A = (o + ta * d) * inv
+    B = (tb - ta) * d * inv
+    R = major * inv
+    k = R * R - minor * minor * inv * inv
+    a2 = wp.dot(B, B)
+    a1 = 2.0 * wp.dot(A, B)
+    g0 = wp.dot(A, A) + k
+    b2 = B[0] * B[0] + B[1] * B[1]
+    b1 = 2.0 * (A[0] * B[0] + A[1] * B[1])
+    b0 = A[0] * A[0] + A[1] * A[1]
+    fr = 4.0 * R * R
+    c = vec5(g0 * g0 - fr * b0, 2.0 * a1 * g0 - fr * b1, a1 * a1 + 2.0 * a2 * g0 - fr * b2, 2.0 * a2 * a1, a2 * a2)
+    # Isolate roots through the derivatives: the roots of f'' (a quadratic) split [0, 1] into
+    # pieces where f' is monotone; the roots of f' split it where f is monotone. Missing roots
+    # repeat the previous breakpoint, leaving empty pieces that cannot change sign.
+    qc, q0, q1 = solve_quadratic(12.0 * c[4], 3.0 * c[3], 2.0 * c[2])
+    p1 = float(0.0)
+    if qc >= 1 and q0 > 0.0 and q0 < 1.0:
+        p1 = q0
+    p2 = p1
+    if qc == 2 and q1 > 0.0 and q1 < 1.0:
+        p2 = q1
+    r1 = derivative_root(c, 0.0, p1, 0.0)
+    r2 = derivative_root(c, p1, p2, r1)
+    r3 = derivative_root(c, p2, 1.0, r2)
+    crit = vec5(0.0, r1, r2, r3, 1.0)
+    i = int(0)
+    while i < 4:
+        lo = breakpoint_at(crit, i)
+        hi = breakpoint_at(crit, i + 1)
+        if changes_sign(c, 0, lo, hi):
+            s = bisect(c, 0, lo, hi)
+            df = poly_eval(c, 1, s)
+            if df != 0.0:
+                s = wp.clamp(s - poly_eval(c, 0, s) / df, lo, hi)
+            t = ta + s * (tb - ta)
+            p = o + t * d
+            rho = wp.sqrt(p[0] * p[0] + p[1] * p[1])
+            nrm = p - wp.vec3(p[0], p[1], 0.0) * (major / wp.max(rho, 1.0e-30))
+            if try_report(
+                brep,
+                prim,
+                t + shift,
+                wp.atan2(p[1], p[0]),
+                wp.atan2(p[2], rho - major),
+                to_object(brep, prim, nrm),
+                direction,
+            ):
+                return
+        i += 1
 
+
+# ---------------------------------------------------------------------------------------------
+# NURBS sub-patches: rational Bezier patches, bicubic (in registers) or of degree <= 7 (global)
+# ---------------------------------------------------------------------------------------------
 
 MAX_ORDER = 8  # Bezier degree <= 7 per direction
 vec8 = wp.types.vector(length=MAX_ORDER, dtype=wp.float32)
@@ -449,50 +461,48 @@ vec8 = wp.types.vector(length=MAX_ORDER, dtype=wp.float32)
 
 @wp.func
 def bernstein_all(n: int, x: float):
-    """All degree-n Bernstein polynomials at x and their derivatives (NURBS Book A1.3)."""
+    """All degree-n Bernstein polynomials at x and their derivatives (NURBS Book A1.3).
+
+    The loops run to the largest degree, guarded: constant bounds unroll, so every vector index
+    is static and the vectors stay in registers instead of local memory.
+    """
     basis = vec8(0.0)
     basis[0] = 1.0
     deriv = vec8(0.0)
     x1 = 1.0 - x
-    for j in range(1, n + 1):
-        if j == n:  # basis holds degree n-1: dB_i^n = n (B_{i-1}^{n-1} - B_i^{n-1})
-            prev = float(0.0)
-            for k in range(n):
-                deriv[k] = float(n) * (prev - basis[k])
-                prev = basis[k]
-            deriv[n] = float(n) * prev
-        saved = float(0.0)
-        for k in range(j):
-            temp = basis[k]
-            basis[k] = saved + x1 * temp
-            saved = x * temp
-        basis[j] = saved
+    for j in range(1, MAX_ORDER):
+        if j <= n:
+            if j == n:  # basis holds degree n-1: dB_i^n = n (B_{i-1}^{n-1} - B_i^{n-1})
+                prev = float(0.0)
+                for k in range(j):
+                    deriv[k] = float(j) * (prev - basis[k])
+                    prev = basis[k]
+                deriv[j] = float(j) * prev
+            saved = float(0.0)
+            for k in range(j):
+                temp = basis[k]
+                basis[k] = saved + x1 * temp
+                saved = x * temp
+            basis[j] = saved
     return basis, deriv
 
 
 @wp.func
-def eval_bezier(b: BrepData, base: int, p: int, q: int, s: float, t: float):
-    """Rational tensor Bezier patch: point and first partial derivatives."""
-    bu, dbu = bernstein_all(p, s)
-    bv, dbv = bernstein_all(q, t)
-    acc = wp.vec4(0.0)
-    acc_s = wp.vec4(0.0)
-    acc_t = wp.vec4(0.0)
-    for i in range(p + 1):
-        row = wp.vec4(0.0)
-        row_t = wp.vec4(0.0)
-        for j in range(q + 1):
-            cv = b.cvs[base + i * (q + 1) + j]
-            row += bv[j] * cv
-            row_t += dbv[j] * cv
-        acc += bu[i] * row
-        acc_s += dbu[i] * row
-        acc_t += bu[i] * row_t
-    w = acc[3]
-    point = wp.vec3(acc[0], acc[1], acc[2]) / w
-    ds = (wp.vec3(acc_s[0], acc_s[1], acc_s[2]) - acc_s[3] * point) / w
-    dt = (wp.vec3(acc_t[0], acc_t[1], acc_t[2]) - acc_t[3] * point) / w
-    return point, ds, dt
+def basis_at(b: vec8, i: int) -> float:
+    """b[i] by selects: a runtime index into a vector would move it to local memory."""
+    out = b[0]
+    for k in range(1, MAX_ORDER):
+        if i == k:
+            out = b[k]
+    return out
+
+
+@wp.struct
+class Bezier:
+    """A rational Bezier patch of any degree up to 7: its control points' base in ``BrepData.cvs``."""
+
+    base: int
+    degree: wp.vec2i
 
 
 @wp.struct
@@ -506,96 +516,17 @@ class Cubic:
 
 
 @wp.func
-def load_cubic(b: BrepData, base: int) -> Cubic:
-    v0 = b.cvs[base + 0]
-    v1 = b.cvs[base + 1]
-    v2 = b.cvs[base + 2]
-    v3 = b.cvs[base + 3]
-    v4 = b.cvs[base + 4]
-    v5 = b.cvs[base + 5]
-    v6 = b.cvs[base + 6]
-    v7 = b.cvs[base + 7]
-    v8 = b.cvs[base + 8]
-    v9 = b.cvs[base + 9]
-    v10 = b.cvs[base + 10]
-    v11 = b.cvs[base + 11]
-    v12 = b.cvs[base + 12]
-    v13 = b.cvs[base + 13]
-    v14 = b.cvs[base + 14]
-    v15 = b.cvs[base + 15]
+def load_cubic(cvs: wp.array[wp.vec4], base: int) -> Cubic:
+    # Row i's four control points as matrix columns: rows 0..3 of that matrix are row i of x..w.
+    r0 = wp.matrix_from_cols(cvs[base + 0], cvs[base + 1], cvs[base + 2], cvs[base + 3])
+    r1 = wp.matrix_from_cols(cvs[base + 4], cvs[base + 5], cvs[base + 6], cvs[base + 7])
+    r2 = wp.matrix_from_cols(cvs[base + 8], cvs[base + 9], cvs[base + 10], cvs[base + 11])
+    r3 = wp.matrix_from_cols(cvs[base + 12], cvs[base + 13], cvs[base + 14], cvs[base + 15])
     c = Cubic()
-    c.x = wp.mat44(
-        v0[0],
-        v1[0],
-        v2[0],
-        v3[0],
-        v4[0],
-        v5[0],
-        v6[0],
-        v7[0],
-        v8[0],
-        v9[0],
-        v10[0],
-        v11[0],
-        v12[0],
-        v13[0],
-        v14[0],
-        v15[0],
-    )
-    c.y = wp.mat44(
-        v0[1],
-        v1[1],
-        v2[1],
-        v3[1],
-        v4[1],
-        v5[1],
-        v6[1],
-        v7[1],
-        v8[1],
-        v9[1],
-        v10[1],
-        v11[1],
-        v12[1],
-        v13[1],
-        v14[1],
-        v15[1],
-    )
-    c.z = wp.mat44(
-        v0[2],
-        v1[2],
-        v2[2],
-        v3[2],
-        v4[2],
-        v5[2],
-        v6[2],
-        v7[2],
-        v8[2],
-        v9[2],
-        v10[2],
-        v11[2],
-        v12[2],
-        v13[2],
-        v14[2],
-        v15[2],
-    )
-    c.w = wp.mat44(
-        v0[3],
-        v1[3],
-        v2[3],
-        v3[3],
-        v4[3],
-        v5[3],
-        v6[3],
-        v7[3],
-        v8[3],
-        v9[3],
-        v10[3],
-        v11[3],
-        v12[3],
-        v13[3],
-        v14[3],
-        v15[3],
-    )
+    c.x = wp.matrix_from_rows(r0[0], r1[0], r2[0], r3[0])
+    c.y = wp.matrix_from_rows(r0[1], r1[1], r2[1], r3[1])
+    c.z = wp.matrix_from_rows(r0[2], r1[2], r2[2], r3[2])
+    c.w = wp.matrix_from_rows(r0[3], r1[3], r2[3], r3[3])
     return c
 
 
@@ -626,393 +557,348 @@ def eval_cubic(c: Cubic, s: float, t: float):
     yt = c.y * dbv
     zt = c.z * dbv
     wt = c.w * dbv
-    w = wp.dot(bu, wv)
-    point = wp.vec3(wp.dot(bu, xv), wp.dot(bu, yv), wp.dot(bu, zv)) / w
-    ds = (wp.vec3(wp.dot(dbu, xv), wp.dot(dbu, yv), wp.dot(dbu, zv)) - wp.dot(dbu, wv) * point) / w
-    dt = (wp.vec3(wp.dot(bu, xt), wp.dot(bu, yt), wp.dot(bu, zt)) - wp.dot(bu, wt) * point) / w
+    inv_w = 1.0 / wp.dot(bu, wv)  # one division: a vector divided by w costs one per component
+    point = wp.vec3(wp.dot(bu, xv), wp.dot(bu, yv), wp.dot(bu, zv)) * inv_w
+    ds = (wp.vec3(wp.dot(dbu, xv), wp.dot(dbu, yv), wp.dot(dbu, zv)) - wp.dot(dbu, wv) * point) * inv_w
+    dt = (wp.vec3(wp.dot(bu, xt), wp.dot(bu, yt), wp.dot(bu, zt)) - wp.dot(bu, wt) * point) * inv_w
     return point, ds, dt
 
 
 @wp.func
-def newton_patch(
-    brep: BrepData,
-    base: int,
-    deg: wp.vec2i,
-    n1: wp.vec3,
-    n2: wp.vec3,
-    near: wp.vec3,
-    tol: float,
-    s_seed: float,
-    t_seed: float,
-):
-    """Newton on the two-plane form of the ray from (s_seed, t_seed).
-
-    Returns (converged, inside the patch, s, t, S, S_s, S_t).
-    """
-    s = s_seed
-    t = t_seed
-    converged = bool(False)
-    point = wp.vec3(0.0)
-    ds = wp.vec3(0.0)
-    dt = wp.vec3(0.0)
-    for _ in range(NEWTON_ITERATIONS):
-        point, ds, dt = eval_bezier(brep, base, deg[0], deg[1], s, t)
-        rel = point - near
-        f0 = wp.dot(n1, rel)
-        f1 = wp.dot(n2, rel)
-        if wp.abs(f0) + wp.abs(f1) < tol:
-            converged = True
-            break
-        j00 = wp.dot(n1, ds)
-        j01 = wp.dot(n1, dt)
-        j10 = wp.dot(n2, ds)
-        j11 = wp.dot(n2, dt)
-        det = j00 * j11 - j01 * j10
-        if wp.abs(det) < 1.0e-30:
-            break
-        s = s - (j11 * f0 - j01 * f1) / det
-        t = t - (-j10 * f0 + j00 * f1) / det
-        if s < -0.5 or s > 1.5 or t < -0.5 or t > 1.5:
-            break
-    inside = s >= -1.0e-4 and s <= 1.0001 and t >= -1.0e-4 and t <= 1.0001
-    return converged, converged and inside, s, t, point, ds, dt
+def eval_patch(patch: Cubic, cvs: wp.array[wp.vec4], s: float, t: float):
+    return eval_cubic(patch, s, t)
 
 
 @wp.func
-def newton_cubic(
-    c: Cubic,
-    n1: wp.vec3,
-    n2: wp.vec3,
-    near: wp.vec3,
-    tol: float,
-    s_seed: float,
-    t_seed: float,
-):
-    """Newton on the two-plane form of the ray from (s_seed, t_seed).
+def eval_patch(patch: Bezier, cvs: wp.array[wp.vec4], s: float, t: float):
+    """Rational tensor Bezier patch: point and first partial derivatives."""
+    p = patch.degree[0]
+    q = patch.degree[1]
+    bu, dbu = bernstein_all(p, s)
+    bv, dbv = bernstein_all(q, t)
+    acc = wp.vec4(0.0)
+    acc_s = wp.vec4(0.0)
+    acc_t = wp.vec4(0.0)
+    for i in range(p + 1):
+        row = wp.vec4(0.0)
+        row_t = wp.vec4(0.0)
+        for j in range(q + 1):
+            cv = cvs[patch.base + i * (q + 1) + j]
+            row += basis_at(bv, j) * cv
+            row_t += basis_at(dbv, j) * cv
+        acc += basis_at(bu, i) * row
+        acc_s += basis_at(dbu, i) * row
+        acc_t += basis_at(bu, i) * row_t
+    inv_w = 1.0 / acc[3]
+    point = wp.vec3(acc[0], acc[1], acc[2]) * inv_w
+    ds = (wp.vec3(acc_s[0], acc_s[1], acc_s[2]) - acc_s[3] * point) * inv_w
+    dt = (wp.vec3(acc_t[0], acc_t[1], acc_t[2]) - acc_t[3] * point) * inv_w
+    return point, ds, dt
 
-    Returns (converged, inside the patch, s, t, S, S_s, S_t).
+
+@wp.func
+def patch_degree(patch: Cubic) -> wp.vec2i:
+    return wp.vec2i(3, 3)
+
+
+@wp.func
+def patch_degree(patch: Bezier) -> wp.vec2i:
+    return patch.degree
+
+
+@wp.func
+def first_point(patch: Cubic, cvs: wp.array[wp.vec4]) -> wp.vec3:
+    return wp.vec3(patch.x[0, 0], patch.y[0, 0], patch.z[0, 0]) / patch.w[0, 0]
+
+
+@wp.func
+def first_point(patch: Bezier, cvs: wp.array[wp.vec4]) -> wp.vec3:
+    cv = cvs[patch.base]
+    return wp.vec3(cv[0], cv[1], cv[2]) / cv[3]
+
+
+@wp.struct
+class PatchRay:
+    """An object-space ray as the intersection of two planes through it (n1, n2 orthonormal to
+    the direction), with a point ``near`` on it next to the patch."""
+
+    direction: wp.vec3
+    unit: wp.vec3
+    dd: float  # direction . direction
+    n1: wp.vec3
+    n2: wp.vec3
+    near: wp.vec3
+    shift: float  # ray parameter of near
+
+
+@wp.func
+def patch_ray(origin: wp.vec3, direction: wp.vec3, anchor: wp.vec3) -> PatchRay:
+    """Re-center the ray next to ``anchor``: with a distant origin, n . (S - o) cancels in float32
+    down to the convergence tolerance and Newton fails at random pixels."""
+    r = PatchRay()
+    r.direction = direction
+    r.unit = wp.normalize(direction)
+    r.dd = wp.dot(direction, direction)
+    if wp.abs(r.unit[0]) > wp.abs(r.unit[1]) and wp.abs(r.unit[0]) > wp.abs(r.unit[2]):
+        r.n1 = wp.normalize(wp.vec3(r.unit[1], -r.unit[0], 0.0))
+    else:
+        r.n1 = wp.normalize(wp.vec3(0.0, r.unit[2], -r.unit[1]))
+    r.n2 = wp.cross(r.n1, r.unit)
+    r.shift = wp.dot(anchor - origin, direction) / r.dd
+    r.near = origin + r.shift * direction
+    return r
+
+
+@wp.func
+def ray_t(ray: PatchRay, point: wp.vec3) -> float:
+    """Ray parameter of (the projection of) a point."""
+    return ray.shift + wp.dot(point - ray.near, ray.direction) / ray.dd
+
+
+@wp.struct
+class Hull:
+    """The control points seen from the ray: (n1, n2) . (P - near) ranges, the nearest point along
+    the ray, and the control point closest to the ray."""
+
+    lo: wp.vec2
+    hi: wp.vec2
+    nearest: float
+    closest: float
+    closest_index: int
+
+
+@wp.func
+def hull_add(h: Hull, i: int, cv: wp.vec4, ray: PatchRay) -> Hull:
+    rel = wp.vec3(cv[0], cv[1], cv[2]) * (1.0 / cv[3]) - ray.near
+    d = wp.vec2(wp.dot(ray.n1, rel), wp.dot(ray.n2, rel))
+    out = h
+    out.lo = wp.min(h.lo, d)
+    out.hi = wp.max(h.hi, d)
+    out.nearest = wp.min(h.nearest, wp.dot(rel, ray.direction))
+    if wp.dot(d, d) < h.closest:
+        out.closest = wp.dot(d, d)
+        out.closest_index = i
+    return out
+
+
+@wp.func
+def hull_new() -> Hull:
+    h = Hull()
+    h.lo = wp.vec2(1.0e30)
+    h.hi = wp.vec2(-1.0e30)
+    h.nearest = 1.0e30
+    h.closest = 1.0e30
+    h.closest_index = 0
+    return h
+
+
+@wp.func
+def patch_hull(patch: Cubic, cvs: wp.array[wp.vec4], ray: PatchRay) -> Hull:
+    h = hull_new()
+    for i in range(16):  # a constant count: unrolled, so the matrices stay in registers
+        h = hull_add(
+            h,
+            i,
+            wp.vec4(patch.x[i // 4, i % 4], patch.y[i // 4, i % 4], patch.z[i // 4, i % 4], patch.w[i // 4, i % 4]),
+            ray,
+        )
+    return h
+
+
+@wp.func
+def patch_hull(patch: Bezier, cvs: wp.array[wp.vec4], ray: PatchRay) -> Hull:
+    h = hull_new()
+    for i in range((patch.degree[0] + 1) * (patch.degree[1] + 1)):
+        h = hull_add(h, i, cvs[patch.base + i], ray)
+    return h
+
+
+@wp.func
+def hull_tmin(hull: Hull, ray: PatchRay, tol: float) -> float:
+    """A lower bound of the ray parameter of any patch point (weights are positive, so the patch
+    lies in the convex hull of its Euclidean control points)."""
+    return ray.shift + hull.nearest / ray.dd - tol / wp.sqrt(ray.dd)
+
+
+@wp.func
+def hull_misses(hull: Hull, tol: float) -> bool:
+    """Convex-hull rejection (the first step of Bezier clipping): the ray lies on both planes, so
+    it can only hit the patch if the control points straddle each plane."""
+    return hull.lo[0] > tol or hull.hi[0] < -tol or hull.lo[1] > tol or hull.hi[1] < -tol
+
+
+@wp.func
+def newton(patch: Any, cvs: wp.array[wp.vec4], ray: PatchRay, tol: float, seed: wp.vec2):
+    """Newton on the two-plane form of the ray (Martin et al. 2000) from ``seed``.
+
+    Returns (converged, converged inside the patch, (s, t), S, S_s, S_t).
     """
-    s = s_seed
-    t = t_seed
+    st = seed
     converged = bool(False)
     point = wp.vec3(0.0)
     ds = wp.vec3(0.0)
     dt = wp.vec3(0.0)
     for _ in range(NEWTON_ITERATIONS):
-        point, ds, dt = eval_cubic(c, s, t)
-        rel = point - near
-        f0 = wp.dot(n1, rel)
-        f1 = wp.dot(n2, rel)
+        point, ds, dt = eval_patch(patch, cvs, st[0], st[1])
+        rel = point - ray.near
+        f0 = wp.dot(ray.n1, rel)
+        f1 = wp.dot(ray.n2, rel)
         if wp.abs(f0) + wp.abs(f1) < tol:
             converged = True
             break
-        j00 = wp.dot(n1, ds)
-        j01 = wp.dot(n1, dt)
-        j10 = wp.dot(n2, ds)
-        j11 = wp.dot(n2, dt)
+        j00 = wp.dot(ray.n1, ds)
+        j01 = wp.dot(ray.n1, dt)
+        j10 = wp.dot(ray.n2, ds)
+        j11 = wp.dot(ray.n2, dt)
         det = j00 * j11 - j01 * j10
         if wp.abs(det) < 1.0e-30:
             break
-        s = s - (j11 * f0 - j01 * f1) / det
-        t = t - (-j10 * f0 + j00 * f1) / det
-        if s < -0.5 or s > 1.5 or t < -0.5 or t > 1.5:
+        inv_det = 1.0 / det
+        st = wp.vec2(st[0] - (j11 * f0 - j01 * f1) * inv_det, st[1] - (-j10 * f0 + j00 * f1) * inv_det)
+        if st[0] < -0.5 or st[0] > 1.5 or st[1] < -0.5 or st[1] > 1.5:
             break
-    inside = s >= -1.0e-4 and s <= 1.0001 and t >= -1.0e-4 and t <= 1.0001
-    return converged, converged and inside, s, t, point, ds, dt
+    inside = st[0] >= -1.0e-4 and st[0] <= 1.0001 and st[1] >= -1.0e-4 and st[1] <= 1.0001
+    return converged, converged and inside, st, point, ds, dt
+
+
+@wp.func
+def upstream_step(ds: wp.vec3, dt: wp.vec3, unit: wp.vec3) -> wp.vec2:
+    """Unit parameter-space direction that moves the surface point against the ray (least
+    squares), or zero: from an exit root, the entry lies that way."""
+    a00 = wp.dot(ds, ds)
+    a01 = wp.dot(ds, dt)
+    a11 = wp.dot(dt, dt)
+    b0 = -wp.dot(ds, unit)
+    b1 = -wp.dot(dt, unit)
+    det = a00 * a11 - a01 * a01
+    if wp.abs(det) <= 1.0e-30:
+        return wp.vec2(0.0)
+    step = wp.vec2((a11 * b0 - a01 * b1) / det, (a00 * b1 - a01 * b0) / det)
+    length = wp.length(step)
+    if length > 0.0:
+        return step / length
+    return wp.vec2(0.0)
+
+
+@wp.func
+def outward_cosine(brep: BrepData, prim: int, ds: wp.vec3, dt: wp.vec3, unit: wp.vec3) -> float:
+    """Cosine between the face's outward normal and the ray: positive where the ray leaves."""
+    normal = wp.normalize(wp.cross(ds, dt))
+    if (brep.prims[prim].flags & FLAG_FLIP) != 0:
+        normal = -normal
+    return wp.dot(normal, unit)
 
 
 @wp.func
 def report_patch_hit(
-    brep: BrepData,
-    prim: int,
-    face: int,
-    s: float,
-    t: float,
-    point: wp.vec3,
-    ds: wp.vec3,
-    dt: wp.vec3,
-    near: wp.vec3,
-    shift: float,
-    direction: wp.vec3,
+    brep: BrepData, prim: int, st: wp.vec2, point: wp.vec3, ds: wp.vec3, dt: wp.vec3, ray: PatchRay
 ) -> float:
     """Report a sub-patch root; returns the cosine between the outward normal and the ray there."""
     rect = brep.prim_uv[prim]
-    normal = wp.cross(ds, dt)
     try_report(
         brep,
-        face,
-        shift + wp.dot(point - near, direction) / wp.dot(direction, direction),
-        rect[0] + s * (rect[1] - rect[0]),
-        rect[2] + t * (rect[3] - rect[2]),
-        normal,
-        direction,
+        prim,
+        ray_t(ray, point),
+        rect[0] + st[0] * (rect[1] - rect[0]),
+        rect[2] + st[1] * (rect[3] - rect[2]),
+        wp.cross(ds, dt),
+        ray.direction,
     )
-    if (brep.face_flags[face] & FLAG_FLIP) != 0:
-        normal = -normal
-    return wp.dot(wp.normalize(normal), wp.normalize(direction))
+    return outward_cosine(brep, prim, ds, dt, ray.unit)
 
 
 @wp.func
-def intersect_nurbs_generic(brep: BrepData, prim: int, origin: wp.vec3, direction: wp.vec3):
-    """Rational Bezier patches of any degree up to 7, read from global memory."""
-    face = brep.prim_face[prim]
-    deg = brep.prim_degree[prim]
-    base = brep.prim_cv[prim]
+def intersect_patch(brep: BrepData, prim: int, patch: Any, origin: wp.vec3, direction: wp.vec3):
+    """Every root of the ray with one sub-patch, inside the face's trims (OptiX keeps the nearest)."""
     tol = brep.prim_tol[prim]
-    # The ray as the intersection of two planes through it.
-    dn = wp.normalize(direction)
-    n1 = wp.vec3(0.0)
-    if wp.abs(dn[0]) > wp.abs(dn[1]) and wp.abs(dn[0]) > wp.abs(dn[2]):
-        n1 = wp.normalize(wp.vec3(dn[1], -dn[0], 0.0))
-    else:
-        n1 = wp.normalize(wp.vec3(0.0, dn[2], -dn[1]))
-    n2 = wp.cross(n1, dn)
-    # Re-center the ray origin next to the patch: with a distant origin, n . (S - o) cancels
-    # in float32 down to the convergence tolerance and Newton fails at random pixels.
-    corner = brep.cvs[base]
-    dd = wp.dot(direction, direction)
-    shift = wp.dot(wp.vec3(corner[0], corner[1], corner[2]) / corner[3] - origin, direction) / dd
-    near = origin + shift * direction
-    # Convex-hull rejection (the first step of Bezier clipping): the ray lies on both planes, so
-    # it can only hit the patch if the control points straddle each plane. Weights are positive,
-    # so the patch lies in the hull of its Euclidean control points.
-    # The same pass picks the control point nearest the ray as the Newton seed: control point
-    # (i, j) of a Bezier patch sits at about parameter (i / p, j / q).
-    lo1 = float(1.0e30)
-    hi1 = float(-1.0e30)
-    lo2 = float(1.0e30)
-    hi2 = float(-1.0e30)
-    best = float(1.0e30)
-    best_index = int(0)
-    nearest = float(1.0e30)
-    for i in range((deg[0] + 1) * (deg[1] + 1)):
-        cv = brep.cvs[base + i]
-        rel = wp.vec3(cv[0], cv[1], cv[2]) / cv[3] - near
-        d1 = wp.dot(n1, rel)
-        d2 = wp.dot(n2, rel)
-        lo1 = wp.min(lo1, d1)
-        hi1 = wp.max(hi1, d1)
-        lo2 = wp.min(lo2, d2)
-        hi2 = wp.max(hi2, d2)
-        nearest = wp.min(nearest, wp.dot(rel, direction))
-        dist = d1 * d1 + d2 * d2
-        if dist < best:
-            best = dist
-            best_index = i
-    if lo1 > tol or hi1 < -tol or lo2 > tol or hi2 < -tol:
-        return
-    # The patch lies beyond the closest hit found so far.
-    hull_tmin = shift + nearest / dd - tol / wp.sqrt(dd)
-    if hull_tmin > wp.optix_get_ray_tmax():
-        return
+    ray = patch_ray(origin, direction, first_point(patch, brep.cvs))
+    hull = patch_hull(patch, brep.cvs, ray)
+    t_lo = hull_tmin(hull, ray, tol)
+    if hull_misses(hull, tol) or t_lo > wp.optix_get_ray_tmax():
+        return  # no hit, or none nearer than the closest hit so far
     # A ray starting within the patch's depth range (a bounce or shadow ray leaving this surface)
     # is not the silhouette case the retries are for: Newton finds its own origin, below tmin.
-    arriving = hull_tmin > wp.optix_get_ray_tmin()
-    seed_s = float(best_index // (deg[1] + 1)) / float(wp.max(deg[0], 1))
-    seed_t = float(best_index % (deg[1] + 1)) / float(wp.max(deg[1], 1))
-    # Newton fails or finds the wrong root only where the ray is nearly tangent to the surface:
-    # a grazing ray crosses a curved sub-patch twice near a silhouette, entering and leaving.
-    # Every root found inside the patch is reported (OptiX keeps the nearest). Without a root
-    # where the ray enters, and only when the ray grazes the surface at Newton's last point:
-    # - after divergence, retry once from the patch center;
-    # - from an exit root, the entry lies upstream along the ray: step back along the ray's
-    #   direction mapped into the parameter domain, and seed Newton there.
-    converged, ok, s, t, point, ds, dt = newton_patch(brep, base, deg, n1, n2, near, tol, seed_s, seed_t)
-    retry = arriving and ((not converged) or wp.abs(wp.dot(wp.normalize(wp.cross(ds, dt)), dn)) < GRAZING_COS)
-    if ok:
-        # Report first: the hit must be reported whether or not the ray grazes.
-        cosine = report_patch_hit(brep, prim, face, s, t, point, ds, dt, near, shift, direction)
-        retry = retry and cosine >= 0.0
-    if retry and not ok:
-        converged, ok, s, t, point, ds, dt = newton_patch(brep, base, deg, n1, n2, near, tol, 0.5, 0.5)
-        if ok:
-            retry = report_patch_hit(brep, prim, face, s, t, point, ds, dt, near, shift, direction) >= 0.0
-    if retry and ok:
-        # Least-squares parameter step that moves the surface point by -dn.
-        a00 = wp.dot(ds, ds)
-        a01 = wp.dot(ds, dt)
-        a11 = wp.dot(dt, dt)
-        b0 = -wp.dot(ds, dn)
-        b1 = -wp.dot(dt, dn)
-        det = a00 * a11 - a01 * a01
-        if wp.abs(det) > 1.0e-30:
-            step = wp.vec2((a11 * b0 - a01 * b1) / det, (a00 * b1 - a01 * b0) / det)
-            length = wp.length(step)
-            if length > 0.0:
-                step = step / length
-                exit_s = s
-                exit_t = t
-                for k in range(2):
-                    reach = 0.35 * float(k + 1)
-                    s0 = wp.clamp(exit_s + reach * step[0], 0.0, 1.0)
-                    t0 = wp.clamp(exit_t + reach * step[1], 0.0, 1.0)
-                    converged, ok, s, t, point, ds, dt = newton_patch(brep, base, deg, n1, n2, near, tol, s0, t0)
-                    if ok:
-                        if report_patch_hit(brep, prim, face, s, t, point, ds, dt, near, shift, direction) < 0.0:
-                            retry = False
-                            break
-    if retry:
-        # Last resort for grazing rays still without an entry: seeds near the patch corners.
-        for k in range(4):
-            s0 = 0.15
-            t0 = 0.15
-            if k == 1 or k == 3:
-                s0 = 0.85
-            if k >= 2:
-                t0 = 0.85
-            converged, ok, s, t, point, ds, dt = newton_patch(brep, base, deg, n1, n2, near, tol, s0, t0)
-            if ok:
-                if report_patch_hit(brep, prim, face, s, t, point, ds, dt, near, shift, direction) < 0.0:
-                    break
-
-
-@wp.func
-def intersect_nurbs_cubic(brep: BrepData, prim: int, origin: wp.vec3, direction: wp.vec3):
-    """``intersect_nurbs`` for bicubic patches, with the control points held in registers."""
-    face = brep.prim_face[prim]
-    deg = brep.prim_degree[prim]
-    base = brep.prim_cv[prim]
-    c = load_cubic(brep, base)
-    tol = brep.prim_tol[prim]
-    # The ray as the intersection of two planes through it.
-    dn = wp.normalize(direction)
-    n1 = wp.vec3(0.0)
-    if wp.abs(dn[0]) > wp.abs(dn[1]) and wp.abs(dn[0]) > wp.abs(dn[2]):
-        n1 = wp.normalize(wp.vec3(dn[1], -dn[0], 0.0))
-    else:
-        n1 = wp.normalize(wp.vec3(0.0, dn[2], -dn[1]))
-    n2 = wp.cross(n1, dn)
-    # Re-center the ray origin next to the patch: with a distant origin, n . (S - o) cancels
-    # in float32 down to the convergence tolerance and Newton fails at random pixels.
-    corner = wp.vec4(c.x[0, 0], c.y[0, 0], c.z[0, 0], c.w[0, 0])
-    dd = wp.dot(direction, direction)
-    shift = wp.dot(wp.vec3(corner[0], corner[1], corner[2]) / corner[3] - origin, direction) / dd
-    near = origin + shift * direction
-    # Convex-hull rejection (the first step of Bezier clipping): the ray lies on both planes, so
-    # it can only hit the patch if the control points straddle each plane. Weights are positive,
-    # so the patch lies in the hull of its Euclidean control points.
-    # The same pass picks the control point nearest the ray as the Newton seed: control point
-    # (i, j) of a Bezier patch sits at about parameter (i / p, j / q).
-    lo1 = float(1.0e30)
-    hi1 = float(-1.0e30)
-    lo2 = float(1.0e30)
-    hi2 = float(-1.0e30)
-    best = float(1.0e30)
-    best_index = int(0)
-    nearest = float(1.0e30)
-    for i in range((deg[0] + 1) * (deg[1] + 1)):
-        cv = wp.vec4(c.x[i // 4, i % 4], c.y[i // 4, i % 4], c.z[i // 4, i % 4], c.w[i // 4, i % 4])
-        rel = wp.vec3(cv[0], cv[1], cv[2]) / cv[3] - near
-        d1 = wp.dot(n1, rel)
-        d2 = wp.dot(n2, rel)
-        lo1 = wp.min(lo1, d1)
-        hi1 = wp.max(hi1, d1)
-        lo2 = wp.min(lo2, d2)
-        hi2 = wp.max(hi2, d2)
-        nearest = wp.min(nearest, wp.dot(rel, direction))
-        dist = d1 * d1 + d2 * d2
-        if dist < best:
-            best = dist
-            best_index = i
-    if lo1 > tol or hi1 < -tol or lo2 > tol or hi2 < -tol:
+    arriving = t_lo > wp.optix_get_ray_tmin()
+    # The first seed is the control point nearest the ray: control point (i, j) of a Bezier patch
+    # sits at about parameter (i / p, j / q).
+    deg = patch_degree(patch)
+    seed = wp.vec2(
+        float(hull.closest_index // (deg[1] + 1)) / float(wp.max(deg[0], 1)),
+        float(hull.closest_index % (deg[1] + 1)) / float(wp.max(deg[1], 1)),
+    )
+    # Newton fails or finds the wrong root only where the ray is nearly tangent to the surface: a
+    # grazing ray crosses a curved sub-patch twice near a silhouette, entering and leaving.
+    converged, ok, st, point, ds, dt = newton(patch, brep.cvs, ray, tol, seed)
+    grazing = (not converged) or wp.abs(wp.dot(wp.normalize(wp.cross(ds, dt)), ray.unit)) < GRAZING_COS
+    if ok and report_patch_hit(brep, prim, st, point, ds, dt, ray) < 0.0:
+        return  # the ray enters here
+    if not (arriving and grazing):
         return
-    # The patch lies beyond the closest hit found so far.
-    hull_tmin = shift + nearest / dd - tol / wp.sqrt(dd)
-    if hull_tmin > wp.optix_get_ray_tmax():
-        return
-    # A ray starting within the patch's depth range (a bounce or shadow ray leaving this surface)
-    # is not the silhouette case the retries are for: Newton finds its own origin, below tmin.
-    arriving = hull_tmin > wp.optix_get_ray_tmin()
-    seed_s = float(best_index // (deg[1] + 1)) / float(wp.max(deg[0], 1))
-    seed_t = float(best_index % (deg[1] + 1)) / float(wp.max(deg[1], 1))
-    # Newton fails or finds the wrong root only where the ray is nearly tangent to the surface:
-    # a grazing ray crosses a curved sub-patch twice near a silhouette, entering and leaving.
-    # Every root found inside the patch is reported (OptiX keeps the nearest). Without a root
-    # where the ray enters, and only when the ray grazes the surface at Newton's last point:
-    # - after divergence, retry once from the patch center;
-    # - from an exit root, the entry lies upstream along the ray: step back along the ray's
-    #   direction mapped into the parameter domain, and seed Newton there.
-    converged, ok, s, t, point, ds, dt = newton_cubic(c, n1, n2, near, tol, seed_s, seed_t)
-    retry = arriving and ((not converged) or wp.abs(wp.dot(wp.normalize(wp.cross(ds, dt)), dn)) < GRAZING_COS)
+    # Until a root where the ray enters is found, a grazing ray gets more seeds (attempts): 1 the
+    # patch center (after divergence), 2-3 upstream of an exit root along the ray's direction
+    # mapped into the parameter domain, 4-7 near the patch corners.
+    exit_st = st
+    step = wp.vec2(0.0)
     if ok:
-        # Report first: the hit must be reported whether or not the ray grazes.
-        cosine = report_patch_hit(brep, prim, face, s, t, point, ds, dt, near, shift, direction)
-        retry = retry and cosine >= 0.0
-    if retry and not ok:
-        converged, ok, s, t, point, ds, dt = newton_cubic(c, n1, n2, near, tol, 0.5, 0.5)
+        step = upstream_step(ds, dt, ray.unit)
+    attempt = int(1)
+    while attempt < 8:
+        if attempt == 1 and ok:
+            attempt = 2  # the center only after divergence
+        if attempt == 2 and (not ok or wp.length(step) == 0.0):
+            attempt = 4  # upstream only of an exit
+        if attempt == 1:
+            seed = wp.vec2(0.5, 0.5)
+        elif attempt < 4:
+            seed = wp.vec2(
+                wp.clamp(exit_st[0] + 0.35 * float(attempt - 1) * step[0], 0.0, 1.0),
+                wp.clamp(exit_st[1] + 0.35 * float(attempt - 1) * step[1], 0.0, 1.0),
+            )
+        else:
+            seed = wp.vec2(0.15 + 0.7 * float((attempt - 4) % 2), 0.15 + 0.7 * float((attempt - 4) // 2))
+        converged, ok, st, point, ds, dt = newton(patch, brep.cvs, ray, tol, seed)
         if ok:
-            retry = report_patch_hit(brep, prim, face, s, t, point, ds, dt, near, shift, direction) >= 0.0
-    if retry and ok:
-        # Least-squares parameter step that moves the surface point by -dn.
-        a00 = wp.dot(ds, ds)
-        a01 = wp.dot(ds, dt)
-        a11 = wp.dot(dt, dt)
-        b0 = -wp.dot(ds, dn)
-        b1 = -wp.dot(dt, dn)
-        det = a00 * a11 - a01 * a01
-        if wp.abs(det) > 1.0e-30:
-            step = wp.vec2((a11 * b0 - a01 * b1) / det, (a00 * b1 - a01 * b0) / det)
-            length = wp.length(step)
-            if length > 0.0:
-                step = step / length
-                exit_s = s
-                exit_t = t
-                for k in range(2):
-                    reach = 0.35 * float(k + 1)
-                    s0 = wp.clamp(exit_s + reach * step[0], 0.0, 1.0)
-                    t0 = wp.clamp(exit_t + reach * step[1], 0.0, 1.0)
-                    converged, ok, s, t, point, ds, dt = newton_cubic(c, n1, n2, near, tol, s0, t0)
-                    if ok:
-                        if report_patch_hit(brep, prim, face, s, t, point, ds, dt, near, shift, direction) < 0.0:
-                            retry = False
-                            break
-    if retry:
-        # Last resort for grazing rays still without an entry: seeds near the patch corners.
-        for k in range(4):
-            s0 = 0.15
-            t0 = 0.15
-            if k == 1 or k == 3:
-                s0 = 0.85
-            if k >= 2:
-                t0 = 0.85
-            converged, ok, s, t, point, ds, dt = newton_cubic(c, n1, n2, near, tol, s0, t0)
-            if ok:
-                if report_patch_hit(brep, prim, face, s, t, point, ds, dt, near, shift, direction) < 0.0:
-                    break
+            if report_patch_hit(brep, prim, st, point, ds, dt, ray) < 0.0:
+                return  # the ray enters here
+            if attempt == 1:
+                exit_st = st
+                step = upstream_step(ds, dt, ray.unit)
+        attempt += 1
 
 
 @wp.func
 def intersect_nurbs(brep: BrepData, prim: int, origin: wp.vec3, direction: wp.vec3):
     deg = brep.prim_degree[prim]
+    base = brep.prim_cv[prim]
     if deg[0] == 3 and deg[1] == 3:
-        intersect_nurbs_cubic(brep, prim, origin, direction)
+        intersect_patch(brep, prim, load_cubic(brep.cvs, base), origin, direction)
     else:
-        intersect_nurbs_generic(brep, prim, origin, direction)
+        patch = Bezier()
+        patch.base = base
+        patch.degree = deg
+        intersect_patch(brep, prim, patch, origin, direction)
 
 
 @wp.func
-def _proxy_hit_nurbs(brep: BrepData, prim: int, tri: int, seed: wp.vec2, origin: wp.vec3, direction: wp.vec3):
-    """Exact surface hit for a ray that crossed shell triangle ``tri`` (global index).
+def proxy_hit(brep: BrepData, tri: int, local: int, bary: wp.vec2, origin: wp.vec3, direction: wp.vec3):
+    """Exact surface hit for a ray that crossed shell triangle ``tri`` (global index; ``local``:
+    its index in its shell geometry).
 
     Newton starts from the patch parameters interpolated at the triangle hit, then the face's
     range and trim decide. Returns (hit, t, u, v, outward object-space normal, face).
     """
-    face = brep.prim_face[prim]
-    c = load_cubic(brep, brep.prim_cv[prim])
+    prim = brep.proxy_prim[tri]
+    corner = 3 * (local % (brep.shell_st.shape[0] // 3))
+    seed = (
+        (1.0 - bary[0] - bary[1]) * brep.shell_st[corner]
+        + bary[0] * brep.shell_st[corner + 1]
+        + bary[1] * brep.shell_st[corner + 2]
+    )
+    patch = load_cubic(brep.cvs, brep.prim_cv[prim])
     tol = brep.prim_tol[prim]
-    dn = wp.normalize(direction)
-    n1 = wp.vec3(0.0)
-    if wp.abs(dn[0]) > wp.abs(dn[1]) and wp.abs(dn[0]) > wp.abs(dn[2]):
-        n1 = wp.normalize(wp.vec3(dn[1], -dn[0], 0.0))
-    else:
-        n1 = wp.normalize(wp.vec3(0.0, dn[2], -dn[1]))
-    n2 = wp.cross(n1, dn)
-    dd = wp.dot(direction, direction)
-    corner = wp.vec3(c.x[0, 0], c.y[0, 0], c.z[0, 0]) / c.w[0, 0]
-    shift = wp.dot(corner - origin, direction) / dd
-    near = origin + shift * direction
-    converged, ok, s, t, point, ds, dt = newton_cubic(
-        c, n1, n2, near, tol, wp.clamp(seed[0], 0.0, 1.0), wp.clamp(seed[1], 0.0, 1.0)
+    ray = patch_ray(origin, direction, first_point(patch, brep.cvs))
+    converged, ok, st, point, ds, dt = newton(
+        patch, brep.cvs, ray, tol, wp.vec2(wp.clamp(seed[0], 0.0, 1.0), wp.clamp(seed[1], 0.0, 1.0))
     )
     # Rare (grazing rays on strongly curved patches): retry from the triangle's corners, which
     # bracket the crossing in parameter space, then from the patch center.
@@ -1021,183 +907,89 @@ def _proxy_hit_nurbs(brep: BrepData, prim: int, tri: int, seed: wp.vec2, origin:
             break
         retry = wp.vec2(0.5, 0.5)
         if k < 3:
-            retry = brep.proxy_st[3 * tri + k]
-        converged, ok, s, t, point, ds, dt = newton_cubic(c, n1, n2, near, tol, retry[0], retry[1])
+            retry = brep.shell_st[corner + k]
+        converged, ok, st, point, ds, dt = newton(patch, brep.cvs, ray, tol, retry)
     # A grazing ray can cross a curved patch twice; from an exit root, look upstream along the
     # ray (in parameter space) for the entry, like the custom intersector does.
     if ok:
-        sn = wp.cross(ds, dt)
-        if (brep.face_flags[brep.prim_face[prim]] & FLAG_FLIP) != 0:
-            sn = -sn
-        cosine = wp.dot(wp.normalize(sn), dn)
+        cosine = outward_cosine(brep, prim, ds, dt, ray.unit)
         if cosine > 0.0 and cosine < GRAZING_COS:
-            a00 = wp.dot(ds, ds)
-            a01 = wp.dot(ds, dt)
-            a11 = wp.dot(dt, dt)
-            b0 = -wp.dot(ds, dn)
-            b1 = -wp.dot(dt, dn)
-            det = a00 * a11 - a01 * a01
-            if wp.abs(det) > 1.0e-30:
-                step = wp.vec2((a11 * b0 - a01 * b1) / det, (a00 * b1 - a01 * b0) / det)
-                length = wp.length(step)
-                if length > 0.0:
-                    step = step / length
-                    exit_t = shift + wp.dot(point - near, direction) / dd
-                    for k in range(2):
-                        reach = 0.35 * float(k + 1)
-                        c2, ok2, s2, t2, p2, ds2, dt2 = newton_cubic(
-                            c,
-                            n1,
-                            n2,
-                            near,
-                            tol,
-                            wp.clamp(s + reach * step[0], 0.0, 1.0),
-                            wp.clamp(t + reach * step[1], 0.0, 1.0),
-                        )
-                        if ok2 and shift + wp.dot(p2 - near, direction) / dd < exit_t - tol:
-                            s = s2
-                            t = t2
-                            point = p2
-                            ds = ds2
-                            dt = dt2
-                            break
-    hit_t = shift + wp.dot(point - near, direction) / dd
+            step = upstream_step(ds, dt, ray.unit)
+            if wp.length(step) > 0.0:
+                exit_t = ray_t(ray, point)
+                for k in range(2):
+                    reach = 0.35 * float(k + 1)
+                    c2, ok2, st2, p2, ds2, dt2 = newton(
+                        patch,
+                        brep.cvs,
+                        ray,
+                        tol,
+                        wp.vec2(
+                            wp.clamp(st[0] + reach * step[0], 0.0, 1.0), wp.clamp(st[1] + reach * step[1], 0.0, 1.0)
+                        ),
+                    )
+                    if ok2 and ray_t(ray, p2) < exit_t - tol:
+                        st = st2
+                        point = p2
+                        ds = ds2
+                        dt = dt2
+                        break
+    hit_t = ray_t(ray, point)
     normal = wp.vec3(0.0)
     u = float(0.0)
     v = float(0.0)
     if ok and hit_t >= wp.optix_get_ray_tmin():
         rect = brep.prim_uv[prim]
-        inside, u, v = accept_uv(brep, face, rect[0] + s * (rect[1] - rect[0]), rect[2] + t * (rect[3] - rect[2]))
-        ok = inside
+        ok, u, v = accept_uv(brep, prim, rect[0] + st[0] * (rect[1] - rect[0]), rect[2] + st[1] * (rect[3] - rect[2]))
         normal = wp.normalize(wp.cross(ds, dt))
-        if (brep.face_flags[face] & FLAG_FLIP) != 0:
+        if (brep.prims[prim].flags & FLAG_FLIP) != 0:
             normal = -normal
     else:
         ok = False
-    return ok, hit_t, u, v, normal, face
+    return ok, hit_t, u, v, normal, brep.prims[prim].face
 
 
 @wp.func
-def _analytic_root_near(brep: BrepData, prim: int, seed: wp.vec2, origin: wp.vec3, direction: wp.vec3):
-    """Closed-form hit of a plane, cylinder, cone or sphere face, taking the root whose (u, v) is
-    nearest the shell's seed. Returns (found, t, u, v, object-space Su x Sv normal)."""
-    face = brep.prim_face[prim]
-    kind = brep.prim_kind[prim]
-    if kind == PLANE:
-        a = brep.face_axis[face]
-        denom = wp.dot(direction, a)
-        if wp.abs(denom) < 1.0e-20:
-            return False, 0.0, 0.0, 0.0, a
-        t = wp.dot(brep.face_origin[face] - origin, a) / denom
-        rel = origin + t * direction - brep.face_origin[face]
-        return True, t, wp.dot(rel, brep.face_x[face]), wp.dot(rel, brep.face_y[face]), a
-    o, d, shift = local_ray(brep, face, origin, direction)
-    r = brep.face_params[face][0]
-    k = brep.face_params[face][1]
-    count = int(0)
-    t0 = float(0.0)
-    t1 = float(0.0)
-    if kind == CYLINDER:
-        count, t0, t1 = solve_quadratic(
-            d[0] * d[0] + d[1] * d[1], o[0] * d[0] + o[1] * d[1], o[0] * o[0] + o[1] * o[1] - r * r
-        )
-    elif kind == CONE:
-        ro = r + k * o[2]
-        count, t0, t1 = solve_quadratic(
-            d[0] * d[0] + d[1] * d[1] - k * k * d[2] * d[2],
-            o[0] * d[0] + o[1] * d[1] - k * ro * d[2],
-            o[0] * o[0] + o[1] * o[1] - ro * ro,
-        )
-    else:
-        count, t0, t1 = solve_quadratic(wp.dot(d, d), wp.dot(o, d), wp.dot(o, o) - r * r)
-    period = brep.face_period[face][0]
-    best = float(1.0e30)
-    found = bool(False)
-    best_t = float(0.0)
-    best_u = float(0.0)
-    best_v = float(0.0)
-    best_n = wp.vec3(0.0)
-    for i in range(count):
-        t = t0
-        if i == 1:
-            t = t1
-        p = o + t * d
-        u = wp.atan2(p[1], p[0])
-        v = p[2]
-        n = wp.vec3(p[0], p[1], 0.0)
-        if kind == CONE:
-            radius = r + k * p[2]
-            if radius < 0.0:
-                u = wp.atan2(-p[1], -p[0])
-            er = wp.vec3(wp.cos(u), wp.sin(u), 0.0)
-            n = radius * (er - wp.vec3(0.0, 0.0, k))
-        elif kind == SPHERE:
-            v = wp.asin(wp.clamp(p[2] / r, -1.0, 1.0))
-            n = p
-        du = u - seed[0]
-        if period > 0.0:
-            du = du - period * wp.round(du / period)
-        distance = du * du + (v - seed[1]) * (v - seed[1])
-        if distance < best:
-            best = distance
-            found = True
-            best_t = t + shift
-            best_u = seed[0] + du  # the root's u on the seed's branch
-            best_v = v
-            best_n = to_object(brep, face, n)
-    return found, best_t, best_u, best_v, best_n
+def intersect_curved(brep: BrepData, prim: int, origin: wp.vec3, direction: wp.vec3):
+    """Intersect a torus or NURBS sub-patch primitive (a global BRep primitive index).
 
-
-@wp.func
-def proxy_hit(brep: BrepData, tri: int, bary: wp.vec2, origin: wp.vec3, direction: wp.vec3):
-    """Exact surface hit for a ray that crossed proxy triangle ``tri`` (global index).
-
-    NURBS shells: Newton from the patch parameters interpolated at the triangle hit. Analytic
-    faces: the closed-form root nearest the interpolated face (u, v). Then the face's range and
-    trim decide. Returns (hit, t, u, v, outward object-space normal, face, exact); ``exact`` means
-    the triangle lies on the surface (planes), so its t is the surface's.
+    Renderers run these in an intersection program apart from intersect_quadric: their code and
+    register footprint would otherwise slow every quadric call (OptiX saves the registers a
+    program uses on each invocation), while warps rarely mix them with quadrics.
     """
-    prim = brep.proxy_prim[tri]
-    seed = (
-        (1.0 - bary[0] - bary[1]) * brep.proxy_st[3 * tri]
-        + bary[0] * brep.proxy_st[3 * tri + 1]
-        + bary[1] * brep.proxy_st[3 * tri + 2]
-    )
-    kind = brep.prim_kind[prim]
-    if kind == NURBS:
-        ok, hit_t, u, v, normal, face = _proxy_hit_nurbs(brep, prim, tri, seed, origin, direction)
-        return ok, hit_t, u, v, normal, face, False
-    face = brep.prim_face[prim]
-    found, hit_t, u_raw, v_raw, n = _analytic_root_near(brep, prim, seed, origin, direction)
-    if not found or hit_t < wp.optix_get_ray_tmin():
-        return False, hit_t, 0.0, 0.0, n, face, False
-    inside, u, v = accept_uv(brep, face, u_raw, v_raw)
-    normal = wp.normalize(n)
-    if (brep.face_flags[face] & FLAG_FLIP) != 0:
-        normal = -normal
-    return inside, hit_t, u, v, normal, face, kind == PLANE
-
-
-@wp.func
-def intersect(brep: BrepData, prim: int, origin: wp.vec3, direction: wp.vec3):
-    """Intersect primitive ``prim`` (a global BRep primitive index) by its surface kind."""
-    kind = brep.prim_kind[prim]
-    if kind == PLANE:
-        intersect_plane(brep, prim, origin, direction)
-    elif kind == CYLINDER:
-        intersect_cylinder(brep, prim, origin, direction)
-    elif kind == CONE:
-        intersect_cone(brep, prim, origin, direction)
-    elif kind == SPHERE:
-        intersect_sphere(brep, prim, origin, direction)
-    elif kind == TORUS:
+    if (brep.prims[prim].flags >> KIND_SHIFT) == TORUS:
         intersect_torus(brep, prim, origin, direction)
-    elif kind == NURBS:
+    else:
         intersect_nurbs(brep, prim, origin, direction)
 
 
 def _device_array(values, dtype, device):
     return wp.array(np.ascontiguousarray(values), dtype=dtype, device=device)
+
+
+def _slab_data(prim, has_grid: np.ndarray):
+    """The slab-test arrays of the prim's trimmed faces that have no cell grid (the grid answers
+    the others): (face_slab, slab starts without the end, slab members, segments, bulges)."""
+    face_slab = np.zeros_like(prim.face_slab)
+    starts, members, segments, bulges = [], [], [], []
+    slabs = nmembers = nsegments = 0
+    for f in np.nonzero(((prim.face_flags & FLAG_TRIMMED) != 0) & ~has_grid)[0]:
+        base, count = (int(x) for x in prim.face_slab[f])
+        lo, hi = int(prim.slab_start[base]), int(prim.slab_start[base + count])
+        ids = prim.slab_segments[lo:hi]
+        first = int(ids.min()) if len(ids) else 0  # a face's chords are contiguous
+        last = int(ids.max()) + 1 if len(ids) else 0
+        face_slab[f] = (slabs, count)
+        starts.append(prim.slab_start[base : base + count] - lo + nmembers)
+        members.append(ids - first + nsegments)
+        segments.append(prim.segments[first:last])
+        bulges.append(prim.segment_bulge[first:last])
+        slabs += count
+        nmembers += hi - lo
+        nsegments += last - first
+    if not starts:
+        return face_slab, np.zeros(0, np.int32), np.zeros(0, np.int32), np.zeros((0, 4), np.float32), np.zeros(0)
+    return face_slab, np.concatenate(starts), np.concatenate(members), np.concatenate(segments), np.concatenate(bulges)
 
 
 def pack(prims, device, proxies=None):
@@ -1208,38 +1000,40 @@ def pack(prims, device, proxies=None):
     """
     face_base = prim_base = cv_base = seg_base = slab_base = slab_seg_base = tri_base = 0
     cell_base = member_base = 0
-    cat = {k: [] for k in cast(Any, BrepData).vars}
+    cat = {k: [] for k in cast(Any, BrepData).vars if k != "prims"}
+    record_fields = ("origin", "x", "y", "axis", "params", "range", "period", "flags", "grid", "grid_map")
+    faces = {k: [] for k in record_fields}  # per face, expanded to its primitives below
+    prim_kind, prim_face = [], []
     bases, tri_bases = [], []
+    grids = trim_grid.build_trim_grids(prims, device)  # all prims' grids at once
     for n, prim in enumerate(prims):
         if proxies is not None:
             cat["proxy_prim"].append(proxies[n].tri_prim + prim_base)
-            cat["proxy_st"].append(proxies[n].tri_st.reshape(-1, 2))
             tri_bases.append(tri_base)
             tri_base += len(proxies[n].tri_prim)
-        cat["face_origin"].append(prim.face_origin)
-        cat["face_x"].append(prim.face_x)
-        cat["face_y"].append(prim.face_y)
-        cat["face_axis"].append(prim.face_axis)
-        cat["face_params"].append(prim.face_params)
-        cat["face_range"].append(prim.face_range)
-        cat["face_period"].append(prim.face_period)
-        cat["face_flags"].append(prim.face_flags)
-        cat["face_slab"].append(prim.face_slab + np.array([slab_base, 0]))
-        cat["face_slab_map"].append(prim.face_slab_map)
-        cat["slab_start"].append(prim.slab_start[:-1] + slab_seg_base)
-        cat["slab_segments"].append(prim.slab_segments + seg_base)
-        cat["segments"].append(prim.segments)
-        cat["segment_bulge"].append(prim.segment_bulge)
-        grid, grid_map, cell_info, cell_chords, cell_bulges = trim_grid.build_trim_grids(prim)
-        cat["face_grid"].append(grid + np.array([cell_base, 0, 0]) * (grid[:, 1:2] > 0))
-        cat["face_grid_map"].append(grid_map)
+        for k in ("origin", "x", "y", "axis", "params", "range", "period", "flags"):
+            faces[k].append(getattr(prim, f"face_{k}"))
+        grid, grid_map, cell_info, cell_chords, cell_bulges = grids[n]
+        face_slab, slab_start, slab_members, segments, bulges = _slab_data(prim, grid[:, 1] > 0)
+        # Without a cell grid, the grid fields hold the slab test's lookup (see Surface).
+        slab = face_slab[:, 1] > 0
+        grid = grid + np.array([cell_base, 0, 0]) * (grid[:, 1:2] > 0)
+        grid[slab] = np.stack([face_slab[slab, 0] + slab_base, np.zeros(slab.sum()), face_slab[slab, 1]], axis=1)
+        grid_map = np.array(grid_map, np.float32)
+        grid_map[slab] = np.concatenate([prim.face_slab_map[slab], np.zeros((slab.sum(), 2))], axis=1)
+        cat["slab_start"].append(slab_start + slab_seg_base)
+        cat["slab_segments"].append(slab_members + seg_base)
+        cat["segments"].append(segments)
+        cat["segment_bulge"].append(bulges)
+        faces["grid"].append(grid)
+        faces["grid_map"].append(grid_map)
         cat["cell_info"].append(cell_info + np.array([member_base, 0]))
         cat["cell_chords"].append(cell_chords)
         cat["cell_bulges"].append(cell_bulges)
         cell_base += len(cell_info)
         member_base += len(cell_chords)
-        cat["prim_kind"].append(prim.prim_kind)
-        cat["prim_face"].append(prim.prim_face + face_base)
+        prim_kind.append(prim.prim_kind)
+        prim_face.append(prim.prim_face + face_base)
         cat["prim_cv"].append(prim.prim_cv + cv_base)
         cat["prim_degree"].append(prim.prim_degree)
         cat["prim_uv"].append(prim.prim_uv)
@@ -1249,11 +1043,23 @@ def pack(prims, device, proxies=None):
         face_base += len(prim.face_kind)
         prim_base += len(prim.prim_kind)
         cv_base += len(prim.cvs)
-        seg_base += len(prim.segments)
-        slab_base += len(prim.slab_start) - 1
-        slab_seg_base += len(prim.slab_segments)
+        seg_base += len(segments)
+        slab_base += len(slab_start)
+        slab_seg_base += len(slab_members)
     cat["slab_start"].append(np.array([slab_seg_base]))
+    from .proxy import SHELL_ST  # noqa: PLC0415 - proxy builds on this module's patch evaluation
+
+    cat["shell_st"].append(SHELL_ST.reshape(-1, 2))
     data = BrepData()
+    records = np.zeros(max(prim_base, 1), dtype=cast(Any, Surface).numpy_dtype())
+    if prim_base:
+        face = np.concatenate(prim_face)
+        for key, parts in faces.items():
+            values = np.concatenate([np.asarray(p).reshape(len(p), -1) for p in parts])
+            records[key][:prim_base] = values[face].reshape(records[key][:prim_base].shape)
+        records["flags"][:prim_base] |= np.concatenate(prim_kind).astype(np.int32) << int(KIND_SHIFT)
+        records["face"][:prim_base] = face
+    data.prims = wp.array(records, dtype=Surface, device=device)
     for key, parts in cat.items():
         dtype = cast(Any, BrepData).vars[key].type.dtype
         width = int(getattr(dtype, "_length_", 1))

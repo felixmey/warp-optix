@@ -6,9 +6,9 @@
 Each analytic face (plane, cylinder, cone, sphere, torus) is one custom primitive whose AABB bounds
 its UV range; each NURBS face becomes flat rational Bezier sub-patches (Martin et al., "Practical
 Ray Tracing of Trimmed NURBS Surfaces", 2000). One intersection program per surface kind selects
-its hit record through the primitive's SBT index. A candidate hit is mapped to the face's (u, v)
-and kept only if it lies inside the face's trim loops (crossing test against UV polylines,
-bucketed into slabs).
+its hit record through the primitive's SBT index; planes, cylinders, cones and spheres share one
+quadric program. A candidate hit is mapped to the face's (u, v) and kept only if it lies inside
+the face's trim loops (crossing test against UV polylines, bucketed into slabs).
 
 The intersection program reports u, v, the outward object-space normal and the face index as
 attributes; the hit kind is 0 for the outside of the solid and 1 for the inside.
@@ -47,25 +47,11 @@ def primitive() -> int:
     return int(wp.optix_get_instance_id()) + int(wp.optix_get_primitive_index())
 
 
-# One intersection program per surface kind, selected through the primitive's SBT index.
+# One intersection program per surface kind, selected through the primitive's SBT index; planes,
+# cylinders, cones and spheres share the quadric one.
 @wp.kernel(module="unique")
-def isect_plane(brep: BrepData):
-    bd.intersect_plane(brep, primitive(), wp.optix_get_object_ray_origin(), wp.optix_get_object_ray_direction())
-
-
-@wp.kernel(module="unique")
-def isect_cylinder(brep: BrepData):
-    bd.intersect_cylinder(brep, primitive(), wp.optix_get_object_ray_origin(), wp.optix_get_object_ray_direction())
-
-
-@wp.kernel(module="unique")
-def isect_cone(brep: BrepData):
-    bd.intersect_cone(brep, primitive(), wp.optix_get_object_ray_origin(), wp.optix_get_object_ray_direction())
-
-
-@wp.kernel(module="unique")
-def isect_sphere(brep: BrepData):
-    bd.intersect_sphere(brep, primitive(), wp.optix_get_object_ray_origin(), wp.optix_get_object_ray_direction())
+def isect_quadric(brep: BrepData):
+    bd.intersect_quadric(brep, primitive(), wp.optix_get_object_ray_origin(), wp.optix_get_object_ray_direction())
 
 
 @wp.kernel(module="unique")
@@ -87,10 +73,16 @@ def proxy_any_hit(brep: BrepData):
     where the ray enters the surface are accepted (shrinking tmax): an exit can hide an entry in
     front of it, so exits are recorded but traversal continues.
     """
-    tri = int(wp.optix_get_instance_id()) + int(wp.optix_get_primitive_index())
+    local = int(wp.optix_get_primitive_index())
+    tri = int(wp.optix_get_instance_id()) + local
     direction = wp.optix_get_object_ray_direction()
-    ok, hit_t, u, v, n, face, exact = bd.proxy_hit(
-        brep, tri, wp.optix_get_triangle_barycentrics(), wp.optix_get_object_ray_origin(), direction
+    ok, hit_t, u, v, n, face = bd.proxy_hit(
+        brep,
+        tri,
+        local,
+        wp.optix_get_triangle_barycentrics(),
+        wp.optix_get_object_ray_origin(),
+        direction,
     )
     if not ok:
         wp.optix_ignore_intersection()
@@ -106,12 +98,12 @@ def proxy_any_hit(brep: BrepData):
         payload.nz = world_n[2]
         payload.face = wp.int32(face)
         payload.inside = wp.int32(0)
-        if leaving and (brep.face_flags[face] & bd.FLAG_SOLID) != 0:
+        if leaving and (brep.prims[brep.proxy_prim[tri]].flags & bd.FLAG_SOLID) != 0:
             payload.inside = wp.int32(1)
         payload.u = u
         payload.v = v
         wp.optix_store_payload(payload)
-    if leaving and not exact:  # an exact (planar) hit is ordered correctly even as an exit
+    if leaving:
         wp.optix_ignore_intersection()
 
 
@@ -122,30 +114,30 @@ def proxy_closest_hit():
 
 @wp.func
 def plane_hit(brep: BrepData):
-    """A planar face's triangle hit: the face, its (u, v) and the hit point's surface normal."""
+    """A planar face's triangle hit: its BRep primitive, (u, v) and the ray direction."""
     tri = int(wp.optix_get_instance_id()) + int(wp.optix_get_primitive_index())
-    face = brep.proxy_prim[tri]
+    prim = brep.proxy_prim[tri]
     # Object-space ray queries are unavailable in closest-hit programs: transform the world ray.
     origin = wp.optix_transform_point_world_to_object(wp.optix_get_world_ray_origin())
     direction = wp.optix_transform_vector_world_to_object(wp.optix_get_world_ray_direction())
-    rel = origin + wp.optix_get_ray_tmax() * direction - brep.face_origin[face]
-    return face, wp.dot(rel, brep.face_x[face]), wp.dot(rel, brep.face_y[face]), direction
+    rel = origin + wp.optix_get_ray_tmax() * direction - brep.prims[prim].origin
+    return prim, wp.dot(rel, brep.prims[prim].x), wp.dot(rel, brep.prims[prim].y), direction
 
 
 @wp.kernel(module="unique")
 def plane_any_hit(brep: BrepData):
     """Unknown micro-triangles only: the exact trim test (opaque and transparent ones never get here)."""
-    face, u, v, direction = plane_hit(brep)
-    inside, uw, vw = bd.accept_uv(brep, face, u, v)
+    prim, u, v, direction = plane_hit(brep)
+    inside, uw, vw = bd.accept_uv(brep, prim, u, v)
     if not inside:
         wp.optix_ignore_intersection()
 
 
 @wp.kernel(module="unique")
 def plane_closest_hit(brep: BrepData):
-    face, u, v, direction = plane_hit(brep)
-    n = brep.face_axis[face]
-    if (brep.face_flags[face] & bd.FLAG_FLIP) != 0:
+    prim, u, v, direction = plane_hit(brep)
+    n = brep.prims[prim].axis
+    if (brep.prims[prim].flags & bd.FLAG_FLIP) != 0:
         n = -n
     payload = HitPayload()
     payload.t = wp.optix_get_ray_tmax()
@@ -153,16 +145,16 @@ def plane_closest_hit(brep: BrepData):
     payload.nx = world_n[0]
     payload.ny = world_n[1]
     payload.nz = world_n[2]
-    payload.face = wp.int32(face)
+    payload.face = brep.prims[prim].face
     payload.inside = wp.int32(0)
-    if wp.dot(n, direction) > 0.0 and (brep.face_flags[face] & bd.FLAG_SOLID) != 0:
+    if wp.dot(n, direction) > 0.0 and (brep.prims[prim].flags & bd.FLAG_SOLID) != 0:
         payload.inside = wp.int32(1)
     payload.u = u
     payload.v = v
     wp.optix_store_payload(payload)
 
 
-INTERSECTORS = (isect_plane, isect_cylinder, isect_cone, isect_sphere, isect_torus, isect_nurbs)
+INTERSECTORS = (isect_quadric, isect_quadric, isect_quadric, isect_quadric, isect_torus, isect_nurbs)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -312,13 +304,13 @@ class BrepScene:
         plane_offset = sbt.get_sbt_offset("plane_triangles")
         planes = [brep_planes.plane_triangles(p) for p in prototypes] if micromaps else None
         if micromaps:
-            # Plane triangles are numbered after any shell triangles; proxy_prim maps them to faces.
-            face_bases = np.cumsum([0] + [len(p.face_kind) for p in prototypes])[:-1]
+            # Plane triangles (two per plane) are numbered after any shell triangles; proxy_prim maps
+            # them to their primitives.
             first = len(self.data.proxy_prim) if proxy else 0
             plane_bases = (first + np.cumsum([0] + [len(t.indices) for t in planes])[:-1]).tolist()
-            faces = [t.tri_face + face_bases[n] for n, t in enumerate(planes)]
+            plane_prims = [np.repeat(t.prims, 2) + bases[n] for n, t in enumerate(planes)]
             existing = [self.data.proxy_prim.numpy()] if proxy else []
-            self.data.proxy_prim = _array(np.concatenate(existing + faces).astype(np.int32), wp.int32, dev)
+            self.data.proxy_prim = _array(np.concatenate(existing + plane_prims).astype(np.int32), wp.int32, dev)
             self.micromap_bytes = 0
         self.gases, self.buffers = [], []
         gas_records = []  # per prototype: (aabb gas, prim base, triangle gas or None, triangle base)

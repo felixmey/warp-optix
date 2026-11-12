@@ -220,3 +220,14 @@ def test_mixed_geometry_selects_hit_records_by_geometry_primitive_and_ray_type()
     values = wp.zeros((4, 2), dtype=float, device=device)
     wo.launch(pipeline, dim=(4,), inputs=[ias, xs, centers, values])
     np.testing.assert_array_equal(values.numpy(), [[1, -1], [101, -101], [112, -112], [999, 999]])
+
+    # With a primitive index offset, every program sees the offset index (here 5 and 6).
+    centers = wp.array([[9.0, 9.0, 9.0]] * 5 + [[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]], dtype=wp.vec3, device=device)
+    offset_gas = wo.Accel(
+        [wo.aabbs(bounds=bounds, flags=flags, sbt_indices=sbt_indices, primitive_index_offset=5)], device=device
+    )
+    wp.launch(write_mixed_instances, dim=2, inputs=[triangle_gas.id, offset_gas.id, records], device=device)
+    ias = wo.Accel([wo.instances(records, [triangle_gas, offset_gas])], device=device)
+    values.zero_()
+    wo.launch(pipeline, dim=(4,), inputs=[ias, xs, centers, values])
+    np.testing.assert_array_equal(values.numpy(), [[1, -1], [106, -106], [117, -117], [999, 999]])

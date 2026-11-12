@@ -283,7 +283,7 @@ retain their Warp **device** arrays:
 | Builder | Input |
 | --- | --- |
 | `wo.triangles(points, indices, flags=)` | `vec3` (or `float32[N, 3]`) points, int32/uint32 index triplets; a list of point arrays gives motion keys |
-| `wo.aabbs(lowers, uppers, flags=, sbt_indices=)` | `vec3` bounds per custom primitive, like `wp.Bvh(lowers, uppers)`; or packed `wo.aabbs(bounds=float32[N, 6])` to avoid a packing copy |
+| `wo.aabbs(lowers, uppers, flags=, sbt_indices=, primitive_index_offset=)` | `vec3` bounds per custom primitive, like `wp.Bvh(lowers, uppers)`; or packed `wo.aabbs(bounds=float32[N, 6])` to avoid a packing copy. `primitive_index_offset` is added to the index `optix_get_primitive_index()` returns |
 | `wo.curves(points, widths, indices, curve_type=, flags=)` | control points, per-point radii, first control point of each segment |
 | `wo.instances(records, children)` | `wp.array(dtype=wo.Instance)`, plus the `wo.Accel` objects the records reference |
 

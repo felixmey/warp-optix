@@ -1489,7 +1489,10 @@ def load_scene_from_usd(
                     if subset_material:
                         faces = np.asarray(subset.GetIndicesAttr().Get(), dtype=np.int64)
                         face_materials[faces[faces < len(face_materials)]] = material_id(subset_material)
-                geometries[key] = (scene.add_brep(Brep(brep_prim, face_material_ids=face_materials)), bound)
+                geometries[key] = (
+                    scene.add_brep(Brep(brep_prim, face_material_ids=face_materials, device=scene.device)),
+                    bound,
+                )
             geometry_index, first_bound = geometries[key]
             # Placements of one prototype may bind different materials (e.g. STEP colors).
             override = None if bound == first_bound else bound

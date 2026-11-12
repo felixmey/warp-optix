@@ -592,7 +592,7 @@ class Brep:
 
     ``prim`` is a ``warp_optix._src.brep.loader.BrepPrim`` in object space; instances place it.
     Each custom primitive (an analytic face or a NURBS sub-patch) takes its face's material from
-    ``face_material_ids`` (one per face), or ``material_id``.
+    ``face_material_ids`` (one per face), or ``material_id``. ``device`` builds the shells.
     """
 
     primitive_type = "brep"
@@ -607,6 +607,7 @@ class Brep:
         face_material_ids: np.ndarray | None = None,
         shells: bool = True,
         planes: bool = False,
+        device=None,
     ):
         self.prim = prim
         bounds = np.asarray(prim.prim_bounds, dtype=np.float64).reshape(-1, 6)
@@ -622,7 +623,7 @@ class Brep:
         self.bounds = np.ascontiguousarray(bounds, dtype=np.float32)
         # Bicubic patches are traced through triangle shells (hardware traversal, exact refinement
         # in any-hit); their AABBs become inactive (NaN).
-        self.proxy = brep_proxy.build_proxy(prim) if shells else None
+        self.proxy = brep_proxy.build_proxy(prim, device) if shells else None
         if self.proxy is not None and len(self.proxy.patches):
             self.bounds[self.proxy.patches] = np.nan
         # With ``planes``, planar faces are traced as triangles with opacity micromaps of their trims
@@ -1741,15 +1742,8 @@ class Scene:
         for g in breps:
             shell = g.proxy if g.proxy is not None else brep_proxy.empty_proxy()
             plane_prims = np.repeat(g.planes.prims, 2) if g.planes is not None else np.zeros(0, np.int32)
-            proxies.append(
-                brep_proxy.Proxy(
-                    shell.points,
-                    shell.indices,
-                    np.concatenate([shell.tri_prim, plane_prims]).astype(np.int32),
-                    np.concatenate([shell.tri_st, np.zeros((len(plane_prims), 3, 2), np.float32)]),
-                    shell.patches,
-                )
-            )
+            tri_prim = np.concatenate([shell.tri_prim, plane_prims]).astype(np.int32)
+            proxies.append(brep_proxy.Proxy(shell.points, shell.indices, tri_prim, shell.patches))
         self._brep_data, bases, tri_bases = brep_device.pack([g.prim for g in breps], self.device, proxies)
         for geometry, base, tri_base in zip(breps, bases, tri_bases, strict=True):
             geometry.indices = (base + np.arange(len(geometry.bounds))).astype(np.uint32)
@@ -1856,7 +1850,16 @@ class Scene:
                 )
             elif geometry.primitive_type == "brep":
                 geometry.d_bounds = wp.array(geometry.bounds, dtype=wp.float32, device=self.device)
-                build_input = wo.aabbs(bounds=geometry.d_bounds, flags=geometry_flags)
+                # Quadric faces use the "brep" hit group, tori and NURBS sub-patches the next one
+                # ("brep_curved"). The primitive index is the global BRep primitive id.
+                curved = (geometry.prim.prim_kind >= brep_device.TORUS).astype(np.uint32)
+                geometry.d_sbt_indices = wp.array(curved, dtype=wp.uint32, device=self.device)
+                build_input = wo.aabbs(
+                    bounds=geometry.d_bounds,
+                    flags=[geometry_flags, geometry_flags],
+                    sbt_indices=geometry.d_sbt_indices,
+                    primitive_index_offset=int(geometry.indices[0]) if len(geometry.indices) else 0,
+                )
             elif geometry.primitive_type == "brep_shell":
                 # Any-hit refines every shell crossing to the exact surface: never disable it.
                 build_input = wo.triangles(

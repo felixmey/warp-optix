@@ -277,6 +277,7 @@ def aabbs(
     bounds: wp.array | None = None,
     flags: GeometryFlags | Sequence[GeometryFlags] = GeometryFlags.DISABLE_ANYHIT,
     sbt_indices: wp.array | None = None,
+    primitive_index_offset: int = 0,
 ) -> BuildInput:
     """Custom-primitive build input, like ``wp.Bvh(lowers, uppers)``.
 
@@ -285,6 +286,8 @@ def aabbs(
     are packed into a retained buffer before every build and refit. With
     ``sbt_indices`` (uint32 per primitive), primitive ``i`` uses hit record
     ``sbt_indices[i]`` and ``flags`` holds one geometry flag per record.
+    ``primitive_index_offset`` is added to the primitive index that ``optix_get_primitive_index``
+    returns for these primitives.
     """
     prepare = None
     sources: tuple = ()
@@ -332,6 +335,7 @@ def aabbs(
         sbtIndexOffsetBuffer=0 if sbt_indices is None else sbt_indices.ptr,
         sbtIndexOffsetSizeInBytes=0 if sbt_indices is None else 4,
         sbtIndexOffsetStrideInBytes=0 if sbt_indices is None else 4,
+        primitiveIndexOffset=int(primitive_index_offset),
     )
     arrays = (bounds, *sources) if sbt_indices is None else (bounds, *sources, sbt_indices)
     return BuildInput(descriptor, arrays, prepare=prepare)

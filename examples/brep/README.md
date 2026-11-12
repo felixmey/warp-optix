@@ -36,13 +36,18 @@ uv run --extra usd --extra pathtracing --extra ui python examples/example_pathtr
 Headless: `api.scene.load_from_usd(path)`, or `api.scene.add_brep(Brep(prim))` with
 `warp_optix._src.pathtracing.scene.Brep` and a prim from `warp_optix._src.brep.loader`.
 
-- One `"brep"` hit group in the path tracer's SBT: an intersection program dispatching on the
-  surface kind, and a closest-hit that fills the same geometry-neutral payload as triangles
-  (face-forwarded world normal, face UVs, per-face material, front face from the outward normal,
-  so glass tracks entering/leaving the medium). Any-hit uses the material's opacity.
-- A BRep geometry's `indices` hold its global BRep primitive ids, so the existing render
-  primitive and per-primitive material plumbing maps a hit to its BRep data
-  (`PathtraceLaunchParams.brep`). USD instance proxies of one prototype share one GAS.
+- Two hit groups in the path tracer's SBT, chosen per primitive by the GAS's SBT indices:
+  `"brep"` (planes, cylinders, cones, spheres) and `"brep_curved"` (tori, NURBS sub-patches). OptiX
+  saves the registers an intersection program uses on every call, so the common quadric program
+  stays small (5% faster frames than one program for all kinds). Both share a closest-hit that
+  fills the same geometry-neutral payload as triangles (face-forwarded world normal, face UVs,
+  per-face material, front face from the outward normal, so glass tracks entering/leaving the
+  medium). Any-hit uses the material's opacity.
+- BRep GASes offset their primitive indices by their first global BRep primitive id, so
+  intersection programs read it straight from `optix_get_primitive_index()`; closest-hit and
+  any-hit subtract it again for per-primitive materials. A BRep geometry's `indices` hold its
+  global primitive ids, so the existing render primitive and material plumbing maps a hit to its
+  BRep data (`PathtraceLaunchParams.brep`). USD instance proxies of one prototype share one GAS.
 - `BrepArray`'s own xformOps are evaluated even when the omniSolid schema plugin is not
   registered (USD then does not know the prim is a `Gprim`).
 - Tests: `warp_optix/tests/test_brep.py` (hand-authored BReps, no `usd-brep` needed).
@@ -52,9 +57,12 @@ Headless: `api.scene.load_from_usd(path)`, or `api.scene.add_brep(Brep(prim))` w
 | Part | File | Approach |
 | --- | --- | --- |
 | Schema reader | `warp_optix/_src/brep/loader.py` | pxr + NumPy; topology (regions → shells → faceuses, faces → loops → edgeuses), analytic surfaces, NURBS surfaces, 3D edge curves and optional UV pcurves |
-| Analytic faces | `warp_optix/_src/brep/device.py` | one custom primitive per face; AABB from a sampled UV grid padded by the sagitta bound; closed-form plane/cylinder/cone/sphere; torus by a derivative-cascade quartic solver (bounded cost, no grazing blowup) |
+| Analytic faces | `warp_optix/_src/brep/device.py` | one custom primitive per face; AABB from a sampled UV grid padded by the sagitta bound; planes, cylinders, cones and spheres as one closed-form quadric in the face frame (one code path, so rays of a warp hitting mixed kinds share the solve and trim test: 6–10% faster path tracing on a dense assembly); torus by a derivative-cascade quartic solver (bounded cost, no grazing blowup) |
 | NURBS faces | both | knot insertion → rational Bézier patches → de Casteljau splits until flat (`flat_tol`); convex-hull AABBs; Newton on the two-plane ray form, seeded at the sub-patch center (Martin et al. 2000) |
 | Trimming | both | face loops as UV polylines (pcurves when present, otherwise 3D edges projected onto the surface); even–odd crossing test, segments bucketed into slabs; periodic copies for seams |
+| Surface records | `warp_optix/_src/brep/device.py` | per primitive, its face's frame, parameters, ranges, flags and kind, and trim lookup in one 128-byte record: one cache line and one dependent load per intersection (path tracing on a dense assembly is 10-13% faster than with per-field arrays, and 3% faster than per-face records reached through the primitive) |
+| Trim cell grids | `warp_optix/_src/brep/trim_grid.py` | per face, a uniform cell grid: cells away from the trims store inside/outside, the others their chords and a reference parity; built for all faces at once with Warp kernels (radix sort, scans) |
+| Shells | `warp_optix/_src/brep/proxy.py` | bicubic sub-patches enclosed by triangle shells (one Warp kernel builds all of them); hardware triangle traversal finds candidates, an any-hit refines them with Newton seeded from the triangle hit (`--proxy`, and the path tracer's default) |
 | Dispatch (this example) | `brep_optix.py` | one hit group per surface kind, selected per primitive with `wo.aabbs(sbt_indices=)`; one GAS per `BrepArray`, instanced with the USD transform (non-uniform scale works) |
 
 Attributes reported: `u, v`, outward object-space normal, face index; hit kind 1 marks a ray
@@ -100,9 +108,6 @@ surface; the coarser 2e-3 mesh is 1.5–2.6° mean / 5–11° p99.
 
 ## Limitations and next steps
 
-- Hybrid intersection: trace a coarse triangle proxy in hardware, then refine the hit with Newton on
-  the exact surface (closest-hit or any-hit). This removes most custom-primitive invocations and
-  is the most promising route to close the NURBS gap.
 - Exact trims: Bézier clipping against the pcurves (or a tolerance band shared by adjacent faces)
   instead of polylines, to remove cracks.
 - Share one GAS between references of the same `BrepArray` (currently duplicated per prim).
