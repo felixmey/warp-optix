@@ -67,14 +67,14 @@ def proxy_any_hit(brep: BrepData):
     """A shell triangle was crossed: find the exact hit, keep the nearest one in the payload.
 
     OptiX orders hits by the shell triangle's t, not the surface's, and a shell can reach in front
-    of another surface (thin walls). So the payload records the nearest exact hit, and only hits
-    where the ray enters the surface are accepted (shrinking tmax): an exit can hide an entry in
-    front of it, so exits are recorded but traversal continues.
+    of another surface (thin walls). So the payload records the nearest exact hit, and hits that
+    may hide a nearer crossing behind their shell triangle (leaving a solid, or a sheet's back met
+    at a grazing angle; see proxy_hit) are recorded but not accepted: traversal continues.
     """
     local = int(wp.optix_get_primitive_index())
     tri = int(wp.optix_get_instance_id()) + local
     direction = wp.optix_get_object_ray_direction()
-    ok, hit_t, u, v, n, face = bd.proxy_hit(
+    ok, hit_t, u, v, n, face, keep_searching = bd.proxy_hit(
         brep,
         tri,
         local,
@@ -101,7 +101,7 @@ def proxy_any_hit(brep: BrepData):
         payload.u = u
         payload.v = v
         wp.optix_store_payload(payload)
-    if leaving:
+    if keep_searching:
         wp.optix_ignore_intersection()
 
 

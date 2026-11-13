@@ -957,7 +957,8 @@ def proxy_hit(brep: BrepData, tri: int, local: int, bary: wp.vec2, origin: wp.ve
     its index in its shell geometry).
 
     Newton starts from the patch parameters interpolated at the triangle hit, then the face's
-    range and trim decide. Returns (hit, t, u, v, outward object-space normal, face).
+    range and trim decide. Returns (hit, t, u, v, outward object-space normal, face, whether the
+    hit must not end the ray's search: the any-hit records it but ignores the intersection).
     """
     prim = brep.proxy_prim[tri]
     corner = 3 * (local % (brep.shell_st.shape[0] // 3))
@@ -1048,7 +1049,15 @@ def proxy_hit(brep: BrepData, tri: int, local: int, bary: wp.vec2, origin: wp.ve
             normal = -normal
     else:
         ok = False
-    return ok, hit_t, u, v, normal, brep.prims[prim].face
+    # Accepting a hit cuts the ray at the shell triangle, in front of the exact hit, so a nearer
+    # crossing behind the triangle would be lost. A ray's crossings alternate sides: one leaving a
+    # solid (or meeting a sheet's back) is at least its second, unless the ray started inside.
+    # Such hits keep the search going, except a sheet's back met squarely: a sheet has no inside,
+    # and only a grazing ray crosses it twice that close together.
+    cosine = wp.dot(normal, direction) / wp.length(direction)
+    solid = (brep.prims[prim].flags & FLAG_SOLID) != 0
+    keep_searching = cosine > 0.0 and (solid or cosine < GRAZING_COS)
+    return ok, hit_t, u, v, normal, brep.prims[prim].face, keep_searching
 
 
 @wp.func

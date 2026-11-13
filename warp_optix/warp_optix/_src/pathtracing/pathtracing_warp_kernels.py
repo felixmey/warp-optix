@@ -4135,11 +4135,12 @@ def brep_shell_any_hit(params: PathtraceLaunchParams):
     """Refine a shell crossing to the exact BRep surface and record the nearest exact hit.
 
     OptiX orders candidates by the shell triangle's t, and a shell can reach in front of another
-    surface (thin walls). So the payload keeps the nearest exact hit, and only entries are
-    accepted (shrinking tmax): an exit may hide an entry in front of it, so traversal continues.
+    surface (thin walls). So the payload keeps the nearest exact hit, and hits that may hide a
+    nearer crossing behind their shell triangle (leaving a solid, or a sheet's back met at a
+    grazing angle; see proxy_hit) are not accepted, which would shrink tmax: traversal continues.
     The miss and closest-hit programs keep a recorded hit that is nearer than theirs.
     """
-    ok, hit_t, u, v, n_obj, face = _brep_shell_hit(params)
+    ok, hit_t, u, v, n_obj, face, keep_searching = _brep_shell_hit(params)
     if not ok:
         wp.optix_ignore_intersection()
         return
@@ -4155,7 +4156,7 @@ def brep_shell_any_hit(params: PathtraceLaunchParams):
             params, inst_id, primitive_id, u, v, n_obj, wp.optix_get_world_ray_direction()
         )
         _write_primary_payload(geo, wp.int32(inst_id), wp.int32(primitive_id), front_face, u, v, hit_t)
-    if wp.dot(n_obj, wp.optix_get_object_ray_direction()) > 0.0:  # leaving the surface
+    if keep_searching:
         wp.optix_ignore_intersection()
 
 
@@ -4170,7 +4171,7 @@ def brep_shell_closest_hit(params: PathtraceLaunchParams):
 @wp.kernel(module="unique")
 def brep_shell_secondary_any_hit(params: PathtraceLaunchParams):
     """Shadow rays: occluded only where the ray really crosses the exact BRep surface."""
-    ok, hit_t, u, v, n_obj, face = _brep_shell_hit(params)
+    ok, hit_t, u, v, n_obj, face, keep_searching = _brep_shell_hit(params)
     if not ok:
         wp.optix_ignore_intersection()
         return
