@@ -140,6 +140,18 @@ def test_loader_reads_surfaces_orientation_and_seam_trims(tmp_path):
     assert np.all(bounds[:3] > -2.1) and np.all(bounds[3:] < 2.1)
 
 
+def test_loader_flags_closed_solids(tmp_path):
+    """A solid is closed when each edge of its faces' loops is used twice; a loopless sphere face
+    closes up by itself. The half sphere's equator edge bounds only one face: an open "solid"."""
+    whole = _write_sphere_brep(tmp_path / "whole.usda")
+    half = _write_sphere_brep(tmp_path / "half.usda", trimmed=True)
+    whole_prim = loader.load_brep_prim(whole.GetPrimAtPath("/Ball"), np.eye(4))
+    half_prim = loader.load_brep_prim(half.GetPrimAtPath("/Ball"), np.eye(4))
+    assert whole_prim.face_flags[0] & loader.FLAG_CLOSED
+    assert half_prim.face_flags[0] & loader.FLAG_SOLID
+    assert not half_prim.face_flags[0] & loader.FLAG_CLOSED
+
+
 def test_brep_xform_ops_apply_without_the_schema_plugin():
     stage = Usd.Stage.CreateInMemory()
     xform = UsdGeom.Xform.Define(stage, "/X")
@@ -452,5 +464,60 @@ def test_path_traced_near_flat_cone_has_no_cracks(tmp_path):
             # Every image row crosses the ring at most twice: holes would split a crossing in two.
             runs = [np.count_nonzero(np.diff(np.r_[0, row.astype(np.int8), 0]) == 1) for row in hit]
             assert max(runs) == 2 and hit.mean() > 0.15
+    finally:
+        api.close()
+
+
+@pytest.mark.gpu
+@pytest.mark.render
+def test_path_traced_paths_end_inside_closed_opaque_solids(tmp_path):
+    """No light reaches the inside of a closed opaque solid, so camera paths starting there end at their
+    first hit, while views from outside, glass solids and solids holding a light render as before."""
+    if not wp.is_cuda_available():
+        pytest.skip("CUDA device unavailable")
+    from warp_optix.pathtracing import PathTracer  # noqa: PLC0415
+
+    _write_sphere_brep(tmp_path / "ball.usda")
+
+    def render(api, eye, target, dark=True):
+        api._viewer.dark_solid_interiors = dark
+        api._viewer.accumulate_samples = True
+        api._viewer.sample_index = api._viewer.frame_index = 0  # restart accumulation: same samples each time
+        api.set_camera_look_at(eye, target)
+        for _ in range(8):
+            api.render_frame()
+        return np.asarray(api.get_frame()[..., :3], dtype=np.float64)
+
+    def new_api(light=False):
+        api = PathTracer(width=64, height=64, denoiser="none", enable_set=False, backface_culling=False)
+        api.initialize()
+        assert api.scene.load_from_usd(str(tmp_path / "ball.usda"))
+        if light:
+            api.scene.add_light_sphere((0.0, 0.0, 0.0), 0.1, (1.0, 1.0, 1.0), 50.0)
+        api.set_instance_material(0, api.create_diffuse_material((0.8, 0.2, 0.1)))
+        api.build_scene()
+        api.set_environment_color((0.3, 0.3, 0.3))
+        return api
+
+    inside, outside = ((0.0, 0.0, 0.3), (0.0, 0.0, 1.0)), ((0.0, 0.0, 4.0), (0.0, 0.0, 0.0))
+    api = new_api()
+    try:
+        assert not api.scene.lights_in_solids
+        assert render(api, *inside).max() == 0.0
+        lit = render(api, *outside)
+        assert np.abs(lit[32, 32] - lit[0, 0]).max() > 0.05  # the ball differs from the sky
+        np.testing.assert_allclose(lit, render(api, *outside, dark=False), atol=1e-6)
+        api.set_instance_material(0, api.scene.materials.add_glass())
+        api.build_scene()
+        glass = render(api, *outside)
+        np.testing.assert_allclose(glass, render(api, *outside, dark=False), atol=1e-6)
+        assert np.abs(glass - lit).mean() > 0.01
+    finally:
+        api.close()
+
+    api = new_api(light=True)
+    try:
+        assert api.scene.lights_in_solids
+        assert render(api, *inside).mean() > 0.01
     finally:
         api.close()

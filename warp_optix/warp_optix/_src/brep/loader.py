@@ -46,6 +46,7 @@ FLAG_FLIP = 1  # the outward (solid -> void) side is opposite the surface normal
 FLAG_TRIMMED = 2  # the face has trim segments to test
 FLAG_SWAP = 4  # the crossing test runs along +u instead of +v (loops wrap around v)
 FLAG_SOLID = 8  # exactly one side of the face bounds a solid region (else a sheet face)
+FLAG_CLOSED = 16  # a solid face of a prim whose solid faces close up (each edge used twice, see _solids_closed)
 
 TWO_PI = 2.0 * math.pi
 
@@ -530,6 +531,30 @@ def _fill_nan(column: np.ndarray) -> np.ndarray:
     return out
 
 
+def _solids_closed(kinds, solid, loop_off, eu_off, eu_edge) -> bool:
+    """Whether the solid faces of a prim close up: every edge of their trim loops is used an even
+    number of times (twice: once by each face it joins, or twice by the face whose seam it is).
+    Data can claim a solid region yet leave it open (rods without end caps), where rays get inside
+    without crossing a face. A face without loops has no listed edges; only spheres and tori close
+    up then (poles, two periods), any other such face leaves the prim's solids unverified."""
+    faces = np.flatnonzero(solid)
+    if len(faces) == 0:
+        return False
+    uses = []
+    for f in faces.tolist():
+        first, last = int(loop_off[f]), int(loop_off[f + 1])
+        if first == last:
+            if kinds[f] not in (SPHERE, TORUS):
+                return False
+            continue
+        uses.append(eu_edge[int(eu_off[first]) : int(eu_off[last])])
+    if not uses:
+        return True
+    counts = np.bincount(np.concatenate(uses))
+    used = counts[counts > 0]
+    return bool(np.all(used % 2 == 0))
+
+
 def _face_loops_uv(prim_data, surface: Surface, face_rng, loop_list, period) -> tuple[list, list]:
     """Return (closed polylines, open polylines) in UV for a face's loops.
 
@@ -910,6 +935,8 @@ def load_brep_prim(
     owned = range(*faces) if faces is not None else range(nfaces)
     face_flags[flip] |= FLAG_FLIP
     face_flags[solid_sides == 1] |= FLAG_SOLID
+    if _solids_closed(kinds, solid_sides == 1, loop_off, eu_off, eu_edge):
+        face_flags[solid_sides == 1] |= FLAG_CLOSED
     for f in owned:
         surface = surfaces[f]
         period = surface.periods()

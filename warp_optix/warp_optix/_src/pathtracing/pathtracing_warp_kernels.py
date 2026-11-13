@@ -24,6 +24,7 @@ import warp_optix as wo
 from warp_optix._src.enums import RayFlags
 
 from ..brep import device as brep_device
+from ..brep.loader import FLAG_CLOSED
 from .func_common import Mat16f, Vec6f
 
 # Ray types of the path tracer's SBT, in record order. Traces use these indices as their SBT
@@ -1344,6 +1345,13 @@ def _mul_mat4_cm(m: Mat16f, v: wp.vec4) -> wp.vec4:
 MISS_DISTANCE = 65504.0
 FLAGS_USE_PATH_REGULARIZATION = wp.uint32(4)
 FLAGS_CULL_BACK_FACES = wp.uint32(8)
+# No light reaches the inside of a closed solid with opaque faces: paths that meet a face from inside stop there.
+FLAGS_DARK_SOLID_INTERIORS = wp.uint32(16)
+# Payload front_face values: the back side of a face, its front side, the back (inner) side of a face of a
+# closed solid (FLAG_CLOSED: open "solids", like rods without end caps, keep FACE_BACK).
+FACE_BACK = wp.constant(wp.uint32(0))
+FACE_FRONT = wp.constant(wp.uint32(1))
+FACE_SOLID_INSIDE = wp.constant(wp.uint32(2))
 
 
 @wp.func
@@ -2504,9 +2512,26 @@ def _make_invalid_shaded_hit() -> ShadedHitData:
 
 
 @wp.func
+def _ends_in_dark_interior(
+    params: PathtraceLaunchParams, front_face: wp.uint32, hit: ShadedHitData, transmitted: wp.bool
+) -> wp.bool:
+    """Whether a path is inside a closed solid that no light enters, so that it ends at this hit (its
+    emission and ambient light still count): it meets an opaque face from inside, and it was never
+    transmitted, which is the only way light gets into a solid (camera rays start inside, other
+    paths only get there through a leak)."""
+    return (
+        (params.flags & FLAGS_DARK_SOLID_INTERIORS) != wp.uint32(0)
+        and front_face == FACE_SOLID_INSIDE
+        and not transmitted
+        and hit.transmission <= 0.0
+        and hit.diffuse_transmission_factor <= 0.0
+    )
+
+
+@wp.func
 def _set_incident_medium_for_hit(hit: ShadedHitData, front_face: wp.uint32) -> ShadedHitData:
     """Select the incident medium after geometry has face-forwarded its frame."""
-    if hit.valid != wp.uint32(0) and front_face == wp.uint32(0) and hit.is_thin_walled == 0:
+    if hit.valid != wp.uint32(0) and front_face != FACE_FRONT and hit.is_thin_walled == 0:
         exterior_ior = hit.ior1
         hit.ior1 = hit.ior2
         hit.ior2 = exterior_ior
@@ -3132,7 +3157,12 @@ def _make_primary_raygen(reorder_bounces: bool):
         rng = _pcg_advance(rng)
         xi2_l = _pcg_rand01(rng)
         ls = _sample_environment_light(params, xi0_l, xi1_l, xi2_l)
-        if ls.pdf > 1.0e-6 and (wp.dot(ls.direction, pbr_mat.normal) > 0.0 or pbr_mat.transmission > 0.0):
+        dark_interior = _ends_in_dark_interior(params, _payload_get_front_face(payload), pbr_mat, False)
+        if (
+            ls.pdf > 1.0e-6
+            and (wp.dot(ls.direction, pbr_mat.normal) > 0.0 or pbr_mat.transmission > 0.0)
+            and not dark_interior
+        ):
             rng = _pcg_advance(rng)
             eval_xi_z = _pcg_rand01(rng)
             bsdf_eval = _bsdf_evaluate(
@@ -3197,18 +3227,19 @@ def _make_primary_raygen(reorder_bounces: bool):
         sphere_xi2 = _pcg_rand01(rng)
         rng = _pcg_advance(rng)
         sphere_lobe_xi = _pcg_rand01(rng)
-        hdr_radiance = hdr_radiance + _sample_sphere_light_contribution(
-            params,
-            hit_pos,
-            pbr_mat,
-            to_eye,
-            base_color,
-            specular_color,
-            sphere_xi0,
-            sphere_xi1,
-            sphere_xi2,
-            sphere_lobe_xi,
-        )
+        if not dark_interior:
+            hdr_radiance = hdr_radiance + _sample_sphere_light_contribution(
+                params,
+                hit_pos,
+                pbr_mat,
+                to_eye,
+                base_color,
+                specular_color,
+                sphere_xi0,
+                sphere_xi1,
+                sphere_xi2,
+                sphere_lobe_xi,
+            )
 
         if (
             hdr_radiance[0] != hdr_radiance[0]
@@ -3270,7 +3301,8 @@ def _make_primary_raygen(reorder_bounces: bool):
         bsdf_pdf = wp.max(bsdf_sample.pdf, 0.0001)
         sec_event_type = bsdf_sample.event_type
         is_glossy_reflection = wp.bool(bsdf_sample.event_type == BSDF_EVENT_GLOSSY_REFLECTION)
-        bsdf_absorbed = wp.bool(bsdf_sample.event_type == BSDF_EVENT_ABSORB)
+        bsdf_absorbed = wp.bool(bsdf_sample.event_type == BSDF_EVENT_ABSORB) or dark_interior
+        transmitted = (bsdf_sample.event_type & BSDF_EVENT_TRANSMISSION) != 0
 
         sec_origin = _offset_ray_for_direction(hit_pos, pbr_mat.Ng, sec_direction)
         max_depth = wp.int32(params.max_bounces) if params.max_bounces > wp.uint32(0) else wp.int32(1)
@@ -3356,6 +3388,8 @@ def _make_primary_raygen(reorder_bounces: bool):
                 (1.0 - sec_pbr.metallic) * sec_pbr.occlusion
             )
             radiance = radiance + _mul_vec3(sec_throughput, sec_ambient)
+            if _ends_in_dark_interior(params, _payload_get_front_face(sec_payload), sec_pbr, transmitted):
+                break
 
             # Direct lighting at secondary hit (GGX BSDF).
             rng = _pcg_advance(rng)
@@ -3495,7 +3529,7 @@ def _make_primary_raygen(reorder_bounces: bool):
 
             completed_thick_exit = wp.bool(
                 sec_pbr.is_thin_walled == 0
-                and _payload_get_front_face(sec_payload) == wp.uint32(0)
+                and _payload_get_front_face(sec_payload) != FACE_FRONT
                 and (sec_sample.event_type & BSDF_EVENT_TRANSMISSION) != 0
             )
 
@@ -3511,6 +3545,7 @@ def _make_primary_raygen(reorder_bounces: bool):
             sec_origin = _offset_ray_for_direction(sec_hit_pos, sec_pbr.Ng, sec_sample.direction)
             sec_direction = wp.normalize(sec_sample.direction)
             sec_event_type = sec_sample.event_type
+            transmitted = transmitted or (sec_sample.event_type & BSDF_EVENT_TRANSMISSION) != 0
             bsdf_pdf = wp.max(sec_sample.pdf, 0.0001)
             if not completed_thick_exit:
                 depth = depth + wp.int32(1)
@@ -4109,6 +4144,8 @@ def brep_primary_closest_hit(params: PathtraceLaunchParams):
         wp.optix_uint32_as_float(wp.optix_get_attribute(4)),
     )
     geo, front_face = _brep_hit_geometry(params, inst_id, primitive_id, u, v, n_obj, wp.optix_get_world_ray_direction())
+    if front_face == FACE_BACK and _brep_closed(params, int(wp.optix_get_primitive_index())):
+        front_face = FACE_SOLID_INSIDE
     _store_primary_hit_payload(geo, wp.int32(inst_id), wp.int32(primitive_id), front_face, u, v)
 
 
@@ -4127,6 +4164,20 @@ def _brep_shell_hit(params: PathtraceLaunchParams):
         wp.optix_get_object_ray_origin(),
         wp.optix_get_object_ray_direction(),
     )
+
+
+@wp.func
+def _brep_closed(params: PathtraceLaunchParams, prim: int) -> wp.bool:
+    """Whether BRep primitive ``prim`` (global index) is a face of a closed solid."""
+    return (params.brep.prims[prim].flags & FLAG_CLOSED) != 0
+
+
+@wp.func
+def _brep_shell_closed(params: PathtraceLaunchParams) -> wp.bool:
+    """Whether the crossed shell triangle's face belongs to a closed solid."""
+    rp = params.render_primitives[int(params.instance_render_prim_ids[int(wp.optix_get_instance_id())])]
+    tri = int(rp.vertex_buffer.position_offset) + int(wp.optix_get_primitive_index())
+    return _brep_closed(params, int(params.brep.proxy_prim[tri]))
 
 
 @wo.kernel(kind=wo.ProgramKind.ANY_HIT)
@@ -4155,6 +4206,8 @@ def brep_shell_any_hit(params: PathtraceLaunchParams):
         geo, front_face = _brep_hit_geometry(
             params, inst_id, primitive_id, u, v, n_obj, wp.optix_get_world_ray_direction()
         )
+        if front_face == FACE_BACK and _brep_shell_closed(params):
+            front_face = FACE_SOLID_INSIDE
         _write_primary_payload(geo, wp.int32(inst_id), wp.int32(primitive_id), front_face, u, v, hit_t)
     if keep_searching:
         wp.optix_ignore_intersection()

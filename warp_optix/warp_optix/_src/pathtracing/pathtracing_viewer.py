@@ -313,6 +313,8 @@ class Renderer:
         self.emissive_material_intensity = 1.0
         self.env_rotation = 0.0
         self.use_path_regularization = True
+        # Paths that meet the inside of a closed opaque solid end there (no light reaches it).
+        self.dark_solid_interiors = True
         self.use_psr = True
         self.override_roughness = -1.0
         self.override_metallic = -1.0
@@ -923,6 +925,7 @@ class Renderer:
             | (2 if self.use_psr else 0)
             | (4 if self.use_path_regularization else 0)
             | (8 if self.backface_culling else 0)
+            | (16 if self.dark_solid_interiors and not getattr(self._scene, "lights_in_solids", False) else 0)
         )
         values = {
             "tlas": self._scene.tlas_handle,

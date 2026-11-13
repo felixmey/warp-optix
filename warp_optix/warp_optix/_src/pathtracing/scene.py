@@ -32,6 +32,7 @@ import warp as wp
 import warp_optix as wo
 
 from ..brep import device as brep_device
+from ..brep import loader as brep_loader
 from ..brep import proxy as brep_proxy
 from . import pathtracing_warp_kernels as pwk
 from .color_utils import srgb_to_linear_u8
@@ -723,6 +724,9 @@ class Scene:
         self._brep_companions: dict[int, list[int]] = {}
         self._sphere_lights = []
         self._sphere_light_data = None
+        # Whether a light may sit inside a closed BRep solid (see lights_in_solids), None: not known yet.
+        self._lights_in_solids: bool | None = None
+        self._geometry_material_ids: list = []
 
         # GPU buffers
         self._render_primitives = None
@@ -824,6 +828,7 @@ class Scene:
             raise ValueError("radius must be positive")
         if intensity < 0.0:
             raise ValueError("intensity must be nonnegative")
+        self._lights_in_solids = None
         self._sphere_lights.append(
             (
                 tuple(float(value) for value in position),
@@ -1046,6 +1051,7 @@ class Scene:
             inst.transform = np.ascontiguousarray(transform, dtype=np.float32)
             self._instance_transform_cache[instance_index] = inst.transform
             self._instance_records_dirty = True
+            self._lights_in_solids = None
             for companion in self._brep_companions.get(instance_index, []):
                 self.set_instance_transform(companion, transform)
 
@@ -1060,6 +1066,7 @@ class Scene:
         if int(indices.min()) < 0 or int(indices.max()) >= len(self._instances):
             raise IndexError("instance index is out of range")
         self._instance_transform_cache[indices] = matrices
+        self._lights_in_solids = None
         if self._brep_companions:
             pairs = [(c, n) for n, i in enumerate(indices.tolist()) for c in self._brep_companions.get(i, [])]
             if pairs:
@@ -1315,6 +1322,7 @@ class Scene:
         """Override the material used by one instance."""
         if 0 <= instance_index < len(self._instances):
             self._instances[instance_index].material_id = material_id
+            self._lights_in_solids = None
 
     def set_instance_visible(self, instance_index: int, visible: bool):
         """Control whether one instance participates in traversal."""
@@ -1592,6 +1600,8 @@ class Scene:
         self._brep_companions.clear()
         self._sphere_lights.clear()
         self._sphere_light_data = None
+        self._lights_in_solids = None
+        self._geometry_material_ids = []
         self._gas.clear()
         self._ias = None
         self._instance_records = None
@@ -1700,6 +1710,61 @@ class Scene:
             geometry.indices = (base + np.arange(len(geometry.bounds))).astype(np.uint32)
             if geometry.shell_index is not None:
                 self._meshes[geometry.shell_index].tri_base = tri_base
+
+    def _instance_world_bounds(self, index: int) -> np.ndarray:
+        """World AABB (lo, hi) of instance ``index``, from its geometry's bounding-box corners."""
+        v = np.asarray(self._meshes[self._instances[index].mesh_index].vertices, dtype=np.float64).reshape(-1, 3)
+        if len(v) == 0:
+            return np.full((2, 3), np.nan)
+        corners = np.array(list(itertools.product(*zip(v.min(axis=0), v.max(axis=0), strict=True))))
+        m = np.asarray(self._instance_transform_cache[index], dtype=np.float64)
+        w = corners @ m[:3, :3].T + m[:3, 3]
+        return np.stack([w.min(axis=0), w.max(axis=0)])
+
+    @property
+    def lights_in_solids(self) -> bool:
+        """Whether a sphere light's center, or an emissive instance's bounds, lies within the bounds of
+        an instance of a BRep with solids. No light reaches the inside of a closed opaque solid unless
+        it starts there, so the path tracer may end paths that meet such a solid from inside; it keeps
+        them going when this (conservative) test finds a light that might be inside one."""
+        if self._lights_in_solids is None:
+            self._lights_in_solids = self._find_lights_in_solids(self._geometry_material_ids)
+        return self._lights_in_solids
+
+    def _find_lights_in_solids(self, packed_material_ids) -> bool:
+        solids = [
+            i
+            for i, inst in enumerate(self._instances)
+            if self._meshes[inst.mesh_index].primitive_type == "brep"
+            and np.any((self._meshes[inst.mesh_index].prim.face_flags & brep_loader.FLAG_CLOSED) != 0)
+        ]
+        if not solids:
+            return False
+        solid_bounds = np.stack([self._instance_world_bounds(i) for i in solids])
+        for position, *_ in self._sphere_lights:
+            p = np.asarray(position, dtype=np.float64)
+            if np.any(np.all((solid_bounds[:, 0] <= p) & (p <= solid_bounds[:, 1]), axis=1)):
+                return True
+        entries = self.materials.get_material_entries()
+        emissive = {
+            i
+            for i, m in enumerate(entries)
+            if np.any(np.asarray(m["emissiveFactor"]) > 0.0) or int(m["emissiveTexture"]["index"]) >= 0
+        }
+        if not emissive:
+            return False
+        for index, inst in enumerate(self._instances):
+            if inst.material_id is None and inst.mesh_index >= len(packed_material_ids):
+                continue
+            ids = [inst.material_id] if inst.material_id is not None else packed_material_ids[inst.mesh_index]
+            if not emissive.intersection(np.unique(np.asarray(ids)).tolist()):
+                continue
+            lo, hi = self._instance_world_bounds(index)
+            overlap = np.all((solid_bounds[:, 0] <= hi) & (lo <= solid_bounds[:, 1]), axis=1)
+            overlap[[k for k, i in enumerate(solids) if i == index]] = False
+            if np.any(overlap):
+                return True
+        return False
 
     def rebuild_tlas(self, stream=None):
         """Rebuild only TLAS after instance transform updates."""
@@ -2032,6 +2097,8 @@ class Scene:
         self._sphere_light_data = (
             wp.array(light_data, dtype=wp.float32, device=self.device) if len(light_data) else None
         )
+        self._geometry_material_ids = packed_material_ids
+        self._lights_in_solids = None
 
         # Build per-instance material ID lookup buffer.
         instance_material_ids = np.full(len(self._instances), NO_MATERIAL_OVERRIDE, dtype=np.uint32)
