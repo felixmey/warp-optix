@@ -26,7 +26,10 @@ import warp as wp
 from .device import SHELL_LAYER_TRIANGLES, eval_cubic, load_cubic
 from .loader import NURBS, BrepPrim
 
-GRID = 4  # shell cells along each patch direction
+# Shell cells along each patch direction. The shell is offset by twice the grid's deviation from the
+# surface, which falls with the square of GRID: 6 keeps shells about half as thick as 4, so far fewer
+# rays cross them without meeting the surface, for twice the triangles.
+GRID = 6
 # The shell covers the patch extended by MARGIN in parameter space (the Bezier polynomial continues
 # smoothly past its edges), so adjacent patches' shells overlap instead of sharing coincident side
 # walls: a ray crossing a patch boundary must cross both patches' shells.
