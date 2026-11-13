@@ -25,10 +25,15 @@ from . import trim_grid
 from .loader import CONE, FLAG_FLIP, FLAG_SOLID, FLAG_SWAP, FLAG_TRIMMED, PLANE, SPHERE, TORUS
 
 NEWTON_ITERATIONS = 10
-# Retry a sub-patch from more seeds after finding the ray's exit only when the ray meets the
-# surface this obliquely (|cos|): only a nearly tangent ray can also enter the same flat patch.
+# Below this |cos| between the ray and the surface, a ray can cross a flat sub-patch twice: there,
+# the nearest crossing is isolated along the ray (first_root) instead of trusting Newton's root.
 GRAZING_COS = 0.3
 ATTRIBUTE_WORDS = 6
+# Parameter-space margin around a sub-patch's square: first_root skips a stretch of the ray whose
+# foot points pass outside the square grown by it (the crossings there are a neighbor's).
+SQUARE_MARGIN = wp.constant(0.05)
+# Triangles per layer of a sub-patch's shell (proxy.py): outer layer first, then inner, then walls.
+SHELL_LAYER_TRIANGLES = wp.constant(32)
 GRID_REF_A = wp.constant(trim_grid.REF_A)
 GRID_REF_C = wp.constant(trim_grid.REF_C)
 
@@ -631,6 +636,32 @@ def first_point(patch: Bezier, cvs: wp.array[wp.vec4]) -> wp.vec3:
     return wp.vec3(cv[0], cv[1], cv[2]) / cv[3]
 
 
+@wp.func
+def corner_points(patch: Cubic, cvs: wp.array[wp.vec4]):
+    return (
+        wp.vec3(patch.x[0, 0], patch.y[0, 0], patch.z[0, 0]) / patch.w[0, 0],
+        wp.vec3(patch.x[3, 0], patch.y[3, 0], patch.z[3, 0]) / patch.w[3, 0],
+        wp.vec3(patch.x[0, 3], patch.y[0, 3], patch.z[0, 3]) / patch.w[0, 3],
+        wp.vec3(patch.x[3, 3], patch.y[3, 3], patch.z[3, 3]) / patch.w[3, 3],
+    )
+
+
+@wp.func
+def corner_points(patch: Bezier, cvs: wp.array[wp.vec4]):
+    q = patch.degree[1]
+    last = patch.degree[0] * (q + 1)
+    c00 = cvs[patch.base]
+    c10 = cvs[patch.base + last]
+    c01 = cvs[patch.base + q]
+    c11 = cvs[patch.base + last + q]
+    return (
+        wp.vec3(c00[0], c00[1], c00[2]) / c00[3],
+        wp.vec3(c10[0], c10[1], c10[2]) / c10[3],
+        wp.vec3(c01[0], c01[1], c01[2]) / c01[3],
+        wp.vec3(c11[0], c11[1], c11[2]) / c11[3],
+    )
+
+
 @wp.struct
 class PatchRay:
     """An object-space ray as the intersection of two planes through it (n1, n2 orthonormal to
@@ -671,14 +702,20 @@ def ray_t(ray: PatchRay, point: wp.vec3) -> float:
 
 @wp.struct
 class Hull:
-    """The control points seen from the ray: (n1, n2) . (P - near) ranges, the nearest point along
-    the ray, and the control point closest to the ray."""
+    """The control points seen from the ray: (n1, n2) . (P - near) ranges, their ranges along four
+    more axes in that plane (normals of the corner-to-corner edges, as x and y components), the
+    nearest and farthest point along the ray, and the control point closest to the ray."""
 
     lo: wp.vec2
     hi: wp.vec2
     nearest: float
+    farthest: float
     closest: float
     closest_index: int
+    axis_x: wp.vec4
+    axis_y: wp.vec4
+    side_lo: wp.vec4
+    side_hi: wp.vec4
 
 
 @wp.func
@@ -688,7 +725,12 @@ def hull_add(h: Hull, i: int, cv: wp.vec4, ray: PatchRay) -> Hull:
     out = h
     out.lo = wp.min(h.lo, d)
     out.hi = wp.max(h.hi, d)
-    out.nearest = wp.min(h.nearest, wp.dot(rel, ray.direction))
+    side = d[0] * h.axis_x + d[1] * h.axis_y
+    out.side_lo = wp.min(h.side_lo, side)
+    out.side_hi = wp.max(h.side_hi, side)
+    along = wp.dot(rel, ray.direction)
+    out.nearest = wp.min(h.nearest, along)
+    out.farthest = wp.max(h.farthest, along)
     if wp.dot(d, d) < h.closest:
         out.closest = wp.dot(d, d)
         out.closest_index = i
@@ -696,19 +738,47 @@ def hull_add(h: Hull, i: int, cv: wp.vec4, ray: PatchRay) -> Hull:
 
 
 @wp.func
-def hull_new() -> Hull:
+def plane_point(ray: PatchRay, p: wp.vec3) -> wp.vec2:
+    return wp.vec2(wp.dot(ray.n1, p - ray.near), wp.dot(ray.n2, p - ray.near))
+
+
+@wp.func
+def edge_normal(a: wp.vec2, b: wp.vec2) -> wp.vec2:
+    e = b - a
+    length = wp.length(e)
+    if length > 0.0:
+        return wp.vec2(-e[1], e[0]) / length
+    return wp.vec2(0.0)
+
+
+@wp.func
+def hull_new(patch: Any, cvs: wp.array[wp.vec4], ray: PatchRay) -> Hull:
+    p00, p10, p01, p11 = corner_points(patch, cvs)
+    a = plane_point(ray, p00)
+    b = plane_point(ray, p10)
+    c = plane_point(ray, p01)
+    d = plane_point(ray, p11)
+    n0 = edge_normal(a, b)
+    n1 = edge_normal(b, d)
+    n2 = edge_normal(d, c)
+    n3 = edge_normal(c, a)
     h = Hull()
     h.lo = wp.vec2(1.0e30)
     h.hi = wp.vec2(-1.0e30)
     h.nearest = 1.0e30
+    h.farthest = -1.0e30
     h.closest = 1.0e30
     h.closest_index = 0
+    h.axis_x = wp.vec4(n0[0], n1[0], n2[0], n3[0])
+    h.axis_y = wp.vec4(n0[1], n1[1], n2[1], n3[1])
+    h.side_lo = wp.vec4(1.0e30)
+    h.side_hi = wp.vec4(-1.0e30)
     return h
 
 
 @wp.func
 def patch_hull(patch: Cubic, cvs: wp.array[wp.vec4], ray: PatchRay) -> Hull:
-    h = hull_new()
+    h = hull_new(patch, cvs, ray)
     for i in range(16):  # a constant count: unrolled, so the matrices stay in registers
         h = hull_add(
             h,
@@ -721,7 +791,7 @@ def patch_hull(patch: Cubic, cvs: wp.array[wp.vec4], ray: PatchRay) -> Hull:
 
 @wp.func
 def patch_hull(patch: Bezier, cvs: wp.array[wp.vec4], ray: PatchRay) -> Hull:
-    h = hull_new()
+    h = hull_new(patch, cvs, ray)
     for i in range((patch.degree[0] + 1) * (patch.degree[1] + 1)):
         h = hull_add(h, i, cvs[patch.base + i], ray)
     return h
@@ -735,10 +805,23 @@ def hull_tmin(hull: Hull, ray: PatchRay, tol: float) -> float:
 
 
 @wp.func
+def hull_tmax(hull: Hull, ray: PatchRay, tol: float) -> float:
+    """An upper bound of the ray parameter of any patch point."""
+    return ray.shift + hull.farthest / ray.dd + tol / wp.sqrt(ray.dd)
+
+
+@wp.func
 def hull_misses(hull: Hull, tol: float) -> bool:
     """Convex-hull rejection (the first step of Bezier clipping): the ray lies on both planes, so
-    it can only hit the patch if the control points straddle each plane."""
-    return hull.lo[0] > tol or hull.hi[0] < -tol or hull.lo[1] > tol or hull.hi[1] < -tol
+    it can only hit the patch if the control points straddle each plane, and each line through it
+    along an edge between the corners (the tighter separating axes for a ray passing beside the
+    patch: its control points' axis-aligned box in the ray's plane is loose)."""
+    if hull.lo[0] > tol or hull.hi[0] < -tol or hull.lo[1] > tol or hull.hi[1] < -tol:
+        return True
+    for k in range(4):
+        if hull.side_lo[k] > tol or hull.side_hi[k] < -tol:
+            return True
+    return False
 
 
 @wp.func
@@ -757,41 +840,239 @@ def newton(patch: Any, cvs: wp.array[wp.vec4], ray: PatchRay, tol: float, seed: 
         rel = point - ray.near
         f0 = wp.dot(ray.n1, rel)
         f1 = wp.dot(ray.n2, rel)
-        if wp.abs(f0) + wp.abs(f1) < tol:
-            converged = True
-            break
+        done = wp.abs(f0) + wp.abs(f1) < tol
         j00 = wp.dot(ray.n1, ds)
         j01 = wp.dot(ray.n1, dt)
         j10 = wp.dot(ray.n2, ds)
         j11 = wp.dot(ray.n2, dt)
         det = j00 * j11 - j01 * j10
         if wp.abs(det) < 1.0e-30:
+            converged = done
             break
         inv_det = 1.0 / det
-        st = wp.vec2(st[0] - (j11 * f0 - j01 * f1) * inv_det, st[1] - (-j10 * f0 + j00 * f1) * inv_det)
+        step = wp.vec2((j11 * f0 - j01 * f1) * inv_det, (-j10 * f0 + j00 * f1) * inv_det)
+        st = st - step
+        if done:
+            # One more Newton step, linearized (no evaluation): the reported point then lies on the
+            # ray to second order instead of anywhere within tol of it. Rays spawned from it are
+            # offset by less than tol (relative 1/65536 of the position, tol 1e-5 of the patch).
+            converged = True
+            point = point - step[0] * ds - step[1] * dt
+            break
         if st[0] < -0.5 or st[0] > 1.5 or st[1] < -0.5 or st[1] > 1.5:
             break
-    inside = st[0] >= -1.0e-4 and st[0] <= 1.0001 and st[1] >= -1.0e-4 and st[1] <= 1.0001
-    return converged, converged and inside, st, point, ds, dt
+    return converged, converged and in_square(st), st, point, ds, dt
 
 
 @wp.func
-def upstream_step(ds: wp.vec3, dt: wp.vec3, unit: wp.vec3) -> wp.vec2:
-    """Unit parameter-space direction that moves the surface point against the ray (least
-    squares), or zero: from an exit root, the entry lies that way."""
-    a00 = wp.dot(ds, ds)
-    a01 = wp.dot(ds, dt)
-    a11 = wp.dot(dt, dt)
-    b0 = -wp.dot(ds, unit)
-    b1 = -wp.dot(dt, unit)
-    det = a00 * a11 - a01 * a01
-    if wp.abs(det) <= 1.0e-30:
-        return wp.vec2(0.0)
-    step = wp.vec2((a11 * b0 - a01 * b1) / det, (a00 * b1 - a01 * b0) / det)
-    length = wp.length(step)
-    if length > 0.0:
-        return step / length
-    return wp.vec2(0.0)
+def in_square(st: wp.vec2) -> bool:
+    return st[0] >= -1.0e-4 and st[0] <= 1.0001 and st[1] >= -1.0e-4 and st[1] <= 1.0001
+
+
+@wp.struct
+class Foot:
+    """A ray point at ``t``, the parameters of its foot point on a sub-patch (the nearest surface
+    point, the patch extended past its square), and its signed distance ``h`` from the surface along
+    the unit normal with its rate ``g`` = dh/dt along the ray. (Five floats: the root search keeps
+    several alive, and the shell any-hit runs under the path tracer's register budget.)"""
+
+    t: float
+    st: wp.vec2
+    h: float
+    g: float
+
+
+@wp.func
+def foot(patch: Any, cvs: wp.array[wp.vec4], ray: PatchRay, t: float, seed: wp.vec2, steps: int) -> Foot:
+    """Project the ray point at ``t`` onto the patch (Gauss-Newton from ``seed``). Unlike the
+    two-plane Newton, whose Jacobian vanishes as the ray turns tangent, the projection stays well
+    conditioned where a ray grazes the surface. One evaluation site (a ``while`` loop does not
+    unroll): this runs inside first_root's loop, and code size costs instruction cache."""
+    q = ray.near + (t - ray.shift) * ray.direction
+    st = seed
+    point = wp.vec3(0.0)
+    ds = wp.vec3(0.0)
+    dt = wp.vec3(0.0)
+    k = int(0)
+    while k <= steps:
+        point, ds, dt = eval_patch(patch, cvs, st[0], st[1])
+        if k == steps:
+            break
+        r = q - point
+        a00 = wp.dot(ds, ds)
+        a01 = wp.dot(ds, dt)
+        a11 = wp.dot(dt, dt)
+        det = a00 * a11 - a01 * a01
+        if det <= 1.0e-12 * a00 * a11:
+            break
+        b0 = wp.dot(ds, r)
+        b1 = wp.dot(dt, r)
+        step = wp.vec2((a11 * b0 - a01 * b1) / det, (a00 * b1 - a01 * b0) / det)
+        st = wp.vec2(wp.clamp(st[0] + step[0], -0.5, 1.5), wp.clamp(st[1] + step[1], -0.5, 1.5))
+        k += 1
+        if wp.abs(step[0]) + wp.abs(step[1]) < 1.0e-6:
+            k = steps  # converged: evaluate at the new point and stop
+    n = wp.normalize(wp.cross(ds, dt))
+    f = Foot()
+    f.t = t
+    f.st = st
+    f.h = wp.dot(q - point, n)
+    f.g = wp.dot(ray.direction, n)
+    return f
+
+
+@wp.func
+def path_meets_square(a: wp.vec2, b: wp.vec2, margin: float) -> bool:
+    """Whether the segment a-b in parameter space meets the patch's square, grown by a margin for
+    the curvature of the feet's path (the projections of the ray points between two probes)."""
+    lo = float(0.0)
+    hi = float(1.0)
+    d = b - a
+    for k in range(2):
+        if wp.abs(d[k]) < 1.0e-12:
+            if a[k] < -margin or a[k] > 1.0 + margin:
+                return False
+        else:
+            u0 = (-margin - a[k]) / d[k]
+            u1 = (1.0 + margin - a[k]) / d[k]
+            lo = wp.max(lo, wp.min(u0, u1))
+            hi = wp.min(hi, wp.max(u0, u1))
+    return lo <= hi
+
+
+@wp.func
+def root_foot(ray: PatchRay, st: wp.vec2, point: wp.vec3, ds: wp.vec3, dt: wp.vec3) -> Foot:
+    """A Newton root as a Foot (h = 0)."""
+    f = Foot()
+    f.t = ray_t(ray, point)
+    f.st = st
+    f.h = 0.0
+    f.g = wp.dot(ray.direction, wp.normalize(wp.cross(ds, dt)))
+    return f
+
+
+@wp.func
+def first_root(
+    patch: Any, cvs: wp.array[wp.vec4], ray: PatchRay, tol: float, t0: float, t1: float, r: Foot, known: bool
+):
+    """The ray's nearest crossing of the (extended) sub-patch with t in [t0, t1]: (found, Foot).
+
+    Along the ray, the signed distance h to a flat sub-patch has at most one extremum, so crossings
+    come alone (h changes sign between the ends) or as a pair around a silhouette or a fold (h has
+    the same sign at both ends, heading toward zero at t0 and away from it at t1), separated by a
+    secant search for the extremum. Safeguarded Newton on h then finds the crossing. A ray starting
+    within ``tol`` of the surface (a bounce or shadow ray) counts as on the side it heads to.
+
+    A ``known`` root ``r`` (Newton's, or a crossing found before) saves probes: ahead of t0, a
+    nearer crossing exists exactly when h at t0 is on the side h heads to at r (one probe); behind
+    t0, h heads away from zero after it, so at most one crossing follows: h at t1 tells (two).
+    Without a root, ``r.st`` seeds the projections.
+
+    One projection site in one loop: probe t0 (phase 0), t1 (1), the extremum (2), the crossing (3).
+    """
+    a = Foot()
+    b = Foot()
+    t = t0
+    st = r.st
+    phase = int(0)
+    probes = int(0)
+    ahead = known and r.t >= t0
+    while probes < 14:
+        probes += 1
+        m = foot(patch, cvs, ray, t, st, 2)
+        st = m.st
+        if phase == 0:
+            if wp.abs(m.h) < tol:
+                m.h = wp.where(m.g > 0.0, tol, -tol)
+            a = m
+            if ahead:
+                if (a.h > 0.0) == (r.g > 0.0):
+                    b = r  # an odd number of crossings before r: bracket them
+                    b.h = wp.where(r.g > 0.0, -tol, tol)
+                    phase = 3
+                else:
+                    return r.t <= t1, r
+            else:
+                phase = 1
+                t = t1
+                continue
+        elif phase == 1:
+            b = m
+            phase = 3
+            if not path_meets_square(a.st, b.st, SQUARE_MARGIN):
+                return False, a  # every crossing in between lies on a neighbor's part of the surface
+            if (a.h > 0.0) == (b.h > 0.0):
+                if known or a.h * a.g >= 0.0 or b.h * b.g <= 0.0:
+                    return False, a  # h never heads back across zero
+                phase = 2
+        elif phase == 2:
+            if (m.h > 0.0) != (a.h > 0.0):
+                b = m
+                phase = 3
+            elif wp.abs(m.g) * (b.t - a.t) < wp.abs(m.h):
+                return False, a  # near the extremum and still on the starting side
+            elif (m.g > 0.0) == (a.g > 0.0):
+                a = m
+            else:
+                b = m
+        else:
+            if wp.abs(m.h) < tol:
+                m.t = m.t - m.h / m.g  # a final Newton step (no evaluation), as in newton()
+                return True, m
+            if (m.h > 0.0) == (a.h > 0.0):
+                a = m
+            else:
+                b = m
+            # The bracket closed in on a jump of the projection rather than a crossing (h changes
+            # sign without passing zero, where the clamped foot point switches sides): skip it.
+            if (b.t - a.t) * wp.sqrt(ray.dd) < tol:
+                break
+        if phase == 2:
+            t = a.t - a.g * (b.t - a.t) / (b.g - a.g)  # secant on g, toward the extremum
+        else:
+            t = m.t - m.h / m.g  # Newton, bisecting where it leaves the bracket
+            if not (t > a.t and t < b.t):
+                t = 0.5 * (a.t + b.t)
+        # Seed the next projection from the last foot point, moved along the bracket's parameter-
+        # space chord: Gauss-Newton then starts next to the new foot point.
+        rate = (b.st - a.st) / (b.t - a.t)
+        st = m.st + (t - m.t) * rate
+    # No crossing settled. Looking for one before a known root, that root stands. A bracketed one
+    # is skipped as off the square (a long, curved interval can hold such crossings before the
+    # patch's own): reported outside the square, so square_root searches on past it.
+    if ahead:
+        return r.t <= t1, r
+    if phase == 3:
+        b.st = wp.vec2(-10.0)
+        if b.g == 0.0:
+            b.g = 1.0
+        return True, b
+    return False, a
+
+
+@wp.func
+def square_root(
+    patch: Any, cvs: wp.array[wp.vec4], ray: PatchRay, tol: float, t0: float, t1: float, r: Foot, known: bool
+):
+    """The ray's nearest crossing of the sub-patch itself (its square) with t in [t0, t1]: a nearer
+    crossing of its extension (a neighbor's part of the surface) is skipped."""
+    t = t0
+    root = r
+    have = known
+    searches = int(0)
+    while searches < 3 and t < t1:
+        searches += 1
+        found, f = first_root(patch, cvs, ray, tol, t, t1, root, have)
+        if not found:
+            break
+        if in_square(f.st):
+            return True, f
+        if f.g == 0.0:
+            break
+        t = f.t + 2.0 * tol / wp.abs(f.g)
+        root = f
+        have = True
+    return False, Foot()
 
 
 @wp.func
@@ -822,38 +1103,14 @@ def report_patch_hit(
 
 
 @wp.func
-def bends_toward(
-    patch: Any,
-    cvs: wp.array[wp.vec4],
-    st: wp.vec2,
-    step: wp.vec2,
-    point: wp.vec3,
-    ds: wp.vec3,
-    dt: wp.vec3,
-    ray: PatchRay,
-) -> bool:
-    """Whether the surface downstream of the ray's start (along ``step`` in parameter space) bends
-    toward the side the ray leaves to: only a concave stretch can meet the ray again."""
-    ahead = wp.vec2(wp.clamp(st[0] + 0.35 * step[0], 0.0, 1.0), wp.clamp(st[1] + 0.35 * step[1], 0.0, 1.0))
-    if wp.length(ahead - st) < 1.0e-3:
-        return True  # at the patch's edge: the crossing may lie on its neighbor
-    q, qs, qt = eval_patch(patch, cvs, ahead[0], ahead[1])
-    n = wp.cross(ds, dt)
-    return wp.dot(q - point, n) * wp.dot(ray.direction, n) > 0.0
-
-
-@wp.func
 def intersect_patch(brep: BrepData, prim: int, patch: Any, origin: wp.vec3, direction: wp.vec3):
-    """Every root of the ray with one sub-patch, inside the face's trims (OptiX keeps the nearest)."""
+    """The ray's nearest root with one sub-patch inside the face's trims (OptiX keeps the nearest)."""
     tol = brep.prim_tol[prim]
     ray = patch_ray(origin, direction, first_point(patch, brep.cvs))
     hull = patch_hull(patch, brep.cvs, ray)
     t_lo = hull_tmin(hull, ray, tol)
     if hull_misses(hull, tol) or t_lo > wp.optix_get_ray_tmax():
         return  # no hit, or none nearer than the closest hit so far
-    # A ray starting within the patch's depth range (a bounce or shadow ray leaving this surface)
-    # is not the silhouette case the retries are for: Newton finds its own origin, below tmin.
-    arriving = t_lo > wp.optix_get_ray_tmin()
     # The first seed is the control point nearest the ray: control point (i, j) of a Bezier patch
     # sits at about parameter (i / p, j / q).
     deg = patch_degree(patch)
@@ -861,74 +1118,43 @@ def intersect_patch(brep: BrepData, prim: int, patch: Any, origin: wp.vec3, dire
         float(hull.closest_index // (deg[1] + 1)) / float(wp.max(deg[0], 1)),
         float(hull.closest_index % (deg[1] + 1)) / float(wp.max(deg[1], 1)),
     )
-    # Newton fails or finds the wrong root only where the ray is nearly tangent to the surface: a
-    # grazing ray crosses a curved sub-patch twice near a silhouette, entering and leaving.
     converged, ok, st, point, ds, dt = newton(patch, brep.cvs, ray, tol, seed)
-    grazing = (not converged) or wp.abs(wp.dot(wp.normalize(wp.cross(ds, dt)), ray.unit)) < GRAZING_COS
-    if ok and report_patch_hit(brep, prim, st, point, ds, dt, ray) < 0.0 and not grazing:
-        return  # the ray enters here, the nearest root of a closed solid seen from outside
-    if not arriving:
-        # A ray leaving this patch (a shadow or bounce ray from it): Newton tends to find its own
-        # start, below tmin. Leaving at a grazing angle, it may cross the patch again downstream.
-        if ok and grazing and ray_t(ray, point) < wp.optix_get_ray_tmin():
-            step = -upstream_step(ds, dt, ray.unit)
-            if wp.length(step) > 0.0 and bends_toward(patch, brep.cvs, st, step, point, ds, dt, ray):
-                for k in range(2):
-                    reach = 0.35 * float(k + 1)
-                    _c, ok2, st2, p2, ds2, dt2 = newton(
-                        patch,
-                        brep.cvs,
-                        ray,
-                        tol,
-                        wp.vec2(
-                            wp.clamp(st[0] + reach * step[0], 0.0, 1.0), wp.clamp(st[1] + reach * step[1], 0.0, 1.0)
-                        ),
-                    )
-                    if ok2 and ray_t(ray, p2) >= wp.optix_get_ray_tmin():
-                        report_patch_hit(brep, prim, st2, p2, ds2, dt2, ray)
-                        return
-        if not ok:
-            # Newton from the control point nearest the ray failed for a ray passing near its start:
-            # typically it slid to the ray's own start on a strongly curved patch, which the ray can
-            # meet again further on. The patch center seeds that crossing.
-            _c, ok2, st2, p2, ds2, dt2 = newton(patch, brep.cvs, ray, tol, wp.vec2(0.5, 0.5))
-            if ok2:
-                report_patch_hit(brep, prim, st2, p2, ds2, dt2, ray)
-        return
-    if not grazing:
-        return
-    # A grazing ray may cross the sub-patch nearer than the root found, whichever way that root
-    # faces: inside an open surface or across a fold, the nearer crossing is an exit. Until a root
-    # where the ray enters is found upstream, it gets more seeds (attempts): 1 the patch center
-    # (after divergence), 2-3 upstream of the root along the ray's direction mapped into the
-    # parameter domain, 4-7 near the patch corners.
-    exit_st = st
-    step = wp.vec2(0.0)
-    if ok:
-        step = upstream_step(ds, dt, ray.unit)
-    attempt = int(1)
-    while attempt < 8:
-        if attempt == 1 and ok:
-            attempt = 2  # the center only after divergence
-        if attempt == 2 and (not ok or wp.length(step) == 0.0):
-            attempt = 4  # upstream only of an exit
-        if attempt == 1:
-            seed = wp.vec2(0.5, 0.5)
-        elif attempt < 4:
-            seed = wp.vec2(
-                wp.clamp(exit_st[0] + 0.35 * float(attempt - 1) * step[0], 0.0, 1.0),
-                wp.clamp(exit_st[1] + 0.35 * float(attempt - 1) * step[1], 0.0, 1.0),
-            )
-        else:
-            seed = wp.vec2(0.15 + 0.7 * float((attempt - 4) % 2), 0.15 + 0.7 * float((attempt - 4) // 2))
-        converged, ok, st, point, ds, dt = newton(patch, brep.cvs, ray, tol, seed)
+    # A ray meeting a flat sub-patch squarely crosses it once: Newton's root (or the neighbor's, if
+    # it converged outside the square) is the only one.
+    if converged and wp.abs(outward_cosine(brep, prim, ds, dt, ray.unit)) >= GRAZING_COS:
         if ok:
-            if report_patch_hit(brep, prim, st, point, ds, dt, ray) < 0.0:
-                return  # the ray enters here
-            if attempt == 1:
-                exit_st = st
-                step = upstream_step(ds, dt, ray.unit)
-        attempt += 1
+            report_patch_hit(brep, prim, st, point, ds, dt, ray)
+        return
+    # Grazing, or Newton failed: near a silhouette or a fold the ray crosses the patch twice (and a
+    # bounce ray leaving a concave surface crosses it again), where Newton converges to the wrong
+    # root or not at all. Isolate the nearest crossing ahead along the ray instead.
+    root = root_foot(ray, st, point, ds, dt)
+    if not converged:
+        root.st = wp.vec2(0.5, 0.5)
+    t0 = wp.max(t_lo, wp.optix_get_ray_tmin())
+    t1 = wp.min(hull_tmax(hull, ray, tol), wp.optix_get_ray_tmax())
+    known = converged
+    searches = int(0)
+    while searches < 2:  # the nearest crossing, then the next if the trims cut the first away
+        searches += 1
+        found, f = square_root(patch, brep.cvs, ray, tol, t0, t1, root, known)
+        if not found:
+            return
+        rect = brep.prim_uv[prim]
+        _p, fs, ft = eval_patch(patch, brep.cvs, f.st[0], f.st[1])
+        if try_report(
+            brep,
+            prim,
+            f.t,
+            rect[0] + f.st[0] * (rect[1] - rect[0]),
+            rect[2] + f.st[1] * (rect[3] - rect[2]),
+            wp.cross(fs, ft),
+            ray.direction,
+        ):
+            return
+        t0 = f.t + 2.0 * tol / wp.abs(f.g)
+        root = f
+        known = True
 
 
 @wp.func
@@ -942,13 +1168,6 @@ def intersect_nurbs(brep: BrepData, prim: int, origin: wp.vec3, direction: wp.ve
         patch.base = base
         patch.degree = deg
         intersect_patch(brep, prim, patch, origin, direction)
-
-
-@wp.func
-def normal_at_seed(patch: Cubic, cvs: wp.array[wp.vec4], seed: wp.vec2) -> wp.vec3:
-    """The patch's unit normal at the clamped parameter ``seed``."""
-    point, ds, dt = eval_patch(patch, cvs, wp.clamp(seed[0], 0.0, 1.0), wp.clamp(seed[1], 0.0, 1.0))
-    return wp.normalize(wp.cross(ds, dt))
 
 
 @wp.func
@@ -973,71 +1192,45 @@ def proxy_hit(brep: BrepData, tri: int, local: int, bary: wp.vec2, origin: wp.ve
     converged, ok, st, point, ds, dt = newton(
         patch, brep.cvs, ray, tol, wp.vec2(wp.clamp(seed[0], 0.0, 1.0), wp.clamp(seed[1], 0.0, 1.0))
     )
-    # Rare (grazing rays on strongly curved patches): retry from the triangle's corners, which
-    # bracket the crossing in parameter space, then from the patch center.
-    for k in range(4):
-        if ok:
-            break
-        retry = wp.vec2(0.5, 0.5)
-        if k < 3:
-            retry = brep.shell_st[corner + k]
-        converged, ok, st, point, ds, dt = newton(patch, brep.cvs, ray, tol, retry)
-    # A grazing ray can cross a curved patch twice. From a root ahead of the ray's start, look
-    # upstream along the ray (in parameter space) for a nearer root, like the custom intersector
-    # does; whichever way the root faces (inside an open surface or across a fold, the nearer
-    # crossing is an exit). From the ray's own start (a shadow or bounce ray leaving the patch),
-    # look downstream for its next crossing: inside the shell, no other triangle reports it.
-    concave = bool(True)
-    if ok:
-        cosine = outward_cosine(brep, prim, ds, dt, ray.unit)
-        if wp.abs(cosine) < GRAZING_COS:
-            step = upstream_step(ds, dt, ray.unit)
-            exit_t = ray_t(ray, point)
-            leaving = exit_t < wp.optix_get_ray_tmin()
-            if leaving:
-                step = -step
-                concave = bends_toward(patch, brep.cvs, st, step, point, ds, dt, ray)
-            if wp.length(step) > 0.0 and concave:
-                for k in range(2):
-                    reach = 0.35 * float(k + 1)
-                    _c2, ok2, st2, p2, ds2, dt2 = newton(
-                        patch,
-                        brep.cvs,
-                        ray,
-                        tol,
-                        wp.vec2(
-                            wp.clamp(st[0] + reach * step[0], 0.0, 1.0), wp.clamp(st[1] + reach * step[1], 0.0, 1.0)
-                        ),
-                    )
-                    t2 = ray_t(ray, p2)
-                    if ok2 and ((leaving and t2 >= wp.optix_get_ray_tmin()) or (not leaving and t2 < exit_t - tol)):
-                        st = st2
-                        point = p2
-                        ds = ds2
-                        dt = dt2
-                        break
     hit_t = ray_t(ray, point)
-    # Last resort for a grazing ray with no root ahead of its start yet (where the surface bends
-    # toward it): the shell-seeded searches can miss a crossing close to a patch edge. Seed from the
-    # center and near the corners, as the custom intersector does, and keep the nearest root ahead.
-    if (not ok or (hit_t < wp.optix_get_ray_tmin() and concave)) and wp.abs(
-        wp.dot(direction, normal_at_seed(patch, brep.cvs, seed))
-    ) < GRAZING_COS * wp.length(direction):
-        best_t = float(1.0e30)
-        for k in range(5):
-            retry = wp.vec2(0.5, 0.5)
-            if k > 0:
-                retry = wp.vec2(0.15 + 0.7 * float((k - 1) % 2), 0.15 + 0.7 * float((k - 1) // 2))
-            _c3, ok3, st3, p3, ds3, dt3 = newton(patch, brep.cvs, ray, tol, retry)
-            t3 = ray_t(ray, p3)
-            if ok3 and t3 >= wp.optix_get_ray_tmin() and t3 < best_t:
-                best_t = t3
-                ok = True
-                st = st3
-                point = p3
-                ds = ds3
-                dt = dt3
-        hit_t = ray_t(ray, point)
+    # Grazing, or Newton failed: the ray may cross the patch twice (a silhouette, a fold, or a bounce
+    # ray leaving a concave surface), and Newton's root need not be the nearest ahead of the ray's
+    # start. Isolate that crossing along the ray (see intersect_patch), using the shell: it holds
+    # all of the patch's crossings, and its triangles face out of it, the outer layer's along the
+    # normal (where h > 0), the inner layer's against it. A ray entering through a layer, with
+    # Newton's root ahead crossed the other way, meets that root first (h has at most one extremum
+    # in between); a ray leaving through a layer crossed the patch before it, if at all.
+    if not converged or wp.abs(outward_cosine(brep, prim, ds, dt, ray.unit)) < GRAZING_COS:
+        layer = local % (brep.shell_st.shape[0] // 3)
+        side = wp.where(layer < SHELL_LAYER_TRIANGLES, 1.0, wp.where(layer < 2 * SHELL_LAYER_TRIANGLES, -1.0, 0.0))
+        entering = wp.optix_is_front_face_hit()
+        root = root_foot(ray, st, point, ds, dt)
+        if (
+            converged
+            and entering
+            and side != 0.0
+            and root.t >= wp.optix_get_ray_tmax()
+            and (root.g > 0.0) != (side > 0.0)
+        ):
+            ok = ok and hit_t >= wp.optix_get_ray_tmin()
+        else:
+            if not converged:
+                root.st = wp.vec2(wp.clamp(seed[0], 0.0, 1.0), wp.clamp(seed[1], 0.0, 1.0))
+            hull = patch_hull(patch, brep.cvs, ray)
+            t_lo = hull_tmin(hull, ray, tol)
+            t1 = hull_tmax(hull, ray, tol)
+            if hull_misses(hull, tol):
+                t1 = t_lo  # the ray passes beside the patch (mostly side-wall crossings near a neighbor)
+            if not entering and side != 0.0:
+                t1 = wp.min(t1, wp.optix_get_ray_tmax())  # leaving: its crossings lie before t_tri
+            found, f = square_root(
+                patch, brep.cvs, ray, tol, wp.max(t_lo, wp.optix_get_ray_tmin()), t1, root, converged
+            )
+            ok = found
+            st = f.st
+            hit_t = f.t
+            if found:
+                point, ds, dt = eval_patch(patch, brep.cvs, st[0], st[1])
     normal = wp.vec3(0.0)
     u = float(0.0)
     v = float(0.0)

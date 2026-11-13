@@ -23,7 +23,7 @@ from dataclasses import dataclass
 import numpy as np
 import warp as wp
 
-from .device import eval_cubic, load_cubic
+from .device import SHELL_LAYER_TRIANGLES, eval_cubic, load_cubic
 from .loader import NURBS, BrepPrim
 
 GRID = 4  # shell cells along each patch direction
@@ -58,6 +58,7 @@ def _shell_topology() -> tuple[np.ndarray, np.ndarray]:
 
 
 SHELL_TRIANGLES, SHELL_ST = _shell_topology()
+assert SHELL_LAYER_TRIANGLES == 2 * GRID * GRID  # proxy_hit tells the layers apart by triangle index
 
 
 @wp.func
