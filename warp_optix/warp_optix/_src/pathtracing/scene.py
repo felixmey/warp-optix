@@ -766,6 +766,9 @@ class Scene:
         self._d_usd_instance_ids = None
         self._d_usd_instance_node_ids = None
         self._d_usd_level_nodes = []
+        # Host world matrices lag device-side updates until something reads them.
+        self._usd_host_world_stale = False
+        self._usd_upload_cache = None  # (node ids, device count, device ids, device matrices)
 
         # Acceleration structures. Instance records are written on the GPU from
         # the per-instance device arrays below before every TLAS build or refit.
@@ -1142,6 +1145,8 @@ class Scene:
         self._usd_level_nodes = [
             order[start:end].astype(np.int32) for start, end in zip(level_starts[:-1], level_starts[1:], strict=True)
         ]
+        self._usd_host_world_stale = False
+        self._usd_upload_cache = None
         self._compose_usd_world_transforms_host()
         world = self._usd_world_transforms
         if len(self._usd_instance_ids) != len(self._usd_instance_node_ids):
@@ -1170,6 +1175,12 @@ class Scene:
         local, world, parents = self._usd_local_transforms, self._usd_world_transforms, self._usd_node_parents
         for depth, nodes in enumerate(self._usd_level_nodes):
             world[nodes] = local[nodes] if depth == 0 else world[parents[nodes]] @ local[nodes]
+
+    def _sync_usd_host_world(self):
+        """Bring host world matrices and instance transforms up to date after device-side updates."""
+        if self._usd_host_world_stale:
+            self._usd_host_world_stale = False
+            self._evaluate_usd_transform_hierarchy_host()
 
     def _evaluate_usd_transform_hierarchy_host(self, update_instances: bool = True):
         self._compose_usd_world_transforms_host()
@@ -1308,14 +1319,25 @@ class Scene:
         if int(indices.min()) < 0 or int(indices.max()) >= len(self._usd_node_parents):
             raise IndexError("USD transform handle is out of range")
         self._usd_local_transforms[indices] = matrices
-        self._evaluate_usd_transform_hierarchy_host(update_instances=self._d_usd_local_transforms is None)
         if self._d_usd_local_transforms is None:
+            self._evaluate_usd_transform_hierarchy_host()
             return
+        # The device composes the hierarchy; host world matrices are refreshed only when read.
+        self._usd_host_world_stale = True
         scope = wp.ScopedStream(stream, sync_enter=False, sync_exit=False) if stream is not None else nullcontext()
         with scope:
-            device_count = wp.array([len(indices)], dtype=wp.int32, device=self.device)
-            device_ids = wp.array(indices, dtype=wp.int32, device=self.device)
-            device_matrices = wp.array(matrices, dtype=wp.mat44, device=self.device)
+            # Animation sends the same node set every frame: reuse its device buffers.
+            cache = self._usd_upload_cache
+            if cache is None or len(cache[0]) != len(indices) or not np.array_equal(cache[0], indices):
+                cache = (
+                    indices.copy(),
+                    wp.array([len(indices)], dtype=wp.int32, device=self.device),
+                    wp.array(indices, dtype=wp.int32, device=self.device),
+                    wp.empty(len(indices), dtype=wp.mat44, device=self.device),
+                )
+                self._usd_upload_cache = cache
+            _, device_count, device_ids, device_matrices = cache
+            device_matrices.assign(matrices)
             self.set_usd_local_transforms_device(
                 device_count,
                 device_ids,
@@ -1650,10 +1672,15 @@ class Scene:
         self._d_usd_instance_ids = None
         self._d_usd_instance_node_ids = None
         self._d_usd_level_nodes = []
+        # Host world matrices lag device-side updates until something reads them.
+        self._usd_host_world_stale = False
+        self._usd_upload_cache = None  # (node ids, device count, device ids, device matrices)
 
     def build(self):
         """Build the scene: upload meshes, create BLASes, and create TLAS."""
         self._built = True
+        # Instance records are rebuilt from the host cache, so fold in pending USD updates first.
+        self._sync_usd_host_world()
 
         if len(self._meshes) == 0:
             logger.info("No meshes to build.")

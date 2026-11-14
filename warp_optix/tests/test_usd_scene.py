@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import warp as wp
 from warp_optix._src.pathtracing.scene import Scene
 from warp_optix._src.pathtracing.usd_loader import _bound_material, _mesh_arrays
 
@@ -57,6 +58,131 @@ def test_usd_scene_retains_paths_and_local_geometry(tmp_path):
     scene.clear()
     with pytest.raises(RuntimeError, match="invalidated"):
         usd_scene.get_world_transform(mesh)
+
+
+def _write_animated_stage(path):
+    stage = Usd.Stage.CreateNew(str(path))
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+    UsdGeom.SetStageMetersPerUnit(stage, 0.01)
+    stage.SetStartTimeCode(10.0)
+    stage.SetEndTimeCode(20.0)
+    stage.SetTimeCodesPerSecond(24.0)
+    # An instanced part whose prototype animates a child, placed under an animated root.
+    proto = stage.CreateClassPrim("/Proto")
+    spin = UsdGeom.Xform.Define(stage, "/Proto/spin")
+    spin_op = spin.AddRotateZOp()
+    spin_op.Set(0.0, 10.0)
+    spin_op.Set(90.0, 20.0)
+    mesh = UsdGeom.Mesh.Define(stage, "/Proto/spin/mesh")
+    mesh.CreatePointsAttr([Gf.Vec3f(0.0, 0.0, 0.0), Gf.Vec3f(1.0, 0.0, 0.0), Gf.Vec3f(0.0, 1.0, 0.0)])
+    mesh.CreateFaceVertexCountsAttr([3])
+    mesh.CreateFaceVertexIndicesAttr([0, 1, 2])
+    mesh.AddTranslateOp().Set(Gf.Vec3d(100.0, 0.0, 0.0))
+    root = UsdGeom.Xform.Define(stage, "/root")
+    move = root.AddTranslateOp()
+    move.Set(Gf.Vec3d(0.0, 0.0, 0.0), 10.0)
+    move.Set(Gf.Vec3d(0.0, 0.0, 200.0), 20.0)
+    part = UsdGeom.Xform.Define(stage, "/root/part")
+    part.GetPrim().GetReferences().AddInternalReference(proto.GetPath())
+    part.GetPrim().SetInstanceable(True)
+    UsdGeom.Xform.Define(stage, "/static").AddTranslateOp().Set(Gf.Vec3d(1.0, 2.0, 3.0))
+    stage.GetRootLayer().Save()
+
+
+def test_usd_scene_plays_back_time_sampled_transforms(tmp_path):
+    path = tmp_path / "animated.usda"
+    _write_animated_stage(path)
+    scene = Scene()
+
+    assert scene.load_from_usd(path)
+    usd_scene = scene.usd_scene
+    assert usd_scene.time_code_range == (10.0, 20.0)
+    assert usd_scene.time_codes_per_second == 24.0
+    assert usd_scene.time == 10.0
+    animated = {handle.path for handle in usd_scene.animated_transforms}
+    assert animated == {"/root", "/root/part/spin"}
+    mesh = usd_scene.require_transform("/root/part/spin/mesh")
+    # Loaded posed at the start time: centimeters to meters, Z-up to Y-up.
+    np.testing.assert_allclose(usd_scene.get_world_transform(mesh)[:3, 3], (1.0, 0.0, 0.0), atol=1e-6)
+
+    assert usd_scene.set_time(20.0) == 2
+    assert usd_scene.time == 20.0
+    # Spun 90 degrees about Z (the mesh moves to +Y, i.e. render -Z) and lifted 2 m (render +Y).
+    np.testing.assert_allclose(usd_scene.get_world_transform(mesh)[:3, 3], (0.0, 2.0, -1.0), atol=1e-5)
+    np.testing.assert_allclose(scene._instance_transform_cache[0, :3, 3], (0.0, 2.0, -1.0), atol=1e-5)
+    static = usd_scene.require_transform("/static")
+    np.testing.assert_allclose(usd_scene.get_world_transform(static)[:3, 3], (0.01, 0.03, -0.02), atol=1e-6)
+
+    usd_scene.set_time(15.0)
+    np.testing.assert_allclose(usd_scene.get_world_transform(mesh)[:3, 3], (0.7071068, 1.0, -0.7071068), atol=1e-5)
+
+
+def _write_matrix_animation(path):
+    stage = Usd.Stage.CreateNew(str(path))
+    stage.SetStartTimeCode(0.0)
+    stage.SetEndTimeCode(10.0)
+    arm = UsdGeom.Xform.Define(stage, "/arm")
+    arm.AddTranslateOp().Set(Gf.Vec3d(0.0, 1.0, 0.0))  # constant op before the animated one
+    op = arm.AddTransformOp()
+    for t, angle, shift in ((0.0, 0.0, 0.0), (4.0, 60.0, 2.0), (10.0, 150.0, -1.0)):
+        op.Set(
+            Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d(0, 0, 1), angle)) * Gf.Matrix4d().SetTranslate((shift, 0, 0)),
+            t,
+        )
+    mesh = UsdGeom.Mesh.Define(stage, "/arm/mesh")
+    mesh.CreatePointsAttr([Gf.Vec3f(0.0, 0.0, 0.0), Gf.Vec3f(1.0, 0.0, 0.0), Gf.Vec3f(0.0, 1.0, 0.0)])
+    mesh.CreateFaceVertexCountsAttr([3])
+    mesh.CreateFaceVertexIndicesAttr([0, 1, 2])
+    stage.GetRootLayer().Save()
+    return stage
+
+
+@pytest.mark.parametrize("held", [False, True])
+def test_sampled_transform_playback_matches_usd(tmp_path, held):
+    path = tmp_path / "matrix.usda"
+    stage = _write_matrix_animation(path)
+    scene = Scene()
+    assert scene.load_from_usd(path, apply_stage_units=False, convert_up_axis=False)
+    usd_scene = scene.usd_scene
+    if held:  # a stage runtime setting, not authored data
+        for s in (stage, usd_scene.stage):
+            s.SetInterpolationType(Usd.InterpolationTypeHeld)
+    mesh = usd_scene.require_transform("/arm/mesh")
+    _, groups, fallback = usd_scene._animated()
+    assert len(groups) == 1 and not fallback  # one matrix op varies: interpolated from samples
+    for t in (-3.0, 0.0, 1.5, 4.0, 7.25, 10.0, 12.0):
+        usd_scene.set_time(t)
+        expected = np.array(UsdGeom.XformCache(t).GetLocalToWorldTransform(stage.GetPrimAtPath("/arm/mesh"))).T
+        np.testing.assert_allclose(usd_scene.get_world_transform(mesh), expected, atol=1e-5)
+
+
+@pytest.mark.skipif(not wp.is_cuda_available(), reason="requires a CUDA device")
+def test_device_playback_survives_scene_rebuild(tmp_path):
+    path = tmp_path / "matrix.usda"
+    stage = _write_matrix_animation(path)
+    scene = Scene()
+    assert scene.load_from_usd(path, apply_stage_units=False, convert_up_axis=False)
+    scene.build()
+    usd_scene = scene.usd_scene
+    mesh = usd_scene.require_transform("/arm/mesh")
+    usd_scene.set_time(7.25)
+    expected = np.array(UsdGeom.XformCache(7.25).GetLocalToWorldTransform(stage.GetPrimAtPath("/arm/mesh"))).T
+    np.testing.assert_allclose(usd_scene.get_world_transform(mesh), expected, atol=1e-5)
+    # A rebuild re-uploads instance transforms from the host; it must keep the animated pose.
+    scene.build()
+    np.testing.assert_allclose(scene._device_instance_transforms.numpy()[0].reshape(3, 4), expected[:3], atol=1e-5)
+    np.testing.assert_allclose(usd_scene.get_world_transform(mesh), expected, atol=1e-5)
+
+
+def test_static_usd_scene_has_no_animation(tmp_path):
+    path = tmp_path / "transform.usda"
+    _write_transform_stage(path)
+    scene = Scene()
+    assert scene.load_from_usd(path, apply_stage_units=False)
+    assert scene.usd_scene.time_code_range is None
+    assert scene.usd_scene.time is None
+    assert scene.usd_scene.animated_transforms == ()
+    assert scene.usd_scene.set_time(5.0) == 0
 
 
 def test_direct_material_relationship_without_applied_api_resolves(tmp_path):

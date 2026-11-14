@@ -31,6 +31,8 @@ Runs:
 - `python examples/example_pathtracing.py --scene contact_lines`
 - `python examples/example_pathtracing.py --gltf scene.glb`
 - `python examples/example_pathtracing.py --usd scene.usd`
+
+USD stages with time-sampled transforms play back in a loop (Space pauses).
 """
 
 from __future__ import annotations
@@ -139,6 +141,33 @@ class FreeCameraController:
     def on_mouse_scroll(self, _x, _y, _scroll_x, scroll_y):
         self.fov = max(15.0, min(90.0, self.fov - float(scroll_y) * 2.0))
         self._apply()
+
+
+class UsdAnimationPlayer:
+    """Plays a USD stage's time-sampled transforms in a loop; Space pauses and resumes."""
+
+    def __init__(self, viewer, usd_scene, time: float | None = None):
+        self.pyglet = viewer.pyglet
+        self.usd_scene = usd_scene
+        self.start, self.end = usd_scene.time_code_range
+        self.rate = usd_scene.time_codes_per_second
+        self.time = self.start if time is None else float(time)
+        self.playing = time is None
+        usd_scene.set_time(self.time)
+        viewer.window.push_handlers(self)
+
+    def update(self, dt: float):
+        if not self.playing:
+            return
+        span = self.end - self.start
+        self.time = self.start + (
+            (self.time - self.start + max(0.0, min(dt, 0.1)) * self.rate) % span if span > 0 else 0.0
+        )
+        self.usd_scene.set_time(self.time)
+
+    def on_key_press(self, symbol, _modifiers):
+        if symbol == self.pyglet.window.key.SPACE:
+            self.playing = not self.playing
 
 
 def _add_ball_and_ground(api: PathTracer, core_material: int, ball_radius: float = 0.8):
@@ -252,6 +281,8 @@ def setup_usd(api: PathTracer, args) -> View:
     from scenes import usd
 
     path = args.usd.expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"USD stage not found: {path}")
     if not api.load_scene_from_usd(str(path), max_texture_size=args.max_texture_size or None):
         raise RuntimeError(f"USD stage contained no supported render meshes: {path}")
     position, yaw, pitch, fov, radius, camera_path = usd.camera_for_scene(api, requested_path=args.usd_camera)
@@ -300,6 +331,9 @@ def _parse_args():
     parser.add_argument("--arrow-count", type=int, default=1800, help="Number of arrows (arrowball).")
     parser.add_argument("--contact-count", type=int, default=100_000, help="Maximum number of lines (contact_lines).")
     parser.add_argument("--usd-camera", help="USD camera prim path; defaults to the stage's bound camera.")
+    parser.add_argument(
+        "--usd-time", type=float, help="Hold an animated USD stage at this time code instead of playing it."
+    )
     parser.add_argument(
         "--max-texture-size", type=int, default=512, help="Maximum USD texture size per tile (0 = full size)."
     )
@@ -353,10 +387,19 @@ def main():
     if lines is not None:
         lines.attach(viewer)
     controller = FreeCameraController(viewer, api, view)
+    player = None
+    if args.usd is not None and api.usd_scene.animated_transforms and api.usd_scene.time_code_range:
+        player = UsdAnimationPlayer(viewer, api.usd_scene, args.usd_time)
+        print(
+            f"[optix] animation: {len(api.usd_scene.animated_transforms)} transforms, time codes "
+            f"{player.start:g}-{player.end:g} at {player.rate:g}/s (Space pauses)"
+        )
 
     def render(mapped_image: wp.array, frame: int, elapsed: float):
         nonlocal last_elapsed
         controller.update(elapsed - last_elapsed)
+        if player is not None:
+            player.update(elapsed - last_elapsed)
         last_elapsed = elapsed
         if lines is not None:
             lines.update(frame, elapsed)

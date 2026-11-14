@@ -1377,17 +1377,20 @@ def load_scene_from_usd(
     instance_ids: list[int] = []
     instance_node_ids: list[int] = []
 
+    # Animated stages load posed at their start time; time samples are ignored at the default time.
+    load_time = Usd.TimeCode(stage.GetStartTimeCode()) if stage.HasAuthoredTimeCodeRange() else Usd.TimeCode.Default()
+
     def prim_local_transform(prim) -> tuple[np.ndarray, bool] | None:
         """Return a transformable prim's column-vector local matrix and resetXformStack."""
         xformable = UsdGeom.Xformable(prim)
         if xformable:
-            local = np.asarray(xformable.GetLocalTransformation(), dtype=np.float64).reshape(4, 4).T
+            local = np.asarray(xformable.GetLocalTransformation(load_time), dtype=np.float64).reshape(4, 4).T
             return local, bool(xformable.GetResetXformStack())
         if prim.GetTypeName() == "BrepArray":
             # A Gprim, but USD only knows that when the omniSolid schema plugin is registered.
             from ..brep.loader import local_transform  # noqa: PLC0415
 
-            local, reset = local_transform(prim)
+            local, reset = local_transform(prim, load_time)
             return np.asarray(local, dtype=np.float64), bool(reset)
         return None
 
@@ -1772,7 +1775,9 @@ def load_scene_from_usd(
 
     from .usd_scene import UsdScene  # noqa: PLC0415
 
-    usd_scene = UsdScene(scene, stage, str(path), node_paths)
+    usd_scene = UsdScene(
+        scene, stage, str(path), node_paths, root_transform=extra_transform.T, time=load_time.GetValue()
+    )
     scene.configure_usd_transform_hierarchy(
         usd_scene,
         np.asarray(node_parents, dtype=np.int32),

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 import weakref
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -38,7 +39,16 @@ class UsdScene:
     through NumPy.
     """
 
-    def __init__(self, scene: Scene, stage, source_path: str, paths: Iterable[str]):
+    def __init__(
+        self,
+        scene: Scene,
+        stage,
+        source_path: str,
+        paths: Iterable[str],
+        *,
+        root_transform: np.ndarray | None = None,
+        time: float | None = None,
+    ):
         # Weak, so the scene (which references this object as ``usd_scene``) is freed by refcounting.
         self._scene_ref = weakref.ref(scene)
         self._stage = stage
@@ -47,6 +57,11 @@ class UsdScene:
         self._path_to_handle = {handle.path: handle for handle in self._handles}
         self._local_transforms_device = None
         self._world_transforms_device = None
+        # Unit/up-axis/root conversion folded into parentless nodes' local matrices (column vectors).
+        self._root_transform = np.eye(4) if root_transform is None else np.asarray(root_transform, dtype=np.float64)
+        self._time = None if time is None or math.isnan(time) else float(time)
+        self._animation = None  # (node indices, sampled groups, per-prim fallbacks), built on first use
+        self._held_interpolation = False
 
     @property
     def _scene(self) -> Scene:
@@ -192,6 +207,129 @@ class UsdScene:
             stream=stream,
             rebuild_tlas=rebuild_tlas,
         )
+
+    @property
+    def time_code_range(self) -> tuple[float, float] | None:
+        """The stage's authored ``(startTimeCode, endTimeCode)``, or None for a static stage."""
+        if not self._stage.HasAuthoredTimeCodeRange():
+            return None
+        return float(self._stage.GetStartTimeCode()), float(self._stage.GetEndTimeCode())
+
+    @property
+    def time_codes_per_second(self) -> float:
+        return float(self._stage.GetTimeCodesPerSecond())
+
+    @property
+    def time(self) -> float | None:
+        """The time code the transforms were last evaluated at; None for the default time."""
+        return self._time
+
+    @property
+    def animated_transforms(self) -> tuple[UsdTransformHandle, ...]:
+        """Handles whose local transform may change over time (time-sampled xformOps)."""
+        return tuple(self._handles[index] for index in self._animated()[0])
+
+    def set_time(self, time: float, *, stream=None, rebuild_tlas: bool = True) -> int:
+        """Re-evaluate time-sampled transforms at a USD time code and apply them as one batch.
+
+        Only rigid transform animation is played back; animated points, visibility or materials
+        are not. Returns the number of transforms updated.
+
+        The first call samples every animated transform at its authored time codes. Transforms
+        whose only time-varying op is a matrix, translate or scale op are then interpolated from
+        those samples in one vectorized step, which matches USD's linear (or held) interpolation
+        exactly; any other animation (rotate angles, quaternions, several varying ops) is still
+        evaluated through USD for each prim.
+        """
+        self._require_current()
+        indices, groups, fallback = self._animated()
+        self._time = float(time)
+        if len(indices) == 0:
+            return 0
+        matrices = np.empty((len(indices), 4, 4), dtype=np.float32)
+        held = self._held_interpolation
+        for slots, times, samples in groups:
+            upper = int(np.searchsorted(times, self._time, side="right"))
+            if upper == 0:
+                matrices[slots] = samples[0]
+            elif upper == len(times) or held:
+                matrices[slots] = samples[upper - 1]
+            else:
+                weight = (self._time - times[upper - 1]) / (times[upper] - times[upper - 1])
+                matrices[slots] = samples[upper - 1] + np.float32(weight) * (samples[upper] - samples[upper - 1])
+        if fallback:
+            from pxr import Usd  # noqa: PLC0415
+
+            code = Usd.TimeCode(self._time)
+            for slot, evaluate, is_root in fallback:
+                local = evaluate(code)
+                matrices[slot] = self._root_transform @ local if is_root else local
+        self._scene.set_usd_local_transforms(indices, matrices, stream=stream, rebuild_tlas=rebuild_tlas)
+        return len(indices)
+
+    def _animated(self):
+        """``(node indices, sampled groups, per-prim fallbacks)`` for the time-varying transforms."""
+        if self._animation is not None:
+            return self._animation
+        from pxr import Usd, UsdGeom  # noqa: PLC0415
+
+        self._held_interpolation = self._stage.GetInterpolationType() == Usd.InterpolationTypeHeld
+        linear_ops = {UsdGeom.XformOp.TypeTransform, UsdGeom.XformOp.TypeTranslate, UsdGeom.XformOp.TypeScale}
+        parents = self._scene._usd_node_parents
+        indices, sampled, fallback = [], {}, []
+        for handle in self._handles:
+            prim = self._stage.GetPrimAtPath(handle.path)
+            if not prim:
+                continue
+            xformable = UsdGeom.Xformable(prim)
+            if xformable:
+                ops = xformable.GetOrderedXformOps()
+
+                def evaluate(code, x=xformable):
+                    return np.asarray(x.GetLocalTransformation(code), np.float64).T
+
+            elif prim.GetTypeName() == "BrepArray":
+                # Not an Xformable without the omniSolid schema plugin; read its xformOps directly.
+                order = prim.GetAttribute("xformOpOrder")
+                names = (order.Get() if order and order.HasAuthoredValue() else None) or []
+                ops = [
+                    UsdGeom.XformOp(prim.GetAttribute(name.removeprefix("!invert!")), name.startswith("!invert!"))
+                    for name in names
+                    if name != "!resetXformStack!"
+                ]
+                from ..brep.loader import local_transform  # noqa: PLC0415
+
+                def evaluate(code, p=prim):
+                    return local_transform(p, code)[0]
+
+            else:
+                continue
+            varying = [op for op in ops if op and op.GetAttr().ValueMightBeTimeVarying()]
+            if not varying:
+                continue
+            slot = len(indices)
+            indices.append(handle.index)
+            is_root = bool(parents[handle.index] < 0)
+            op = varying[0]
+            if len(varying) == 1 and op.GetOpType() in linear_ops and not op.IsInverseOp():
+                # The local matrix is linear in this op's value, so interpolating whole matrices
+                # between its samples equals USD interpolating the op and composing.
+                times = tuple(float(t) for t in op.GetAttr().GetTimeSamples())
+                sampled.setdefault(times, []).append((slot, evaluate, is_root))
+            else:
+                fallback.append((slot, evaluate, is_root))
+
+        groups = []
+        for times, members in sampled.items():
+            samples = np.empty((len(times), len(members), 4, 4), dtype=np.float32)
+            for column, (_, evaluate, is_root) in enumerate(members):
+                for row, t in enumerate(times):
+                    local = evaluate(Usd.TimeCode(t))
+                    samples[row, column] = self._root_transform @ local if is_root else local
+            slots = np.fromiter((slot for slot, _, _ in members), dtype=np.intp, count=len(members))
+            groups.append((slots, np.asarray(times, dtype=np.float64), samples))
+        self._animation = (np.asarray(indices, dtype=np.int32), groups, fallback)
+        return self._animation
 
     def update_tlas(self, *, stream=None):
         """Update OptiX traversal after batches submitted with auto-update off."""

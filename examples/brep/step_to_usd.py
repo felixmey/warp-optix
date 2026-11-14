@@ -31,6 +31,10 @@ renderer in this directory reads, in the omniSolid schema's conventions:
 - faces of the part's solids bound one solid region (the reader's "inside" side); faces of open
   shells or bare faces are sheets, with the void region on both sides.
 
+STEP carries no up axis. ``--up auto`` (the default) takes Y for files written by SolidWorks or
+Inventor, whose models are Y-up by default, and Z otherwise; ``--up Y``/``--up Z`` set ``upAxis`` directly, and
+``--up X`` (some NX models) keeps ``upAxis = Z`` and turns ``/World`` so X points up.
+
 This is a minimal writer for rendering experiments: edges are shared per part, but the radial
 edgeuse ordering is not computed, so the result is not meant for modeling kernels.
 """
@@ -368,6 +372,23 @@ def _matrix(location: TopLoc_Location) -> Gf.Matrix4d:
     return Gf.Matrix4d(m.T.tolist())  # USD matrices act on row vectors
 
 
+# Default modeling up axes of CAD systems, by the STEP header's originating system.
+Y_UP_SYSTEMS = ("solidworks", "inventor")
+
+
+def step_up_axis(path) -> str:
+    """Up axis implied by the STEP header's originating system (FILE_NAME's sixth field)."""
+    import re  # noqa: PLC0415
+
+    with open(path, "rb") as f:
+        head = f.read(65536).decode("latin-1")
+    head = re.sub(r"/\*.*?\*/", "", head, flags=re.S)  # some writers comment each field
+    match = re.search(r"FILE_NAME\s*\((.*?)\)\s*;", head, flags=re.S)
+    fields = re.findall(r"'((?:[^']|'')*)'", match.group(1)) if match else []
+    system = " ".join(fields[-3:]).lower()  # preprocessor, originating system, authorisation
+    return "Y" if any(name in system for name in Y_UP_SYSTEMS) else "Z"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("step")
@@ -377,7 +398,12 @@ def main():
         "--deflection", type=float, default=1e-3, help="mesh chord deflection, relative to each part's size"
     )
     parser.add_argument("--angle", type=float, default=20.0, help="mesh angular deflection in degrees")
+    parser.add_argument(
+        "--up", choices=("auto", "X", "Y", "Z"), default="auto", help="model up axis (auto: from the CAD system)"
+    )
     args = parser.parse_args()
+    up = step_up_axis(args.step) if args.up == "auto" else args.up
+    print(f"up axis {up}" + (" (from the STEP header)" if args.up == "auto" else ""))
 
     t0 = time.perf_counter()
     doc = TDocStd_Document(TCollection_ExtendedString("XmlOcaf"))
@@ -426,9 +452,11 @@ def main():
 
     def author(path, write_part):
         stage = Usd.Stage.CreateNew(path)
-        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y if up == "Y" else UsdGeom.Tokens.z)
         UsdGeom.SetStageMetersPerUnit(stage, 0.001)  # OCCT reads STEP in millimeters
         world = UsdGeom.Xform.Define(stage, "/World")
+        if up == "X":  # USD has no X-up stages: turn the model so X points along Z
+            world.AddRotateYOp().Set(-90.0)
         stage.SetDefaultPrim(world.GetPrim())
         stage.CreateClassPrim("/Parts")
         looks = {}
