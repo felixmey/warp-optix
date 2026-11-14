@@ -58,7 +58,7 @@ Headless: `api.scene.load_from_usd(path)`, or `api.scene.add_brep(Brep(prim))` w
 | --- | --- | --- |
 | Schema reader | `warp_optix/_src/brep/loader.py` | pxr + NumPy; topology (regions → shells → faceuses, faces → loops → edgeuses), analytic surfaces, NURBS surfaces, 3D edge curves and optional UV pcurves |
 | Analytic faces | `warp_optix/_src/brep/device.py` | one custom primitive per face; AABB from a sampled UV grid padded by the sagitta bound; planes, cylinders, cones and spheres as one closed-form quadric in the face frame (one code path, so rays of a warp hitting mixed kinds share the solve and trim test: 6–10% faster path tracing on a dense assembly); torus by a derivative-cascade quartic solver (bounded cost, no grazing blowup) |
-| NURBS faces | both | knot insertion → rational Bézier patches → de Casteljau splits until flat (`flat_tol`); convex-hull AABBs; Newton on the two-plane ray form, seeded at the sub-patch center (Martin et al. 2000) |
+| NURBS faces | both | knot insertion → rational Bézier patches → de Casteljau splits until flat (`flat_tol`); convex-hull AABBs; Newton on the two-plane ray form, seeded from the nearest control point; specialized bicubic and degree-(3,4) evaluators, generic evaluation through degree 7 |
 | Trimming | both | face loops as UV polylines (pcurves when present, otherwise 3D edges projected onto the surface); even–odd crossing test, segments bucketed into slabs; periodic copies for seams |
 | Surface records | `warp_optix/_src/brep/device.py` | per primitive, its face's frame, parameters, ranges, flags and kind, and trim lookup in one 128-byte record: one cache line and one dependent load per intersection (path tracing on a dense assembly is 10-13% faster than with per-field arrays, and 3% faster than per-face records reached through the primitive) |
 | Trim cell grids | `warp_optix/_src/brep/trim_grid.py` | per face, a uniform cell grid: cells away from the trims store inside/outside, the others their chords and a reference parity; built for all faces at once with Warp kernels (radix sort, scans) |
@@ -67,6 +67,23 @@ Headless: `api.scene.load_from_usd(path)`, or `api.scene.add_brep(Brep(prim))` w
 
 Attributes reported: `u, v`, outward object-space normal, face index; hit kind 1 marks a ray
 leaving a solid (used to count cracks: "inside-hits").
+
+Torus intersection and edge projection handle both sheets of spindle tori (`minorRadius >
+majorRadius`). The negative signed-radius sheet needs its azimuth shifted by half a turn and
+its parameter-space normal reversed; otherwise valid trimmed faces, such as the turbofan casing,
+are rejected.
+
+Nonperiodic trimmed NURBS faces omit sub-patches proven wholly outside their trims. The check
+includes the solver's parameter tolerance, trim bulges, and boundaries omitted by slab packing;
+boundary patches and periodic faces retain the usual device trim test. Loader statistics report
+`culled_nurbs_subpatches`.
+
+Shell any-hits keep the nearest refined surface hit in the payload. They accept a triangle only
+when its distance is at least the refined hit distance: accepting an earlier triangle could hide
+a nearer surface between that triangle and its refinement. Surface orientation alone is not a
+safe pruning criterion for overlapping shells. This extra traversal has a cost, and the fixed
+192 triangles per bicubic patch can substantially increase acceleration-structure memory; compare
+shells with AABBs for the intended scene and ray distribution.
 
 ## Results (RTX PRO 6000 Blackwell, primary rays, `--repeats 100`)
 

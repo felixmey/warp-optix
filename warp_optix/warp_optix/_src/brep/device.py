@@ -463,13 +463,18 @@ def intersect_torus(brep: BrepData, prim: int, origin: wp.vec3, direction: wp.ve
             t = ta + s * (tb - ta)
             p = o + t * d
             rho = wp.sqrt(p[0] * p[0] + p[1] * p[1])
-            nrm = p - wp.vec3(p[0], p[1], 0.0) * (major / wp.max(rho, 1.0e-30))
+            # A spindle torus (minor > major) also has a sheet with signed radius
+            # major + minor*cos(v) < 0. The quartic contains both sheets; recover the sign
+            # from |p|^2 + major^2 - minor^2 = 2*major*signed_radius before mapping to UV.
+            side = wp.where(wp.dot(p, p) + (major - minor) * (major + minor) < 0.0, -1.0, 1.0)
+            # du x dv reverses on the negative-radius sheet.
+            nrm = side * p - wp.vec3(p[0], p[1], 0.0) * (major / wp.max(rho, 1.0e-30))
             if try_report(
                 brep,
                 prim,
                 t + shift,
-                wp.atan2(p[1], p[0]),
-                wp.atan2(p[2], rho - major),
+                wp.atan2(side * p[1], side * p[0]),
+                wp.atan2(p[2], side * rho - major),
                 to_object(brep, prim, nrm),
                 direction,
             ):
@@ -519,6 +524,13 @@ class Bezier:
 
     base: int
     degree: wp.vec2i
+
+
+@wp.struct
+class CubicQuartic:
+    """Degree (3, 4) patch; stream its 20 control points with fixed evaluation bounds."""
+
+    base: int
 
 
 @wp.struct
@@ -586,6 +598,34 @@ def eval_patch(patch: Cubic, cvs: wp.array[wp.vec4], s: float, t: float):
 
 
 @wp.func
+def eval_patch(patch: CubicQuartic, cvs: wp.array[wp.vec4], s: float, t: float):
+    bu = bernstein3(s)
+    dbu = bernstein3_derivative(s)
+    b3 = bernstein3(t)
+    omt = 1.0 - t
+    bv = vec5(omt * b3[0], t * b3[0] + omt * b3[1], t * b3[1] + omt * b3[2], t * b3[2] + omt * b3[3], t * b3[3])
+    dbv = 4.0 * vec5(-b3[0], b3[0] - b3[1], b3[1] - b3[2], b3[2] - b3[3], b3[3])
+    acc = wp.vec4(0.0)
+    acc_s = wp.vec4(0.0)
+    acc_t = wp.vec4(0.0)
+    for i in range(4):
+        row = wp.vec4(0.0)
+        row_t = wp.vec4(0.0)
+        for j in range(5):
+            cv = cvs[patch.base + i * 5 + j]
+            row += bv[j] * cv
+            row_t += dbv[j] * cv
+        acc += bu[i] * row
+        acc_s += dbu[i] * row
+        acc_t += bu[i] * row_t
+    inv_w = 1.0 / acc[3]
+    point = wp.vec3(acc[0], acc[1], acc[2]) * inv_w
+    ds = (wp.vec3(acc_s[0], acc_s[1], acc_s[2]) - acc_s[3] * point) * inv_w
+    dt = (wp.vec3(acc_t[0], acc_t[1], acc_t[2]) - acc_t[3] * point) * inv_w
+    return point, ds, dt
+
+
+@wp.func
 def eval_patch(patch: Bezier, cvs: wp.array[wp.vec4], s: float, t: float):
     """Rational tensor Bezier patch: point and first partial derivatives."""
     p = patch.degree[0]
@@ -626,6 +666,17 @@ def patch_degree(patch: Bezier) -> wp.vec2i:
 
 
 @wp.func
+def patch_degree(patch: CubicQuartic) -> wp.vec2i:
+    return wp.vec2i(3, 4)
+
+
+@wp.func
+def first_point(patch: CubicQuartic, cvs: wp.array[wp.vec4]) -> wp.vec3:
+    cv = cvs[patch.base]
+    return wp.vec3(cv[0], cv[1], cv[2]) / cv[3]
+
+
+@wp.func
 def first_point(patch: Cubic, cvs: wp.array[wp.vec4]) -> wp.vec3:
     return wp.vec3(patch.x[0, 0], patch.y[0, 0], patch.z[0, 0]) / patch.w[0, 0]
 
@@ -654,6 +705,20 @@ def corner_points(patch: Bezier, cvs: wp.array[wp.vec4]):
     c10 = cvs[patch.base + last]
     c01 = cvs[patch.base + q]
     c11 = cvs[patch.base + last + q]
+    return (
+        wp.vec3(c00[0], c00[1], c00[2]) / c00[3],
+        wp.vec3(c10[0], c10[1], c10[2]) / c10[3],
+        wp.vec3(c01[0], c01[1], c01[2]) / c01[3],
+        wp.vec3(c11[0], c11[1], c11[2]) / c11[3],
+    )
+
+
+@wp.func
+def corner_points(patch: CubicQuartic, cvs: wp.array[wp.vec4]):
+    c00 = cvs[patch.base]
+    c10 = cvs[patch.base + 15]
+    c01 = cvs[patch.base + 4]
+    c11 = cvs[patch.base + 19]
     return (
         wp.vec3(c00[0], c00[1], c00[2]) / c00[3],
         wp.vec3(c10[0], c10[1], c10[2]) / c10[3],
@@ -793,6 +858,14 @@ def patch_hull(patch: Cubic, cvs: wp.array[wp.vec4], ray: PatchRay) -> Hull:
 def patch_hull(patch: Bezier, cvs: wp.array[wp.vec4], ray: PatchRay) -> Hull:
     h = hull_new(patch, cvs, ray)
     for i in range((patch.degree[0] + 1) * (patch.degree[1] + 1)):
+        h = hull_add(h, i, cvs[patch.base + i], ray)
+    return h
+
+
+@wp.func
+def patch_hull(patch: CubicQuartic, cvs: wp.array[wp.vec4], ray: PatchRay) -> Hull:
+    h = hull_new(patch, cvs, ray)
+    for i in range(20):
         h = hull_add(h, i, cvs[patch.base + i], ray)
     return h
 
@@ -1163,6 +1236,10 @@ def intersect_nurbs(brep: BrepData, prim: int, origin: wp.vec3, direction: wp.ve
     base = brep.prim_cv[prim]
     if deg[0] == 3 and deg[1] == 3:
         intersect_patch(brep, prim, load_cubic(brep.cvs, base), origin, direction)
+    elif deg[0] == 3 and deg[1] == 4:
+        patch34 = CubicQuartic()
+        patch34.base = base
+        intersect_patch(brep, prim, patch34, origin, direction)
     else:
         patch = Bezier()
         patch.base = base
@@ -1242,14 +1319,11 @@ def proxy_hit(brep: BrepData, tri: int, local: int, bary: wp.vec2, origin: wp.ve
             normal = -normal
     else:
         ok = False
-    # Accepting a hit cuts the ray at the shell triangle, in front of the exact hit, so a nearer
-    # crossing behind the triangle would be lost. A ray's crossings alternate sides: one leaving a
-    # solid (or meeting a sheet's back) is at least its second, unless the ray started inside.
-    # Such hits keep the search going, except a sheet's back met squarely: a sheet has no inside,
-    # and only a grazing ray crosses it twice that close together.
-    cosine = wp.dot(normal, direction) / wp.length(direction)
-    solid = (brep.prims[prim].flags & FLAG_SOLID) != 0
-    keep_searching = cosine > 0.0 and (solid or cosine < GRAZING_COS)
+    # Accepting the triangle shrinks traversal to its distance, not the refined root's. Only
+    # prune when that distance is at least the exact hit: otherwise a different surface between
+    # the triangle and the root could be nearer. Orientation cannot establish this ordering
+    # (even two front-facing sheets can have overlapping shells of different thicknesses).
+    keep_searching = hit_t > wp.optix_get_ray_tmax()
     return ok, hit_t, u, v, normal, brep.prims[prim].face, keep_searching
 
 

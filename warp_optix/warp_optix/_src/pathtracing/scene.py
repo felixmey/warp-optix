@@ -1122,24 +1122,28 @@ class Scene:
         if np.any(parents >= np.arange(len(parents), dtype=np.int32)):
             raise ValueError("USD hierarchy parents must precede their children")
 
-        world = np.empty_like(local)
+        # Parents precede children, so each pass settles at least one more level of depths.
         depths = np.zeros(len(parents), dtype=np.int32)
-        for node_index, parent_index in enumerate(parents):
-            if parent_index < 0:
-                world[node_index] = local[node_index]
-            else:
-                world[node_index] = world[parent_index] @ local[node_index]
-                depths[node_index] = depths[parent_index] + 1
+        has_parent = parents >= 0
+        while True:
+            updated = np.where(has_parent, depths[np.maximum(parents, 0)] + 1, 0)
+            if np.array_equal(updated, depths):
+                break
+            depths = updated
 
         self.usd_scene = usd_scene
         self._usd_node_parents = parents
         self._usd_local_transforms = local
-        self._usd_world_transforms = world
+        self._usd_world_transforms = np.empty_like(local)
         self._usd_instance_ids = np.asarray(instance_ids, dtype=np.int32).reshape(-1)
         self._usd_instance_node_ids = np.asarray(instance_node_ids, dtype=np.int32).reshape(-1)
+        order = np.argsort(depths, kind="stable")
+        level_starts = np.searchsorted(depths[order], np.arange(int(depths.max(initial=0)) + 2))
         self._usd_level_nodes = [
-            np.flatnonzero(depths == depth).astype(np.int32) for depth in range(int(depths.max(initial=0)) + 1)
+            order[start:end].astype(np.int32) for start, end in zip(level_starts[:-1], level_starts[1:], strict=True)
         ]
+        self._compose_usd_world_transforms_host()
+        world = self._usd_world_transforms
         if len(self._usd_instance_ids) != len(self._usd_instance_node_ids):
             raise ValueError("USD instance and node mappings must have equal length")
         if len(self._usd_instance_ids):
@@ -1161,13 +1165,14 @@ class Scene:
         ]
         self.usd_scene._attach_device_arrays(self._d_usd_local_transforms, self._d_usd_world_transforms)
 
+    def _compose_usd_world_transforms_host(self):
+        """Compose world matrices one hierarchy level at a time (parents before children)."""
+        local, world, parents = self._usd_local_transforms, self._usd_world_transforms, self._usd_node_parents
+        for depth, nodes in enumerate(self._usd_level_nodes):
+            world[nodes] = local[nodes] if depth == 0 else world[parents[nodes]] @ local[nodes]
+
     def _evaluate_usd_transform_hierarchy_host(self, update_instances: bool = True):
-        for node_index, parent_index in enumerate(self._usd_node_parents):
-            local = self._usd_local_transforms[node_index]
-            if parent_index < 0:
-                self._usd_world_transforms[node_index] = local
-            else:
-                self._usd_world_transforms[node_index] = self._usd_world_transforms[parent_index] @ local
+        self._compose_usd_world_transforms_host()
         if update_instances and len(self._usd_instance_ids):
             self.set_instance_transforms_batch(
                 self._usd_instance_ids,

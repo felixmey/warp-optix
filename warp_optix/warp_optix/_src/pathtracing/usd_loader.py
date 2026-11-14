@@ -17,6 +17,7 @@ import re
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -1162,6 +1163,23 @@ def _normalize_mesh_uvs_for_udim_atlas(texcoords: np.ndarray | None, columns: in
     return np.ascontiguousarray(texcoords / scale, dtype=np.float32)
 
 
+@dataclass(frozen=True, slots=True)
+class _InstanceTemplate:
+    """Transform nodes and BrepArrays below a USD instance root, shared by its sibling instances.
+
+    ``parents`` holds template node indices, -1 for the instance root's node and -2 for the
+    stage root (resetXformStack). ``relative`` composes each node onto the root node's world
+    transform unless ``absolute`` marks it as already stage-rooted.
+    """
+
+    suffixes: list[str]
+    parents: np.ndarray
+    local: np.ndarray
+    relative: np.ndarray
+    absolute: np.ndarray
+    breps: list[tuple]
+
+
 def load_scene_from_usd(
     scene: Scene,
     usd_path: str | Path,
@@ -1359,6 +1377,20 @@ def load_scene_from_usd(
     instance_ids: list[int] = []
     instance_node_ids: list[int] = []
 
+    def prim_local_transform(prim) -> tuple[np.ndarray, bool] | None:
+        """Return a transformable prim's column-vector local matrix and resetXformStack."""
+        xformable = UsdGeom.Xformable(prim)
+        if xformable:
+            local = np.asarray(xformable.GetLocalTransformation(), dtype=np.float64).reshape(4, 4).T
+            return local, bool(xformable.GetResetXformStack())
+        if prim.GetTypeName() == "BrepArray":
+            # A Gprim, but USD only knows that when the omniSolid schema plugin is registered.
+            from ..brep.loader import local_transform  # noqa: PLC0415
+
+            local, reset = local_transform(prim)
+            return np.asarray(local, dtype=np.float64), bool(reset)
+        return None
+
     def ensure_transform_node(prim) -> int | None:
         """Create a topologically ordered handle for a transformable prim."""
         if not prim or prim.IsPseudoRoot():
@@ -1366,17 +1398,10 @@ def load_scene_from_usd(
         key = str(prim.GetPath())
         if key in path_to_node:
             return path_to_node[key]
-        xformable = UsdGeom.Xformable(prim)
-        if xformable:
-            local = np.asarray(xformable.GetLocalTransformation(), dtype=np.float64).reshape(4, 4).T
-            reset = xformable.GetResetXformStack()
-        elif prim.GetTypeName() == "BrepArray":
-            # A Gprim, but USD only knows that when the omniSolid schema plugin is registered.
-            from ..brep.loader import local_transform  # noqa: PLC0415
-
-            local, reset = local_transform(prim)
-        else:
+        node_transform = prim_local_transform(prim)
+        if node_transform is None:
             return ensure_transform_node(prim.GetParent())
+        local, reset = node_transform
         parent_index = None
         if not reset:
             parent_index = ensure_transform_node(prim.GetParent())
@@ -1448,22 +1473,24 @@ def load_scene_from_usd(
             material_uv_grids[result] = (columns, rows)
         return material_ids[key]
 
-    stats = {"meshes": 0, "triangles": 0, "vertices": 0, "lights": 0, "breps": 0}
+    stats = {"meshes": 0, "triangles": 0, "vertices": 0, "lights": 0, "breps": 0, "templated_instances": 0}
     geometry_jobs = deque()
     from .scene import Brep, Mesh  # noqa: PLC0415
 
-    brep_jobs = []  # (key, prim, node index): loaded together, in parallel, after the traversal
+    brep_jobs = []  # (key, prim, node index, bound material id): loaded together after the traversal
+
+    def brep_key(prim) -> str:
+        """Instance proxies of one prototype share its geometry."""
+        return str(prim.GetPrimInPrototype().GetPath()) if prim.IsInstanceProxy() else str(prim.GetPath())
 
     def add_brep(prim, node_index: int):
-        """Queue a BrepArray; instance proxies of one prototype share its geometry."""
-        key = str(prim.GetPrimInPrototype().GetPath()) if prim.IsInstanceProxy() else str(prim.GetPath())
-        brep_jobs.append((key, prim, node_index))
+        brep_jobs.append((brep_key(prim), prim, node_index, material_id(_bound_material(prim, UsdShade))))
 
     def load_breps():
         from ..brep.loader import load_brep_prims  # noqa: PLC0415
 
         sources = {}
-        for key, prim, _ in brep_jobs:
+        for key, prim, _, _ in brep_jobs:
             sources.setdefault(key, prim)
         keys = list(sources)
         try:
@@ -1477,10 +1504,9 @@ def load_scene_from_usd(
                 except Exception as prim_error:  # noqa: BLE001
                     logger.warning("Skipping BrepArray %s: %s", sources[key].GetPath(), prim_error)
         geometries = {}
-        for key, prim, node_index in brep_jobs:
+        for key, prim, node_index, bound in brep_jobs:
             if key not in loaded:
                 continue
-            bound = material_id(_bound_material(prim, UsdShade))
             if key not in geometries:
                 brep_prim = loaded[key]
                 face_materials = np.full(len(brep_prim.face_kind), bound)
@@ -1542,9 +1568,110 @@ def load_scene_from_usd(
         stats["triangles"] += triangle_count
 
     predicate = Usd.PrimIsActive & Usd.PrimIsDefined & ~Usd.PrimIsAbstract
-    prim_range = Usd.PrimRange.Stage(stage, Usd.TraverseInstanceProxies(predicate))
-    for prim in prim_range:
+    instance_templates: dict[tuple, _InstanceTemplate | None] = {}
+
+    def instance_context(prim):
+        """What an instance's proxies inherit from outside its prototype, or None if not shareable.
+
+        Proxies of two instances with the same prototype and context compose identically below
+        the instance root, so one representative instance can stand in for all of them.
+        """
+        node = prim
+        while node and not node.IsPseudoRoot():
+            if UsdShade.MaterialBindingAPI(node).GetCollectionBindings():
+                return None  # collections may name individual proxy paths
+            node = node.GetParent()
+        material, relationship = UsdShade.MaterialBindingAPI(prim).ComputeBoundMaterial()
+        strength = str(UsdShade.MaterialBindingAPI.GetMaterialBindingStrength(relationship)) if relationship else ""
+        imageable = UsdGeom.Imageable(prim)
+        return (
+            str(imageable.ComputeVisibility()) if imageable else "",
+            str(imageable.ComputePurpose()) if imageable else "",
+            str(material.GetPath()) if material else "",
+            strength,
+        )
+
+    def build_instance_template(root, has_root_node: bool):
+        """Record an instance's proxies relative to its root, or None if they need the general path.
+
+        Only transforms and BrepArrays are templated; meshes, lights and dome textures make the
+        instance fall back to the per-proxy traversal.
+        """
+        root_path = str(root.GetPath())
+        suffixes, parents, locals_, absolute, breps = [], [], [], [], []
+        # Template node index for a path: -1 is the instance root's node.
+        path_node = {root_path: -1}
+        for prim in Usd.PrimRange(root, Usd.TraverseInstanceProxies(predicate)):
+            path = str(prim.GetPath())
+            if path == root_path:
+                continue
+            is_brep = prim.GetTypeName() == "BrepArray"
+            if not is_brep and (
+                prim.IsA(UsdGeom.Mesh)
+                or (load_usd_lights and prim.IsA(UsdLux.SphereLight))
+                or (scene.usd_environment_path is None and _dome_texture(prim, UsdLux) is not None)
+            ):
+                return None
+            parent = path_node[path.rsplit("/", 1)[0]]
+            node_transform = prim_local_transform(prim)
+            if node_transform is None:
+                path_node[path] = parent
+            else:
+                local, reset = node_transform
+                if reset or (parent == -1 and not has_root_node):
+                    local = extra_transform.T @ local
+                    parent, is_absolute = -2, True
+                else:
+                    is_absolute = parent >= 0 and absolute[parent]
+                path_node[path] = len(suffixes)
+                suffixes.append(path[len(root_path) :])
+                parents.append(parent)
+                locals_.append(local)
+                absolute.append(is_absolute)
+            if is_brep:
+                imageable = UsdGeom.Imageable(prim)
+                if str(imageable.ComputeVisibility()) != "invisible" and str(imageable.ComputePurpose()) in purposes:
+                    breps.append((brep_key(prim), prim, path_node[path], material_id(_bound_material(prim, UsdShade))))
+        parents = np.asarray(parents, dtype=np.int64)
+        local = np.asarray(locals_, dtype=np.float32).reshape(-1, 4, 4)
+        # Each node relative to the root node's world (or to the stage root, when absolute).
+        relative = np.empty_like(local)
+        for index, parent in enumerate(parents):
+            relative[index] = local[index] if parent < 0 else relative[parent] @ local[index]
+        return _InstanceTemplate(suffixes, parents, local, relative, np.asarray(absolute, dtype=bool), breps)
+
+    def expand_instance(prim, root_node: int | None) -> bool:
+        """Add an instance's proxies from its prototype's template; False if it needs traversal."""
+        context = instance_context(prim)
+        if context is None:
+            return False
+        template_key = (str(prim.GetPrototype().GetPath()), context, root_node is not None)
+        if template_key not in instance_templates:
+            instance_templates[template_key] = build_instance_template(prim, root_node is not None)
+        template = instance_templates[template_key]
+        if template is None:
+            return False
+        offset = len(node_paths)
+        root_path = str(prim.GetPath())
+        node_paths.extend(root_path + suffix for suffix in template.suffixes)
+        parents = np.where(template.parents >= 0, template.parents + offset, -1)
+        if root_node is not None:
+            parents[template.parents == -1] = root_node
+        node_parents.extend(parents.tolist())
+        node_local_transforms.extend(template.local)
+        world = template.relative.copy()
+        if root_node is not None:
+            world[~template.absolute] = node_world_transforms[root_node] @ template.relative[~template.absolute]
+        node_world_transforms.extend(world)
+        brep_jobs.extend((key, source, offset + node, bound) for key, source, node, bound in template.breps)
+        stats["templated_instances"] += 1
+        return True
+
+    prim_iterator = iter(Usd.PrimRange.Stage(stage, Usd.TraverseInstanceProxies(predicate)))
+    for prim in prim_iterator:
         node_index = ensure_transform_node(prim)
+        if prim.IsInstance() and expand_instance(prim, node_index):
+            prim_iterator.PruneChildren()
         if scene.usd_environment_path is None:
             dome_texture = _dome_texture(prim, UsdLux)
             if dome_texture is not None:
@@ -1667,10 +1794,12 @@ def load_scene_from_usd(
     )
     scene.set_gltf_textures(textures, srgb_texture_indices=srgb_textures)
     logger.info(
-        "[USD timing] total=%.1f ms meshes=%d breps=%d verts=%d tris=%d lights=%d materials=%d textures=%d",
+        "[USD timing] total=%.1f ms meshes=%d breps=%d templated_instances=%d verts=%d tris=%d lights=%d "
+        "materials=%d textures=%d",
         (time.perf_counter() - start) * 1000.0,
         stats["meshes"],
         stats["breps"],
+        stats["templated_instances"],
         stats["vertices"],
         stats["triangles"],
         stats["lights"],

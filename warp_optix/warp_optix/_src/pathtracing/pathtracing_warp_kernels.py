@@ -4187,8 +4187,8 @@ def brep_shell_any_hit(params: PathtraceLaunchParams):
 
     OptiX orders candidates by the shell triangle's t, and a shell can reach in front of another
     surface (thin walls). So the payload keeps the nearest exact hit, and hits that may hide a
-    nearer crossing behind their shell triangle (leaving a solid, or a sheet's back met at a
-    grazing angle; see proxy_hit) are not accepted, which would shrink tmax: traversal continues.
+    nearer crossing behind their shell triangle are not accepted, which would shrink tmax:
+    traversal continues until a triangle at or beyond an exact hit can safely bound the search.
     The miss and closest-hit programs keep a recorded hit that is nearer than theirs.
     """
     ok, hit_t, u, v, n_obj, face, keep_searching = _brep_shell_hit(params)

@@ -15,32 +15,26 @@ from .style import camera_angles
 
 def world_bounds(api):
     scene = api.scene
-    instance_bounds = []
-    local_bounds = {}
-    for instance_index, instance in enumerate(scene._instances):
-        mesh_index = instance.mesh_index
-        if mesh_index not in local_bounds:
-            vertices = scene._meshes[mesh_index].vertices
-            local_bounds[mesh_index] = (np.min(vertices, axis=0), np.max(vertices, axis=0))
-        local_min, local_max = local_bounds[mesh_index]
-        corners = np.array(
-            [
-                (x, y, z, 1.0)
-                for x in (local_min[0], local_max[0])
-                for y in (local_min[1], local_max[1])
-                for z in (local_min[2], local_max[2])
-            ],
-            dtype=np.float64,
-        )
-        world = scene._instance_transform_cache[instance_index]
-        transformed = (world @ corners.T).T[:, :3]
-        instance_bounds.append((np.min(transformed, axis=0), np.max(transformed, axis=0)))
-
-    if not instance_bounds:
+    instance_count = len(scene._instances)
+    if not instance_count:
         return np.full(3, -0.5), np.full(3, 0.5)
 
+    mesh_indices = np.fromiter((instance.mesh_index for instance in scene._instances), np.int64, instance_count)
+    unique_meshes, mesh_slots = np.unique(mesh_indices, return_inverse=True)
+    local_bounds = np.empty((len(unique_meshes), 2, 3))
+    for slot, mesh_index in enumerate(unique_meshes):
+        vertices = scene._meshes[mesh_index].vertices
+        local_bounds[slot] = np.min(vertices, axis=0), np.max(vertices, axis=0)
+    # The 8 corners of every instance's local box, transformed in one batch.
+    corner_bits = np.array([(x, y, z) for x in (0, 1) for y in (0, 1) for z in (0, 1)], dtype=bool)
+    boxes = local_bounds[mesh_slots]
+    corners = np.where(corner_bits[None], boxes[:, None, 1], boxes[:, None, 0])
+    world = scene._instance_transform_cache[:instance_count].astype(np.float64)
+    transformed = corners @ world[:, :3, :3].transpose(0, 2, 1) + world[:, None, :3, 3]
+    minima, maxima = transformed.min(axis=1), transformed.max(axis=1)
+
     # Ignore huge flat ground planes when framing so a small subject stays visible.
-    sizes = np.asarray([maximum - minimum for minimum, maximum in instance_bounds])
+    sizes = maxima - minima
     diagonals = np.linalg.norm(sizes, axis=1)
     positive = diagonals[diagonals > 1.0e-12]
     if len(positive):
@@ -49,19 +43,13 @@ def world_bounds(api):
         typical = float(np.median(ordered[: max(1, len(ordered) // 2)]))
     else:
         typical = 0.0
-    selected = []
-    for item, size, diagonal in zip(instance_bounds, sizes, diagonals, strict=True):
-        longest = max(float(np.max(size)), 1.0e-20)
-        is_flat = float(np.min(size)) <= longest * 1.0e-5
-        is_extreme = typical > 0.0 and float(diagonal) > typical * 25.0
-        if not (is_flat and is_extreme):
-            selected.append(item)
-    if not selected:
-        selected = instance_bounds
-
-    bounds_min = np.min(np.asarray([item[0] for item in selected]), axis=0)
-    bounds_max = np.max(np.asarray([item[1] for item in selected]), axis=0)
-    return bounds_min, bounds_max
+    longest = np.maximum(np.max(sizes, axis=1), 1.0e-20)
+    is_flat = np.min(sizes, axis=1) <= longest * 1.0e-5
+    is_extreme = diagonals > typical * 25.0 if typical > 0.0 else np.zeros(instance_count, dtype=bool)
+    selected = ~(is_flat & is_extreme)
+    if not selected.any():
+        selected[:] = True
+    return minima[selected].min(axis=0), maxima[selected].max(axis=0)
 
 
 def authored_camera(api, requested_path: str | None = None):

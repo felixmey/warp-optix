@@ -360,7 +360,10 @@ class Surface:
             v = np.arcsin(np.clip(lz / r0, -1.0, 1.0))
             pole = np.hypot(lx, ly) < 1e-6 * max(r0, 1e-30)
             return np.stack([np.where(pole, np.nan, u), v], axis=1)
-        return np.stack([u, np.arctan2(lz, np.hypot(lx, ly) - r0)], axis=1)
+        # Spindle tori also have a negative signed-radius sheet. Its azimuth is opposite the
+        # point's cylindrical angle; using the positive radius maps it outside the face trims.
+        side = np.where(lx * lx + ly * ly + lz * lz + (r0 - r1) * (r0 + r1) < 0.0, -1.0, 1.0)
+        return np.stack([np.arctan2(side * ly, side * lx), np.arctan2(lz, side * np.hypot(lx, ly) - r0)], axis=1)
 
     def _invert_nurbs(self, points: np.ndarray, guess: np.ndarray | None) -> np.ndarray:
         s = self.nurbs
@@ -747,6 +750,41 @@ def _build_trim(polys_closed, polys_open, face_rng, period, swap: bool, num_slab
     return segs, bulges, starts, segment_ids[order], (lo, num_slabs / width)
 
 
+def _patch_outside_trim(rect, segments, bulges, swap=False) -> bool:
+    """Reject only rectangles with constant outside parity, including the solver's UV slack.
+
+    Chord boxes expanded by the absolute bulge enclose both the chord and its parabolic arc.
+    Slab construction can omit vertical chords; keeping every rectangle that crosses a chord
+    endpoint's a-coordinate also covers those missing boundaries and half-open parity changes.
+    Periodic faces are excluded by the caller: wrapping would split the tested rectangle.
+    """
+    if not len(segments):
+        return False
+    a0, a1, c0, c1 = rect if not swap else (rect[2], rect[3], rect[0], rect[1])
+    # Classify the same rounded segments as the device, with a guard for its float32 arithmetic.
+    scale = max(1.0, np.max(np.abs(segments)), abs(a0), abs(a1), abs(c0), abs(c1))
+    slack = 32.0 * np.finfo(np.float32).eps * scale
+    ea = 1.0e-4 * (a1 - a0) + slack
+    ec = 1.0e-4 * (c1 - c0) + slack
+    lo = np.array([a0 - ea, c0 - ec])
+    hi = np.array([a1 + ea, c1 + ec])
+    endpoints = segments[:, (0, 2)]
+    if np.any((endpoints >= lo[0]) & (endpoints <= hi[0])):
+        return False
+    reach = np.abs(bulges)[:, None] + slack
+    lower = np.minimum(segments[:, :2], segments[:, 2:]) - reach
+    upper = np.maximum(segments[:, :2], segments[:, 2:]) + reach
+    if np.any(np.all((upper >= lo) & (lower <= hi), axis=1)):
+        return False
+    # No boundary can meet the expanded rectangle; one point determines its parity. The bulge
+    # regions are inside the boxes above, so only chord crossings can contribute here.
+    a, c = 0.5 * (lo + hi)
+    crossing = (segments[:, 0] <= a) != (segments[:, 2] <= a)
+    segs = segments[crossing]
+    heights = segs[:, 1] + (a - segs[:, 0]) * (segs[:, 3] - segs[:, 1]) / (segs[:, 2] - segs[:, 0])
+    return np.count_nonzero(heights > c) % 2 == 0
+
+
 def load_brep_prim(
     prim,
     world: np.ndarray,
@@ -932,6 +970,7 @@ def load_brep_prim(
     slab_start, slab_segments, all_segments, all_bulges = [0], [], [], []
     slab_total = 0
     seg_base = 0
+    patch_trims = {}
     owned = range(*faces) if faces is not None else range(nfaces)
     face_flags[flip] |= FLAG_FLIP
     face_flags[solid_sides == 1] |= FLAG_SOLID
@@ -957,6 +996,12 @@ def load_brep_prim(
         if not len(segs) or _trims_range(segs, bulges, face_range[f], swap):
             continue
         face_flags[f] |= FLAG_TRIMMED | (FLAG_SWAP if swap else 0)
+        if surface.kind == NURBS and not np.any(period):
+            patch_trims[f] = (
+                segs.astype(np.float32).astype(np.float64),
+                bulges.astype(np.float32).astype(np.float64),
+                swap,
+            )
         face_slab[f] = (len(slab_start) - 1, num_slabs)
         face_slab_map[f] = (lo, scale)
         slab_start.extend((starts[1:] + slab_total).tolist())
@@ -969,6 +1014,7 @@ def load_brep_prim(
     # Primitives: one per analytic face, flat rational Bezier sub-patches for NURBS faces.
     prim_kind, prim_face, prim_bounds, prim_cv, prim_degree, prim_uv, prim_tol, cvs = [], [], [], [], [], [], [], []
     ncv = 0
+    culled_patches = 0
     for f in owned:
         surface = surfaces[f]
         if surface.kind != NURBS:
@@ -985,6 +1031,9 @@ def load_brep_prim(
         for patch, rect in bezier_subpatches(surface.nurbs, flat_tol * diag, max_depth):
             if rect[1] < urng[0] or rect[0] > urng[1] or rect[3] < urng[2] or rect[2] > urng[3]:
                 continue  # outside the face's trimmed domain
+            if f in patch_trims and _patch_outside_trim(rect, *patch_trims[f]):
+                culled_patches += 1
+                continue
             if max(patch.shape[:2]) <= 4:
                 patch = to_bicubic(patch)  # exact; the device evaluates bicubics from registers
             if max(patch.shape[:2]) > 8:
@@ -1008,6 +1057,7 @@ def load_brep_prim(
         faces=nfaces,
         primitives=len(prim_kind),
         nurbs_subpatches=int(sum(1 for k in prim_kind if k == NURBS)),
+        culled_nurbs_subpatches=culled_patches,
         trim_segments=seg_base,
         face_kinds={KIND_NAMES[k]: kinds.count(k) for k in set(kinds)},
     )

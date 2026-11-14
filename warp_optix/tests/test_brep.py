@@ -521,3 +521,128 @@ def test_path_traced_paths_end_inside_closed_opaque_solids(tmp_path):
         assert render(api, *inside).mean() > 0.01
     finally:
         api.close()
+
+
+def _write_instanced_assembly(directory, instanceable):
+    """An assembly placing BRep parts through references, instanceable or flattened."""
+
+    def color_material(stage, path, color):
+        material = UsdShade.Material.Define(stage, path)
+        shader = UsdShade.Shader.Define(stage, f"{path}/Shader")
+        shader.CreateIdAttr("UsdPreviewSurface")
+        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*color))
+        material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+        return material
+
+    def place(stage, path, asset, translate, instance=instanceable, prim_path="/Part"):
+        # Typeless, so the referenced prim's type (Xform or BrepArray) composes through.
+        prim = stage.DefinePrim(path)
+        prim.GetReferences().AddReference(asset, prim_path)
+        prim.CreateAttribute("xformOp:translate", Sdf.ValueTypeNames.Double3).Set(Gf.Vec3d(*translate))
+        prim.CreateAttribute("xformOpOrder", Sdf.ValueTypeNames.TokenArray, variability=Sdf.VariabilityUniform).Set(
+            ["xformOp:translate"]
+        )
+        prim.SetInstanceable(instance)
+        return prim
+
+    ball = directory / "ball.usda"
+    if not ball.exists():
+        _write_sphere_brep(ball, radius=0.25)
+    part = directory / "part.usda"
+    if not part.exists():
+        stage = Usd.Stage.CreateNew(str(part))
+        UsdGeom.Xform.Define(stage, "/Part")
+        red = color_material(stage, "/Part/Looks/Red", (1.0, 0.0, 0.0))
+        bound = place(stage, "/Part/Ball", str(ball), (0, 0, 0), instance=False, prim_path="/Ball")
+        UsdShade.MaterialBindingAPI.Apply(bound).Bind(red)
+        place(stage, "/Part/Sub", str(ball), (0, 1, 0), instance=False, prim_path="/Ball")
+        reset = UsdGeom.Xform.Define(stage, "/Part/Reset")
+        reset.SetResetXformStack(True)
+        reset.AddTranslateOp().Set(Gf.Vec3d(0, 0, 5))
+        place(stage, "/Part/Reset/Ball", str(ball), (1, 0, 0), instance=False, prim_path="/Ball")
+        stage.GetRootLayer().Save()
+        stage = Usd.Stage.CreateNew(str(directory / "pair.usda"))
+        UsdGeom.Xform.Define(stage, "/Part")
+        place(stage, "/Part/Left", str(part), (-1, 0, 0), instance=True)
+        place(stage, "/Part/Right", str(part), (1, 0, 0), instance=True)
+        stage.GetRootLayer().Save()
+        stage = Usd.Stage.CreateNew(str(directory / "with_mesh.usda"))
+        UsdGeom.Xform.Define(stage, "/Part")
+        place(stage, "/Part/Ball", str(ball), (0, 0, 0), instance=False, prim_path="/Ball")
+        mesh = UsdGeom.Mesh.Define(stage, "/Part/Tri")
+        mesh.CreatePointsAttr([Gf.Vec3f(0, 0, 0), Gf.Vec3f(1, 0, 0), Gf.Vec3f(0, 1, 0)])
+        mesh.CreateFaceVertexCountsAttr([3])
+        mesh.CreateFaceVertexIndicesAttr([0, 1, 2])
+        stage.GetRootLayer().Save()
+
+    path = directory / ("instanced.usda" if instanceable else "flattened.usda")
+    stage = Usd.Stage.CreateNew(str(path))
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+    UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+    UsdGeom.Xform.Define(stage, "/World")
+    blue = color_material(stage, "/World/Looks/Blue", (0.0, 0.0, 1.0))
+    green = color_material(stage, "/World/Looks/Green", (0.0, 1.0, 0.0))
+    place(stage, "/World/A", str(part), (0, 0, 0))
+    place(stage, "/World/A2", str(part), (3, 0, 0))
+    UsdShade.MaterialBindingAPI.Apply(place(stage, "/World/B", str(part), (6, 0, 0))).Bind(blue)
+    group = UsdGeom.Xform.Define(stage, "/World/G").GetPrim()
+    UsdShade.MaterialBindingAPI.Apply(group).Bind(green, UsdShade.Tokens.strongerThanDescendants)
+    place(stage, "/World/G/C", str(part), (9, 0, 0))
+    UsdGeom.Imageable(place(stage, "/World/H", str(part), (12, 0, 0))).MakeInvisible()
+    place(stage, "/World/M", str(directory / "with_mesh.usda"), (15, 0, 0))
+    place(stage, "/World/M2", str(directory / "with_mesh.usda"), (18, 0, 0))
+    place(stage, "/World/N", str(directory / "pair.usda"), (21, 0, 0))
+    stage.GetRootLayer().Save()
+    return path
+
+
+def test_instanced_usd_breps_expand_like_flattened_references(tmp_path):
+    """Instances expanded from a shared prototype template match the per-prim traversal."""
+    if not wp.is_cuda_available():
+        pytest.skip("CUDA device unavailable")
+    from warp_optix.pathtracing import PathTracer  # noqa: PLC0415
+
+    def load(instanceable):
+        api = PathTracer(width=32, height=32, denoiser="none", enable_set=False)
+        api.initialize()
+        try:
+            scene = api.scene
+            assert scene.load_from_usd(str(_write_instanced_assembly(tmp_path, instanceable)))
+            colors = []
+            for instance in scene._instances:
+                if instance.material_id is not None:
+                    ids = [instance.material_id]
+                else:
+                    ids = np.unique(scene._meshes[instance.mesh_index].material_ids)
+                entries = scene.materials.get_material_entries()
+                colors.append(tuple(tuple(np.round(entries[int(i)]["pbrBaseColorFactor"], 4)) for i in ids))
+            return (
+                [handle.path for handle in scene.usd_scene.transforms],
+                scene._usd_node_parents.copy(),
+                scene._usd_world_transforms.copy(),
+                scene._usd_instance_node_ids.copy(),
+                [scene._meshes[instance.mesh_index].primitive_type for instance in scene._instances],
+                colors,
+                scene._instance_transform_cache[: len(scene._instances)].copy(),
+            )
+        finally:
+            api.close()
+
+    paths, parents, world, instance_nodes, kinds, colors, transforms = load(instanceable=True)
+    flat = load(instanceable=False)
+    assert paths == flat[0]
+    np.testing.assert_array_equal(parents, flat[1])
+    np.testing.assert_allclose(world, flat[2], atol=1e-6)
+    np.testing.assert_array_equal(instance_nodes, flat[3])
+    assert kinds == flat[4]
+    assert colors == flat[5]
+    np.testing.assert_allclose(transforms, flat[6], atol=1e-6)
+    # Sanity-check the scenario itself: the hidden instance is skipped, the rest resolve as authored.
+    assert not any(path.startswith("/World/H/") and node in instance_nodes for node, path in enumerate(paths))
+    by_path = {paths[node]: color for node, color in zip(instance_nodes, colors, strict=True)}
+    red, blue, green = (1.0, 0.0, 0.0, 1.0), (0.0, 0.0, 1.0, 1.0), (0.0, 1.0, 0.0, 1.0)
+    assert by_path["/World/A/Ball"] == (red,)
+    assert by_path["/World/B/Ball"] == (red,) and by_path["/World/B/Sub"] == (blue,)
+    assert by_path["/World/G/C/Ball"] == (green,) and by_path["/World/G/C/Sub"] == (green,)
+    assert "/World/N/Right/Reset/Ball" in by_path
+    np.testing.assert_allclose(world[paths.index("/World/N/Right/Reset/Ball")][:3, 3], (1.0, 5.0, 0.0), atol=1e-6)

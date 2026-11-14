@@ -68,8 +68,8 @@ def proxy_any_hit(brep: BrepData):
 
     OptiX orders hits by the shell triangle's t, not the surface's, and a shell can reach in front
     of another surface (thin walls). So the payload records the nearest exact hit, and hits that
-    may hide a nearer crossing behind their shell triangle (leaving a solid, or a sheet's back met
-    at a grazing angle; see proxy_hit) are recorded but not accepted: traversal continues.
+    lie behind their shell triangle are recorded but not accepted: traversal continues until
+    a triangle at or beyond a recorded exact hit can safely bound the search.
     """
     local = int(wp.optix_get_primitive_index())
     tri = int(wp.optix_get_instance_id()) + local
