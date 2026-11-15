@@ -244,7 +244,9 @@ def test_nurbs_diagnostic_accounting(tmp_path, monkeypatch):
         assert totals["newton_calls"] > 0
         assert totals["newton_calls"] <= totals["newton_iterations"] <= 10 * totals["newton_calls"]
         assert totals["newton_failures"] <= totals["fallback_entries"] <= totals["newton_calls"]
-        assert totals["newton_calls"] == totals["aabb_candidates"] - totals["hull_rejects"] + totals["shell_candidates"]
+        assert totals["newton_calls"] == (
+            totals["aabb_candidates"] - totals["obb_rejects"] - totals["hull_rejects"] + totals["shell_candidates"]
+        )
         histogram = [totals[f"newton_iterations_{i}"] for i in range(1, 11)]
         assert sum(histogram) == totals["newton_calls"]
         assert sum((i + 1) * count for i, count in enumerate(histogram)) == totals["newton_iterations"]

@@ -22,8 +22,8 @@ from typing import Any, cast
 import numpy as np
 import warp as wp
 
-from . import trim_grid
-from .loader import CONE, FLAG_FLIP, FLAG_SOLID, FLAG_SWAP, FLAG_TRIMMED, PLANE, SPHERE, TORUS
+from . import bounds, trim_grid
+from .loader import CONE, FLAG_FLIP, FLAG_SOLID, FLAG_SWAP, FLAG_TRIMMED, NURBS, PLANE, SPHERE, TORUS
 
 # Read once before kernel compilation. Disabled builds contain no diagnostic atomics.
 DIAGNOSTICS = os.environ.get("WARP_OPTIX_BREP_DIAGNOSTICS") == "1"
@@ -45,6 +45,7 @@ DIAGNOSTIC_NAMES = (
     "fallback_grazing",
     *tuple(f"newton_iterations_{i}" for i in range(1, 11)),
     "projection_stalled",
+    "obb_rejects",
 )
 NEWTON_ITERATIONS = 10
 # Below this |cos| between the ray and the surface, a ray can cross a flat sub-patch twice: there,
@@ -64,7 +65,9 @@ GRID_REF_C = wp.constant(trim_grid.REF_C)
 class Surface:
     """A primitive's surface frame and its face's trim lookup in one 128-byte record (one cache
     line), so an intersection needs a single dependent load for all of it. The primitives of one
-    face (NURBS sub-patches) repeat the face's record."""
+    face repeat its trim record. NURBS patches use origin/x/y/axis for an oriented bound
+    (center and scaled axes), and params[0] for its coordinate reach; they need no analytic
+    surface frame. Zero bound axes disable the optional rejection."""
 
     origin: wp.vec3
     x: wp.vec3
@@ -1228,7 +1231,6 @@ def report_patch_hit(
 @wp.func
 def intersect_patch(brep: BrepData, prim: int, patch: Any, origin: wp.vec3, direction: wp.vec3):
     """The ray's nearest root with one sub-patch inside the face's trims (OptiX keeps the nearest)."""
-    diagnostic_add(brep, prim, 0, 1)
     tol = brep.prim_tol[prim]
     ray = patch_ray(origin, direction, first_point(patch, brep.cvs))
     hull = patch_hull(patch, brep.cvs, ray)
@@ -1287,7 +1289,43 @@ def intersect_patch(brep: BrepData, prim: int, patch: Any, origin: wp.vec3, dire
 
 
 @wp.func
+def patch_obb_misses(surf: Surface, origin: wp.vec3, direction: wp.vec3, tmin: float, tmax: float) -> bool:
+    """Cheap conservative rejection before fetching a patch's control net.
+
+    At a crossing, |t * direction| is bounded componentwise by |origin| + the box's reach.
+    Inflate the slabs for float32 subtraction, dot products and interval arithmetic there,
+    including far-away ray origins and nearly parallel rays. Stored axes need not be exactly
+    orthogonal: the host bounds their projections. Zero axes always pass.
+    """
+    delta = origin - surf.origin
+    o = wp.vec3(wp.dot(surf.x, delta), wp.dot(surf.y, delta), wp.dot(surf.axis, delta))
+    d = wp.vec3(wp.dot(surf.x, direction), wp.dot(surf.y, direction), wp.dot(surf.axis, direction))
+    error = wp.static(8.0 * 2.0**-23) * (wp.max(wp.abs(origin)) + surf.params[0])
+    radius = wp.vec3(1.0) + error * wp.vec3(
+        wp.dot(wp.abs(surf.x), wp.vec3(1.0)),
+        wp.dot(wp.abs(surf.y), wp.vec3(1.0)),
+        wp.dot(wp.abs(surf.axis), wp.vec3(1.0)),
+    )
+    lo = tmin
+    hi = tmax
+    for k in range(3):
+        if d[k] == 0.0:
+            if wp.abs(o[k]) > radius[k]:
+                return True
+        else:
+            a = (-radius[k] - o[k]) / d[k]
+            b = (radius[k] - o[k]) / d[k]
+            lo = wp.max(lo, wp.min(a, b))
+            hi = wp.min(hi, wp.max(a, b))
+    return lo > hi
+
+
+@wp.func
 def intersect_nurbs(brep: BrepData, prim: int, origin: wp.vec3, direction: wp.vec3):
+    diagnostic_add(brep, prim, 0, 1)
+    if patch_obb_misses(brep.prims[prim], origin, direction, wp.optix_get_ray_tmin(), wp.optix_get_ray_tmax()):
+        diagnostic_add(brep, prim, 26, 1)
+        return
     deg = brep.prim_degree[prim]
     base = brep.prim_cv[prim]
     if deg[0] == 3 and deg[1] == 3:
@@ -1435,10 +1473,13 @@ def pack(prims, device, proxies=None):
     """Concatenate loaded ``BrepPrim``s into one ``BrepData``.
 
     Returns it and each prim's primitive base; with ``proxies`` (one ``proxy.Proxy`` per prim),
-    also each prim's shell-triangle base.
+    also each prim's shell-triangle base. CUDA bound fitting is enqueued on the current stream
+    after uploading the arrays; CPU packing uses the reference fitter.
     """
     face_base = prim_base = cv_base = seg_base = slab_base = slab_seg_base = tri_base = 0
     cell_base = member_base = 0
+    gpu_bounds = wp.get_device(device).is_cuda
+    bound_ids = []
     cat = {k: [] for k in cast(Any, BrepData).vars if k not in ("prims", "diagnostic_counts")}
     record_fields = ("origin", "x", "y", "axis", "params", "range", "period", "flags", "grid", "grid_map")
     faces = {k: [] for k in record_fields}  # per face, expanded to its primitives below
@@ -1501,6 +1542,26 @@ def pack(prims, device, proxies=None):
             records[key][:prim_base] = values[face].reshape(records[key][:prim_base].shape)
         records["flags"][:prim_base] |= np.concatenate(prim_kind).astype(np.int32) << int(KIND_SHIFT)
         records["face"][:prim_base] = face
+        for n, prim in enumerate(prims):
+            nurbs = np.flatnonzero(prim.prim_kind == NURBS)
+            for key in ("origin", "x", "y", "axis", "params"):
+                records[key][bases[n] + nurbs] = 0
+            # Shell candidates already have a tighter hardware test. Only fit active AABBs.
+            if proxies is not None:
+                nurbs = np.setdiff1d(nurbs, proxies[n].patches, assume_unique=True)
+            if gpu_bounds:
+                if len(nurbs):
+                    bound_ids.append(bases[n] + nurbs)
+                continue
+            for local in nurbs:
+                p, q = prim.prim_degree[local]
+                start = prim.prim_cv[local]
+                net = prim.cvs[start : start + (p + 1) * (q + 1)].reshape(p + 1, q + 1, 4)
+                center, axes, reach = bounds.patch_obb(net, prim.prim_tol[local])
+                index = bases[n] + local
+                records["origin"][index] = center
+                records["x"][index], records["y"][index], records["axis"][index] = axes.T
+                records["params"][index, 0] = reach
     data.prims = wp.array(records, dtype=Surface, device=device)
     for key, parts in cat.items():
         dtype = cast(Any, BrepData).vars[key].type.dtype
@@ -1511,6 +1572,10 @@ def pack(prims, device, proxies=None):
         if values.size == 0:  # every field must be a valid array for the launch
             values = np.zeros(width, scalar)
         setattr(data, key, _device_array(values.reshape(-1, width) if width > 1 else values, dtype, device))
+    if bound_ids:
+        from .bounds_gpu import build_bounds  # noqa: PLC0415 - requires the structs defined in this module
+
+        build_bounds(data, np.concatenate(bound_ids))
     if proxies is not None:
         return data, bases, tri_bases
     return data, bases
