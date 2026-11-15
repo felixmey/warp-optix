@@ -131,3 +131,58 @@ surface; the coarser 2e-3 mesh is 1.5–2.6° mean / 5–11° p99.
 - Not handled: wire edges, point shells, NURBS degree > 7, non-positive weights, time samples.
 - The torus quartic and the NURBS Newton run in float32; very large or far-from-origin parts would
   want local frames per face.
+
+## NURBS work diagnostics
+
+Run the path tracer's camera, bounce and shadow rays with per-patch counters:
+
+```bash
+uv run --extra usd --extra pathtracing python examples/brep/profile_brep.py part.usda
+# Optional: compare all raw color/guide outputs with an uninstrumented fresh process.
+uv run --extra usd --extra pathtracing python examples/brep/profile_brep.py part.usda --output counted.npz
+uv run --extra usd --extra pathtracing python examples/brep/profile_brep.py part.usda --no-counters --output reference.npz
+```
+
+The script enables `WARP_OPTIX_BREP_DIAGNOSTICS=1` before importing the renderer. For other
+applications, set that variable before process startup; changing it after imports does not
+change compiled kernels. Read `scene._brep_data.diagnostic_counts` after synchronizing rendering;
+its rows are global primitive IDs and columns follow `device.DIAGNOSTIC_NAMES`. Zero the counters
+on the rendering stream (or synchronize around the reset) to delimit a sample interval.
+
+Counters distinguish AABB candidates and hull rejects, shell candidates, Newton calls and
+iterations, failed Newton solves, fallback entries, and root-search calls. Newton failures count
+nonconvergence, not converged roots outside the patch or rejected by trims. Fallback entries
+include grazing cases resolved by the shell orientation shortcut, so not every fallback launches
+a root search. Repeated shell refinement contributes repeated calls; these are work counts, not
+unique ray/patch counts. The script reports a single frame after warmup, with a fixed sample index.
+
+Diagnostic atomics perturb execution: never use instrumented timings to judge speedups. Normal
+builds compile out the updates and allocate no counter storage. The renderer groups bounce rays
+by direction octant and writes primary guide buffers before the bounce loop to reduce state
+carried across reordering. Benchmark hint and live-state changes on the intended scene; small
+improvements can depend on compiler layout and ray distribution.
+
+Newton diagnostics also include the 1–10 iteration histogram, singular/domain exits, failures
+on the last iteration, and separate nonconverged/grazing fallback entries. Last-iteration failures
+can overlap domain or singular exits; they do not necessarily mean the loop exhausted its budget.
+`projection_calls` and `projection_evaluations` measure the Gauss-Newton work inside the fallback,
+which is separate from the initial ray/surface Newton iterations. A projection performs up to
+three surface evaluations (two updates and one final evaluation). These counters help distinguish
+rare long Newton solves from repeated work in grazing-ray root searches.
+
+The projection now stops when clamping or rounding leaves both parameters exactly unchanged:
+the next evaluation would reproduce the point and derivatives already available. The
+`projection_stalled` counter records these exits. This does not relax the residual tolerance or
+reduce the ten-iteration Newton budget or two-update projection budget.
+
+On the RTX PRO 6000 Blackwell (1280×960, four-bounce setting, default shells, denoising off),
+this shortcut measured 0.465 ms versus 0.478–0.479 ms for Mouse's OptiX launch; NURBS parts and bottle
+were effectively unchanged. All seven raw output buffers matched exactly on those three scenes.
+Measurements excluded compilation, used ten warmup frames and five batches of 50 timed launches,
+and checked baselines again after candidates. These small gains remain workload dependent.
+
+A six-iteration Newton cap and a single-update projection were also tested, but not retained:
+they changed some depth/normal or secondary-ray results. In a 320×240 diagnostic frame of
+NURBS parts, 94% of Newton calls finished in two or three iterations, and 86% of fallback entries
+were grazing cases after Newton converged. The fallback's 13,053 projection evaluations were
+24% of the counted Newton-plus-projection evaluations; this is a work count, not a GPU-time share.

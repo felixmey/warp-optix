@@ -16,6 +16,7 @@ and the face index. The hit kind is 1 when the ray leaves a solid through the fa
 
 from __future__ import annotations
 
+import os
 from typing import Any, cast
 
 import numpy as np
@@ -24,6 +25,27 @@ import warp as wp
 from . import trim_grid
 from .loader import CONE, FLAG_FLIP, FLAG_SOLID, FLAG_SWAP, FLAG_TRIMMED, PLANE, SPHERE, TORUS
 
+# Read once before kernel compilation. Disabled builds contain no diagnostic atomics.
+DIAGNOSTICS = os.environ.get("WARP_OPTIX_BREP_DIAGNOSTICS") == "1"
+DIAGNOSTIC_NAMES = (
+    "aabb_candidates",
+    "hull_rejects",
+    "shell_candidates",
+    "newton_calls",
+    "newton_iterations",
+    "newton_failures",
+    "fallback_entries",
+    "root_searches",
+    "projection_calls",
+    "projection_evaluations",
+    "newton_last_iteration_failures",
+    "newton_singular_exits",
+    "newton_domain_exits",
+    "fallback_nonconverged",
+    "fallback_grazing",
+    *tuple(f"newton_iterations_{i}" for i in range(1, 11)),
+    "projection_stalled",
+)
 NEWTON_ITERATIONS = 10
 # Below this |cos| between the ray and the surface, a ray can cross a flat sub-patch twice: there,
 # the nearest crossing is isolated along the ray (first_root) instead of trusting Newton's root.
@@ -85,6 +107,13 @@ class BrepData:
     # patch parameters (s, t) at the corners of one shell's triangles (the same for every shell).
     proxy_prim: wp.array[wp.int32]
     shell_st: wp.array[wp.vec2]
+    diagnostic_counts: wp.array2d[wp.uint64]  # per primitive; empty when diagnostics are disabled
+
+
+@wp.func
+def diagnostic_add(brep: BrepData, prim: int, metric: int, count: int):
+    if wp.static(DIAGNOSTICS):
+        wp.atomic_add(brep.diagnostic_counts, prim, metric, wp.uint64(count))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -898,17 +927,21 @@ def hull_misses(hull: Hull, tol: float) -> bool:
 
 
 @wp.func
-def newton(patch: Any, cvs: wp.array[wp.vec4], ray: PatchRay, tol: float, seed: wp.vec2):
+def newton(patch: Any, brep: BrepData, prim: int, ray: PatchRay, tol: float, seed: wp.vec2):
     """Newton on the two-plane form of the ray (Martin et al. 2000) from ``seed``.
 
     Returns (converged, converged inside the patch, (s, t), S, S_s, S_t).
     """
+    cvs = brep.cvs
+    iterations = int(0)
     st = seed
     converged = bool(False)
     point = wp.vec3(0.0)
     ds = wp.vec3(0.0)
     dt = wp.vec3(0.0)
     for _ in range(NEWTON_ITERATIONS):
+        if wp.static(DIAGNOSTICS):
+            iterations += 1
         point, ds, dt = eval_patch(patch, cvs, st[0], st[1])
         rel = point - ray.near
         f0 = wp.dot(ray.n1, rel)
@@ -920,6 +953,7 @@ def newton(patch: Any, cvs: wp.array[wp.vec4], ray: PatchRay, tol: float, seed: 
         j11 = wp.dot(ray.n2, dt)
         det = j00 * j11 - j01 * j10
         if wp.abs(det) < 1.0e-30:
+            diagnostic_add(brep, prim, 11, int(not done))
             converged = done
             break
         inv_det = 1.0 / det
@@ -933,7 +967,14 @@ def newton(patch: Any, cvs: wp.array[wp.vec4], ray: PatchRay, tol: float, seed: 
             point = point - step[0] * ds - step[1] * dt
             break
         if st[0] < -0.5 or st[0] > 1.5 or st[1] < -0.5 or st[1] > 1.5:
+            diagnostic_add(brep, prim, 12, 1)
             break
+    diagnostic_add(brep, prim, 10, int(not converged and iterations == NEWTON_ITERATIONS))
+    if wp.static(DIAGNOSTICS):
+        diagnostic_add(brep, prim, 14 + iterations, 1)
+    diagnostic_add(brep, prim, 3, 1)
+    diagnostic_add(brep, prim, 4, iterations)
+    diagnostic_add(brep, prim, 5, int(not converged))
     return converged, converged and in_square(st), st, point, ds, dt
 
 
@@ -956,11 +997,13 @@ class Foot:
 
 
 @wp.func
-def foot(patch: Any, cvs: wp.array[wp.vec4], ray: PatchRay, t: float, seed: wp.vec2, steps: int) -> Foot:
+def foot(patch: Any, brep: BrepData, prim: int, ray: PatchRay, t: float, seed: wp.vec2, steps: int) -> Foot:
     """Project the ray point at ``t`` onto the patch (Gauss-Newton from ``seed``). Unlike the
     two-plane Newton, whose Jacobian vanishes as the ray turns tangent, the projection stays well
     conditioned where a ray grazes the surface. One evaluation site (a ``while`` loop does not
     unroll): this runs inside first_root's loop, and code size costs instruction cache."""
+    cvs = brep.cvs
+    diagnostic_add(brep, prim, 8, 1)
     q = ray.near + (t - ray.shift) * ray.direction
     st = seed
     point = wp.vec3(0.0)
@@ -968,6 +1011,7 @@ def foot(patch: Any, cvs: wp.array[wp.vec4], ray: PatchRay, t: float, seed: wp.v
     dt = wp.vec3(0.0)
     k = int(0)
     while k <= steps:
+        diagnostic_add(brep, prim, 9, 1)
         point, ds, dt = eval_patch(patch, cvs, st[0], st[1])
         if k == steps:
             break
@@ -981,7 +1025,13 @@ def foot(patch: Any, cvs: wp.array[wp.vec4], ray: PatchRay, t: float, seed: wp.v
         b0 = wp.dot(ds, r)
         b1 = wp.dot(dt, r)
         step = wp.vec2((a11 * b0 - a01 * b1) / det, (a00 * b1 - a01 * b0) / det)
-        st = wp.vec2(wp.clamp(st[0] + step[0], -0.5, 1.5), wp.clamp(st[1] + step[1], -0.5, 1.5))
+        updated = wp.vec2(wp.clamp(st[0] + step[0], -0.5, 1.5), wp.clamp(st[1] + step[1], -0.5, 1.5))
+        # Clamping or rounding can leave the parameters unchanged. The next evaluation and
+        # update would repeat exactly, so retain the point/partials already evaluated here.
+        if updated[0] == st[0] and updated[1] == st[1]:
+            diagnostic_add(brep, prim, 25, 1)
+            break
+        st = updated
         k += 1
         if wp.abs(step[0]) + wp.abs(step[1]) < 1.0e-6:
             k = steps  # converged: evaluate at the new point and stop
@@ -1026,7 +1076,7 @@ def root_foot(ray: PatchRay, st: wp.vec2, point: wp.vec3, ds: wp.vec3, dt: wp.ve
 
 @wp.func
 def first_root(
-    patch: Any, cvs: wp.array[wp.vec4], ray: PatchRay, tol: float, t0: float, t1: float, r: Foot, known: bool
+    patch: Any, brep: BrepData, prim: int, ray: PatchRay, tol: float, t0: float, t1: float, r: Foot, known: bool
 ):
     """The ray's nearest crossing of the (extended) sub-patch with t in [t0, t1]: (found, Foot).
 
@@ -1052,7 +1102,7 @@ def first_root(
     ahead = known and r.t >= t0
     while probes < 14:
         probes += 1
-        m = foot(patch, cvs, ray, t, st, 2)
+        m = foot(patch, brep, prim, ray, t, st, 2)
         st = m.st
         if phase == 0:
             if wp.abs(m.h) < tol:
@@ -1125,7 +1175,7 @@ def first_root(
 
 @wp.func
 def square_root(
-    patch: Any, cvs: wp.array[wp.vec4], ray: PatchRay, tol: float, t0: float, t1: float, r: Foot, known: bool
+    patch: Any, brep: BrepData, prim: int, ray: PatchRay, tol: float, t0: float, t1: float, r: Foot, known: bool
 ):
     """The ray's nearest crossing of the sub-patch itself (its square) with t in [t0, t1]: a nearer
     crossing of its extension (a neighbor's part of the surface) is skipped."""
@@ -1135,7 +1185,7 @@ def square_root(
     searches = int(0)
     while searches < 3 and t < t1:
         searches += 1
-        found, f = first_root(patch, cvs, ray, tol, t, t1, root, have)
+        found, f = first_root(patch, brep, prim, ray, tol, t, t1, root, have)
         if not found:
             break
         if in_square(f.st):
@@ -1178,11 +1228,13 @@ def report_patch_hit(
 @wp.func
 def intersect_patch(brep: BrepData, prim: int, patch: Any, origin: wp.vec3, direction: wp.vec3):
     """The ray's nearest root with one sub-patch inside the face's trims (OptiX keeps the nearest)."""
+    diagnostic_add(brep, prim, 0, 1)
     tol = brep.prim_tol[prim]
     ray = patch_ray(origin, direction, first_point(patch, brep.cvs))
     hull = patch_hull(patch, brep.cvs, ray)
     t_lo = hull_tmin(hull, ray, tol)
     if hull_misses(hull, tol) or t_lo > wp.optix_get_ray_tmax():
+        diagnostic_add(brep, prim, 1, 1)
         return  # no hit, or none nearer than the closest hit so far
     # The first seed is the control point nearest the ray: control point (i, j) of a Bezier patch
     # sits at about parameter (i / p, j / q).
@@ -1191,7 +1243,7 @@ def intersect_patch(brep: BrepData, prim: int, patch: Any, origin: wp.vec3, dire
         float(hull.closest_index // (deg[1] + 1)) / float(wp.max(deg[0], 1)),
         float(hull.closest_index % (deg[1] + 1)) / float(wp.max(deg[1], 1)),
     )
-    converged, ok, st, point, ds, dt = newton(patch, brep.cvs, ray, tol, seed)
+    converged, ok, st, point, ds, dt = newton(patch, brep, prim, ray, tol, seed)
     # A ray meeting a flat sub-patch squarely crosses it once: Newton's root (or the neighbor's, if
     # it converged outside the square) is the only one.
     if converged and wp.abs(outward_cosine(brep, prim, ds, dt, ray.unit)) >= GRAZING_COS:
@@ -1201,6 +1253,9 @@ def intersect_patch(brep: BrepData, prim: int, patch: Any, origin: wp.vec3, dire
     # Grazing, or Newton failed: near a silhouette or a fold the ray crosses the patch twice (and a
     # bounce ray leaving a concave surface crosses it again), where Newton converges to the wrong
     # root or not at all. Isolate the nearest crossing ahead along the ray instead.
+    diagnostic_add(brep, prim, 6, 1)
+    diagnostic_add(brep, prim, 13, int(not converged))
+    diagnostic_add(brep, prim, 14, int(converged))
     root = root_foot(ray, st, point, ds, dt)
     if not converged:
         root.st = wp.vec2(0.5, 0.5)
@@ -1210,7 +1265,8 @@ def intersect_patch(brep: BrepData, prim: int, patch: Any, origin: wp.vec3, dire
     searches = int(0)
     while searches < 2:  # the nearest crossing, then the next if the trims cut the first away
         searches += 1
-        found, f = square_root(patch, brep.cvs, ray, tol, t0, t1, root, known)
+        diagnostic_add(brep, prim, 7, 1)
+        found, f = square_root(patch, brep, prim, ray, tol, t0, t1, root, known)
         if not found:
             return
         rect = brep.prim_uv[prim]
@@ -1257,6 +1313,7 @@ def proxy_hit(brep: BrepData, tri: int, local: int, bary: wp.vec2, origin: wp.ve
     hit must not end the ray's search: the any-hit records it but ignores the intersection).
     """
     prim = brep.proxy_prim[tri]
+    diagnostic_add(brep, prim, 2, 1)
     corner = 3 * (local % (brep.shell_st.shape[0] // 3))
     seed = (
         (1.0 - bary[0] - bary[1]) * brep.shell_st[corner]
@@ -1267,7 +1324,7 @@ def proxy_hit(brep: BrepData, tri: int, local: int, bary: wp.vec2, origin: wp.ve
     tol = brep.prim_tol[prim]
     ray = patch_ray(origin, direction, first_point(patch, brep.cvs))
     converged, ok, st, point, ds, dt = newton(
-        patch, brep.cvs, ray, tol, wp.vec2(wp.clamp(seed[0], 0.0, 1.0), wp.clamp(seed[1], 0.0, 1.0))
+        patch, brep, prim, ray, tol, wp.vec2(wp.clamp(seed[0], 0.0, 1.0), wp.clamp(seed[1], 0.0, 1.0))
     )
     hit_t = ray_t(ray, point)
     # Grazing, or Newton failed: the ray may cross the patch twice (a silhouette, a fold, or a bounce
@@ -1278,6 +1335,9 @@ def proxy_hit(brep: BrepData, tri: int, local: int, bary: wp.vec2, origin: wp.ve
     # Newton's root ahead crossed the other way, meets that root first (h has at most one extremum
     # in between); a ray leaving through a layer crossed the patch before it, if at all.
     if not converged or wp.abs(outward_cosine(brep, prim, ds, dt, ray.unit)) < GRAZING_COS:
+        diagnostic_add(brep, prim, 6, 1)
+        diagnostic_add(brep, prim, 13, int(not converged))
+        diagnostic_add(brep, prim, 14, int(converged))
         layer = local % (brep.shell_st.shape[0] // 3)
         side = wp.where(layer < SHELL_LAYER_TRIANGLES, 1.0, wp.where(layer < 2 * SHELL_LAYER_TRIANGLES, -1.0, 0.0))
         entering = wp.optix_is_front_face_hit()
@@ -1300,8 +1360,9 @@ def proxy_hit(brep: BrepData, tri: int, local: int, bary: wp.vec2, origin: wp.ve
                 t1 = t_lo  # the ray passes beside the patch (mostly side-wall crossings near a neighbor)
             if not entering and side != 0.0:
                 t1 = wp.min(t1, wp.optix_get_ray_tmax())  # leaving: its crossings lie before t_tri
+            diagnostic_add(brep, prim, 7, 1)
             found, f = square_root(
-                patch, brep.cvs, ray, tol, wp.max(t_lo, wp.optix_get_ray_tmin()), t1, root, converged
+                patch, brep, prim, ray, tol, wp.max(t_lo, wp.optix_get_ray_tmin()), t1, root, converged
             )
             ok = found
             st = f.st
@@ -1378,7 +1439,7 @@ def pack(prims, device, proxies=None):
     """
     face_base = prim_base = cv_base = seg_base = slab_base = slab_seg_base = tri_base = 0
     cell_base = member_base = 0
-    cat = {k: [] for k in cast(Any, BrepData).vars if k != "prims"}
+    cat = {k: [] for k in cast(Any, BrepData).vars if k not in ("prims", "diagnostic_counts")}
     record_fields = ("origin", "x", "y", "axis", "params", "range", "period", "flags", "grid", "grid_map")
     faces = {k: [] for k in record_fields}  # per face, expanded to its primitives below
     prim_kind, prim_face = [], []
@@ -1429,6 +1490,9 @@ def pack(prims, device, proxies=None):
 
     cat["shell_st"].append(SHELL_ST.reshape(-1, 2))
     data = BrepData()
+    data.diagnostic_counts = wp.zeros(
+        (prim_base if DIAGNOSTICS else 0, len(DIAGNOSTIC_NAMES)), dtype=wp.uint64, device=device
+    )
     records = np.zeros(max(prim_base, 1), dtype=cast(Any, Surface).numpy_dtype())
     if prim_base:
         face = np.concatenate(prim_face)

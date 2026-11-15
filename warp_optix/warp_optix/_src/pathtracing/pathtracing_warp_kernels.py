@@ -1863,13 +1863,8 @@ def _build_tangent_frame(n: wp.vec3) -> wp.mat33:
 
 @wp.func
 def _direction_coherence(d: wp.vec3) -> wp.uint32:
-    """Coherence hint for a bounce ray: its direction octant and a 4x4 bin within it."""
-    a = wp.abs(d)
-    s = a[0] + a[1] + a[2] + 1.0e-30
-    u = wp.clamp(int(a[0] / s * 4.0), 0, 3)
-    v = wp.clamp(int(a[1] / s * 4.0), 0, 3)
-    octant = int(d[0] > 0.0) | (int(d[1] > 0.0) << 1) | (int(d[2] > 0.0) << 2)
-    return wp.uint32((octant << 4) | (u << 2) | v)
+    """Group bounce rays by direction octant without fragmenting groups into small bins."""
+    return wp.uint32(int(d[0] > 0.0) | (int(d[1] > 0.0) << 1) | (int(d[2] > 0.0) << 2))
 
 
 # Camera rays and rays from offset surface points (_offset_ray moves an origin off the surface,
@@ -3252,6 +3247,50 @@ def _make_primary_raygen(reorder_bounces: bool):
         # pbrMat.emissive was already set to emissive*psrThroughput + psrDirectRadiance on line 391).
         direct_lum = psr_direct_radiance + emissive_tinted
 
+        # Write primary-surface guides before tracing bounces so they do not stay live across SER.
+        # Normal-incidence specular reflectance for the debug output.
+        guide_f0 = _mul_vec3(
+            _material_f0(
+                guide_pbr.diffuse,
+                guide_pbr.specular,
+                guide_pbr.specular_scalar,
+                guide_pbr.metallic,
+                guide_pbr.ior1,
+                guide_pbr.ior2,
+                guide_pbr.clearcoat,
+            ),
+            psr_throughput,
+        )
+        aux_specular_albedo = wp.vec4(guide_f0[0], guide_f0[1], guide_f0[2], 0.0)
+        params.normal_roughness_output[y, x] = aux_normal_roughness
+        params.motion_output[y, x] = aux_motion
+        params.depth_output[y, x] = aux_view_z
+        params.diffuse_output[y, x] = aux_diffuse_albedo
+        params.specular_output[y, x] = aux_specular_albedo
+        primary_opacity = pbr_mat.opacity
+        primary_debug = wp.vec3(0.0)
+        if params.output_mode == 2:  # DEPTH
+            depth_vis = 0.0 if aux_view_z >= MISS_DISTANCE else wp.exp(-0.075 * aux_view_z)
+            primary_debug = wp.vec3(depth_vis, depth_vis, depth_vis)
+        elif params.output_mode == 3:  # MOTION
+            primary_debug = wp.vec3(
+                wp.clamp(0.5 + aux_motion[0] * 8.0, 0.0, 1.0),
+                wp.clamp(0.5 + aux_motion[1] * 8.0, 0.0, 1.0),
+                0.0,
+            )
+        elif params.output_mode == 4:  # NORMAL
+            primary_debug = wp.vec3(
+                0.5 * (world_normal[0] + 1.0),
+                0.5 * (world_normal[1] + 1.0),
+                0.5 * (world_normal[2] + 1.0),
+            )
+        elif params.output_mode == 5:  # ROUGHNESS
+            primary_debug = wp.vec3(aux_normal_roughness[3], aux_normal_roughness[3], aux_normal_roughness[3])
+        elif params.output_mode == 6:  # DIFFUSE
+            primary_debug = base_color
+        elif params.output_mode == 7:  # SPECULAR (viewer uses metallic visualization)
+            primary_debug = wp.vec3(pbr_mat.metallic, pbr_mat.metallic, pbr_mat.metallic)
+
         # Step 3 - Indirect contribution (path tracing from primary surface).
         radiance = hdr_radiance
         path_length = wp.float32(0.0)
@@ -3313,10 +3352,10 @@ def _make_primary_raygen(reorder_bounces: bool):
             if bsdf_absorbed:
                 break
 
-            sec_payload = _init_primary_payload()
             if wp.static(reorder_bounces):
                 wp.optix_make_nop_hit_object()
-                wp.optix_reorder(_direction_coherence(sec_direction), wp.uint32(7))
+                wp.optix_reorder(_direction_coherence(sec_direction), wp.uint32(3))
+            sec_payload = _init_primary_payload()
             wp.optix_trace(
                 params.tlas,
                 sec_origin,
@@ -3550,20 +3589,6 @@ def _make_primary_raygen(reorder_bounces: bool):
             if not completed_thick_exit:
                 depth = depth + wp.int32(1)
 
-        # Normal-incidence specular reflectance for the debug output.
-        guide_f0 = _mul_vec3(
-            _material_f0(
-                guide_pbr.diffuse,
-                guide_pbr.specular,
-                guide_pbr.specular_scalar,
-                guide_pbr.metallic,
-                guide_pbr.ior1,
-                guide_pbr.ior2,
-                guide_pbr.clearcoat,
-            ),
-            psr_throughput,
-        )
-        aux_specular_albedo = wp.vec4(guide_f0[0], guide_f0[1], guide_f0[2], 0.0)
         aux_spec_hit_dist = path_length
 
         # Guard against NaN/Inf (matches C++ lines 688-693).
@@ -3575,37 +3600,13 @@ def _make_primary_raygen(reorder_bounces: bool):
 
         # Debug visualization modes (matches C++ outputMode enums).
         out_color = color
-        if params.output_mode == 2:  # DEPTH
-            depth_vis = 0.0 if aux_view_z >= MISS_DISTANCE else wp.exp(-0.075 * aux_view_z)
-            out_color = wp.vec3(depth_vis, depth_vis, depth_vis)
-        elif params.output_mode == 3:  # MOTION
-            out_color = wp.vec3(
-                wp.clamp(0.5 + aux_motion[0] * 8.0, 0.0, 1.0),
-                wp.clamp(0.5 + aux_motion[1] * 8.0, 0.0, 1.0),
-                0.0,
-            )
-        elif params.output_mode == 4:  # NORMAL
-            out_color = wp.vec3(
-                0.5 * (world_normal[0] + 1.0),
-                0.5 * (world_normal[1] + 1.0),
-                0.5 * (world_normal[2] + 1.0),
-            )
-        elif params.output_mode == 5:  # ROUGHNESS
-            out_color = wp.vec3(aux_normal_roughness[3], aux_normal_roughness[3], aux_normal_roughness[3])
-        elif params.output_mode == 6:  # DIFFUSE
-            out_color = base_color
-        elif params.output_mode == 7:  # SPECULAR (viewer uses metallic visualization)
-            out_color = wp.vec3(pbr_mat.metallic, pbr_mat.metallic, pbr_mat.metallic)
+        if params.output_mode >= 2 and params.output_mode <= 7:
+            out_color = primary_debug
         elif params.output_mode == 8:  # SPEC_HITDIST
             vis = 1.0 - wp.exp(-0.05 * wp.max(aux_spec_hit_dist, 0.0))
             out_color = wp.vec3(vis, vis, vis)
 
-        params.color_output[y, x] = wp.vec4(out_color[0], out_color[1], out_color[2], pbr_mat.opacity)
-        params.normal_roughness_output[y, x] = aux_normal_roughness
-        params.motion_output[y, x] = aux_motion
-        params.depth_output[y, x] = aux_view_z
-        params.diffuse_output[y, x] = aux_diffuse_albedo
-        params.specular_output[y, x] = aux_specular_albedo
+        params.color_output[y, x] = wp.vec4(out_color[0], out_color[1], out_color[2], primary_opacity)
         params.spec_hit_dist_output[y, x] = aux_spec_hit_dist
 
     return primary_raygen

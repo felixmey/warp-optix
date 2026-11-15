@@ -215,3 +215,67 @@ def test_trimmed_torus_sheet_hit_and_normal(tmp_path, monkeypatch, major, minor,
     if data.face_flags[0] & loader.FLAG_FLIP:
         normal = -normal
     np.testing.assert_allclose(out[1].numpy()[0, 0], normal, atol=2e-4)
+
+
+@pytest.mark.gpu
+def test_nurbs_diagnostic_accounting(tmp_path, monkeypatch):
+    """Exercise both builds by also running with WARP_OPTIX_BREP_DIAGNOSTICS=1."""
+    if not wp.is_cuda_available():
+        pytest.skip("CUDA unavailable")
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "examples" / "brep"))
+    import brep_optix as bo
+    import example_brep as ex
+
+    path = tmp_path / "dome.usda"
+    _write_nurbs_dome(path)
+    prims = loader.load_stage(str(path))
+    lo, hi = prims[0].prim_bounds[:, :3].min(0), prims[0].prim_bounds[:, 3:].max(0)
+    cam, *_ = bo.orbit_camera((lo + hi) * 0.5, bo.frame_distance(lo, hi), -55, 35, 64, 64, "Y")
+    for proxy in (False, True):
+        scene = bo.BrepScene(prims, "cuda:0", proxy=proxy)
+        out = ex.outputs(64, 64, "cuda:0")
+        scene.render(cam, out)
+        wp.synchronize()
+        counts = scene.data.diagnostic_counts.numpy()
+        if not bd.DIAGNOSTICS:
+            assert counts.shape == (0, len(bd.DIAGNOSTIC_NAMES))
+            continue
+        totals = dict(zip(bd.DIAGNOSTIC_NAMES, map(int, counts.sum(axis=0)), strict=True))
+        assert totals["newton_calls"] > 0
+        assert totals["newton_calls"] <= totals["newton_iterations"] <= 10 * totals["newton_calls"]
+        assert totals["newton_failures"] <= totals["fallback_entries"] <= totals["newton_calls"]
+        assert totals["newton_calls"] == totals["aabb_candidates"] - totals["hull_rejects"] + totals["shell_candidates"]
+        histogram = [totals[f"newton_iterations_{i}"] for i in range(1, 11)]
+        assert sum(histogram) == totals["newton_calls"]
+        assert sum((i + 1) * count for i, count in enumerate(histogram)) == totals["newton_iterations"]
+        assert totals["fallback_grazing"] + totals["fallback_nonconverged"] == totals["fallback_entries"]
+        assert totals["fallback_nonconverged"] == totals["newton_failures"]
+        assert totals["projection_calls"] <= totals["projection_evaluations"] <= 3 * totals["projection_calls"]
+        assert np.isfinite(out[0].numpy()).all()
+
+
+@wp.kernel(enable_backward=False)
+def _project_clamped_plane(brep: bd.BrepData, result: wp.array[wp.vec4]):
+    patch = bd.load_cubic(brep.cvs, 0)
+    ray = bd.patch_ray(wp.vec3(5.0, 0.2, 5.0), wp.vec3(0.0, -1.0, 0.0), wp.vec3(-1.0, 0.0, -1.0))
+    f = bd.foot(patch, brep, 0, ray, 0.0, wp.vec2(1.5), 2)
+    result[0] = wp.vec4(f.st[0], f.st[1], f.h, f.g)
+
+
+@pytest.mark.gpu
+def test_projection_stops_at_unchanged_clamped_parameters():
+    if not wp.is_cuda_available():
+        pytest.skip("CUDA unavailable")
+    # Affine x/z plane. The unconstrained projection lies beyond the extended square;
+    # starting on its clamped corner must preserve that corner and its exact plane normal.
+    grid = np.linspace(-1, 1, 4)
+    cvs = np.array([[x, 0, z, 1] for x in grid for z in grid], dtype=np.float32)
+    brep = bd.BrepData()
+    brep.cvs = wp.array(cvs, dtype=wp.vec4, device="cuda:0")
+    brep.diagnostic_counts = wp.zeros((1, len(bd.DIAGNOSTIC_NAMES)), dtype=wp.uint64, device="cuda:0")
+    result = wp.empty(1, dtype=wp.vec4, device="cuda:0")
+    wp.launch(_project_clamped_plane, 1, [brep, result], device="cuda:0")
+    np.testing.assert_allclose(result.numpy()[0], [1.5, 1.5, -0.2, 1.0], rtol=1e-6, atol=1e-6)
+    if bd.DIAGNOSTICS:
+        counts = dict(zip(bd.DIAGNOSTIC_NAMES, map(int, brep.diagnostic_counts.numpy()[0]), strict=True))
+        assert counts["projection_calls"] == counts["projection_evaluations"] == counts["projection_stalled"] == 1
