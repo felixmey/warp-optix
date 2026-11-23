@@ -4152,12 +4152,28 @@ def brep_primary_closest_hit(params: PathtraceLaunchParams):
 
 @wp.func
 def _brep_shell_hit(params: PathtraceLaunchParams):
-    """Exact hit behind the crossed shell triangle: its render primitive's position offset holds
-    the geometry's first shell triangle in ``params.brep``."""
+    """Exact hit behind the crossed shell triangle of a bicubic patch: its render primitive's
+    position offset holds the geometry's first shell triangle in ``params.brep``."""
     inst_id = int(wp.optix_get_instance_id())
     primitive_id = int(wp.optix_get_primitive_index())
     rp = params.render_primitives[int(params.instance_render_prim_ids[inst_id])]
-    return brep_device.proxy_hit(
+    return brep_device.proxy_hit_cubic(
+        params.brep,
+        int(rp.vertex_buffer.position_offset) + primitive_id,
+        primitive_id,
+        wp.optix_get_triangle_barycentrics(),
+        wp.optix_get_object_ray_origin(),
+        wp.optix_get_object_ray_direction(),
+    )
+
+
+@wp.func
+def _brep_shell_generic_hit(params: PathtraceLaunchParams):
+    """_brep_shell_hit for the shell of a sub-patch of another degree (hit group "brep_shell_generic")."""
+    inst_id = int(wp.optix_get_instance_id())
+    primitive_id = int(wp.optix_get_primitive_index())
+    rp = params.render_primitives[int(params.instance_render_prim_ids[inst_id])]
+    return brep_device.proxy_hit_bezier(
         params.brep,
         int(rp.vertex_buffer.position_offset) + primitive_id,
         primitive_id,
@@ -4181,10 +4197,18 @@ def _brep_shell_closed(params: PathtraceLaunchParams) -> wp.bool:
     return _brep_closed(params, int(params.brep.proxy_prim[tri]))
 
 
-@wo.kernel(kind=wo.ProgramKind.ANY_HIT)
-@wp.kernel(module="unique")
-def brep_shell_any_hit(params: PathtraceLaunchParams):
-    """Refine a shell crossing to the exact BRep surface and record the nearest exact hit.
+@wp.func
+def _brep_shell_record(
+    params: PathtraceLaunchParams,
+    ok: bool,
+    hit_t: float,
+    u: float,
+    v: float,
+    n_obj: wp.vec3,
+    face: int,
+    keep_searching: bool,
+):
+    """Record a shell crossing refined to the exact BRep surface: keep the nearest exact hit.
 
     OptiX orders candidates by the shell triangle's t, and a shell can reach in front of another
     surface (thin walls). So the payload keeps the nearest exact hit, and hits that may hide a
@@ -4192,7 +4216,6 @@ def brep_shell_any_hit(params: PathtraceLaunchParams):
     traversal continues until a triangle at or beyond an exact hit can safely bound the search.
     The miss and closest-hit programs keep a recorded hit that is nearer than theirs.
     """
-    ok, hit_t, u, v, n_obj, face, keep_searching = _brep_shell_hit(params)
     if not ok:
         wp.optix_ignore_intersection()
         return
@@ -4214,6 +4237,22 @@ def brep_shell_any_hit(params: PathtraceLaunchParams):
         wp.optix_ignore_intersection()
 
 
+@wo.kernel(kind=wo.ProgramKind.ANY_HIT)
+@wp.kernel(module="unique")
+def brep_shell_any_hit(params: PathtraceLaunchParams):
+    """Refine a bicubic patch's shell crossing to the exact surface (see _brep_shell_record)."""
+    ok, hit_t, u, v, n_obj, face, keep_searching = _brep_shell_hit(params)
+    _brep_shell_record(params, ok, hit_t, u, v, n_obj, face, keep_searching)
+
+
+@wo.kernel(kind=wo.ProgramKind.ANY_HIT)
+@wp.kernel(module="unique")
+def brep_shell_generic_any_hit(params: PathtraceLaunchParams):
+    """brep_shell_any_hit for the shells of sub-patches of other degrees."""
+    ok, hit_t, u, v, n_obj, face, keep_searching = _brep_shell_generic_hit(params)
+    _brep_shell_record(params, ok, hit_t, u, v, n_obj, face, keep_searching)
+
+
 @wo.kernel(kind=wo.ProgramKind.CLOSEST_HIT)
 @wp.kernel(module="unique")
 def brep_shell_closest_hit(params: PathtraceLaunchParams):
@@ -4226,6 +4265,17 @@ def brep_shell_closest_hit(params: PathtraceLaunchParams):
 def brep_shell_secondary_any_hit(params: PathtraceLaunchParams):
     """Shadow rays: occluded only where the ray really crosses the exact BRep surface."""
     ok, hit_t, u, v, n_obj, face, keep_searching = _brep_shell_hit(params)
+    if not ok:
+        wp.optix_ignore_intersection()
+        return
+    _secondary_any_hit(params)
+
+
+@wo.kernel(kind=wo.ProgramKind.ANY_HIT)
+@wp.kernel(module="unique")
+def brep_shell_generic_secondary_any_hit(params: PathtraceLaunchParams):
+    """brep_shell_secondary_any_hit for the shells of sub-patches of other degrees."""
+    ok, hit_t, u, v, n_obj, face, keep_searching = _brep_shell_generic_hit(params)
     if not ok:
         wp.optix_ignore_intersection()
         return
@@ -4340,6 +4390,11 @@ SBT = wo.SbtLayout(
         "brep_shell": {
             "primary": wo.HitGroup(brep_shell_closest_hit, brep_shell_any_hit),
             "secondary": wo.HitGroup(secondary_closest_hit, brep_shell_secondary_any_hit),
+        },
+        # Must follow "brep_shell": a shell triangle's SBT index 1 selects it (non-bicubic patches).
+        "brep_shell_generic": {
+            "primary": wo.HitGroup(brep_shell_closest_hit, brep_shell_generic_any_hit),
+            "secondary": wo.HitGroup(secondary_closest_hit, brep_shell_generic_secondary_any_hit),
         },
     },
 )

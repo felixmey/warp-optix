@@ -54,6 +54,16 @@ def test_invalid_build_inputs_are_rejected():
     with pytest.raises(ValueError, match="curve PrimitiveType"):
         wo.curves(vertices, widths, last_quadratic, curve_type=wo.PrimitiveType.TRIANGLE)
 
+    # Per-triangle SBT indices select among the given flags' records.
+    quad = wp.array([0, 1, 2, 0, 2, 3], dtype=wp.int32, device="cuda")
+    two = [wo.GeometryFlags.NONE, wo.GeometryFlags.NONE]
+    wo.triangles(vertices, quad, flags=two, sbt_indices=wp.array([0, 1], dtype=wp.uint32, device="cuda"))
+    for sbt, flags in (([0, 2], two), ([0], two), ([0, 1], wo.GeometryFlags.NONE)):
+        with pytest.raises(ValueError, match="sbt_indices|indices"):
+            wo.triangles(vertices, quad, flags=flags, sbt_indices=wp.array(sbt, dtype=wp.uint32, device="cuda"))
+    with pytest.raises(ValueError, match="sbt_indices"):
+        wo.triangles(vertices, quad, flags=two, sbt_indices=wp.array([0, 1], dtype=wp.int32, device="cuda"))
+
     lowers = wp.zeros(2, dtype=wp.vec3, device="cuda")
     uppers = wp.ones(2, dtype=wp.vec3, device="cuda")
     with pytest.raises(ValueError, match="lowers and uppers"):

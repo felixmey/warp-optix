@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Triangle shells around bicubic BRep sub-patches, for hardware-traversed exact intersection.
+"""Triangle shells around rational Bezier BRep sub-patches, for hardware-traversed exact intersection.
 
-Each bicubic rational Bezier sub-patch gets a closed shell of triangles that encloses it: the
+Each rational Bezier sub-patch (degree <= 7) gets a closed shell of triangles that encloses it: the
 patch evaluated on a grid, offset outward and inward along the surface normal by more than the
 grid's deviation from the surface, joined by side walls along the patch edges. A ray that reaches
 the surface must cross the shell first, so the RT cores find candidates with hardware triangle
@@ -19,11 +19,12 @@ them for all patches.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import warp as wp
 
-from .device import SHELL_LAYER_TRIANGLES, eval_cubic, load_cubic
+from .device import MAX_ORDER, SHELL_LAYER_TRIANGLES, Bezier, eval_patch, load_cubic
 from .loader import NURBS, BrepPrim
 
 # Shell cells along each patch direction. The shell is offset by twice the grid's deviation from the
@@ -71,17 +72,14 @@ def _node(k: int, count: int, lo: float, span: float) -> wp.vec2:
     return wp.vec2(lo + step * float(k // count), lo + step * float(k % count))
 
 
-@wp.kernel(enable_backward=False)
-def _shell_vertices(cvs: wp.array[wp.vec4], patch_cv: wp.array[wp.int32], vertices: wp.array2d[wp.vec3]):
-    """Both layers of patch p's shell: vertices[p, :NODES] outer, vertices[p, NODES:] inner."""
-    p = wp.tid()
-    c = load_cubic(cvs, patch_cv[p])
-    # Evaluate relative to the first control point: in float32, the deviation of the surface from
-    # the grid then keeps its digits instead of cancelling against the patch's position.
-    o = wp.vec3(c.x[0, 0], c.y[0, 0], c.z[0, 0]) / c.w[0, 0]
-    c.x = c.x - o[0] * c.w
-    c.y = c.y - o[1] * c.w
-    c.z = c.z - o[2] * c.w
+@wp.func
+def _shell(patch: Any, cvs: wp.array[wp.vec4], o: wp.vec3, p: int, vertices: wp.array2d[wp.vec3]):
+    """Both layers of patch p's shell: vertices[p, :NODES] outer, vertices[p, NODES:] inner.
+
+    The patch's control points are relative to ``o``, its first control point: in float32, the
+    deviation of the surface from the grid then keeps its digits instead of cancelling against the
+    patch's position.
+    """
     m = GRID + 1
     span = 1.0 + 2.0 * MARGIN
     average = wp.vec3(0.0)
@@ -90,7 +88,7 @@ def _shell_vertices(cvs: wp.array[wp.vec4], patch_cv: wp.array[wp.int32], vertic
     hi = wp.vec3(-1.0e30)
     for k in range(NODES):
         st = _node(k, m, -MARGIN, span)
-        x, ds, dt = eval_cubic(c, st[0], st[1])
+        x, ds, dt = eval_patch(patch, cvs, st[0], st[1])
         n = wp.cross(ds, dt)
         average += n
         longest = wp.max(longest, wp.length(n))
@@ -102,7 +100,7 @@ def _shell_vertices(cvs: wp.array[wp.vec4], patch_cv: wp.array[wp.int32], vertic
     fine = GRID * OVERSAMPLE + 1
     for k in range(fine * fine):
         f = _node(k, fine, 0.0, 1.0)
-        x, ds, dt = eval_cubic(c, -MARGIN + span * f[0], -MARGIN + span * f[1])
+        x, ds, dt = eval_patch(patch, cvs, -MARGIN + span * f[0], -MARGIN + span * f[1])
         ci = wp.min(int(f[0] * float(GRID)), GRID - 1)
         cj = wp.min(int(f[1] * float(GRID)), GRID - 1)
         a = f[0] * float(GRID) - float(ci)
@@ -124,7 +122,7 @@ def _shell_vertices(cvs: wp.array[wp.vec4], patch_cv: wp.array[wp.int32], vertic
     average = average / (wp.length(average) + 1.0e-30)
     for k in range(NODES):
         st = _node(k, m, -MARGIN, span)
-        x, ds, dt = eval_cubic(c, st[0], st[1])
+        x, ds, dt = eval_patch(patch, cvs, st[0], st[1])
         n = wp.cross(ds, dt)
         length = wp.length(n)
         if length > 1.0e-12 * longest:
@@ -133,6 +131,26 @@ def _shell_vertices(cvs: wp.array[wp.vec4], patch_cv: wp.array[wp.int32], vertic
             n = average
         vertices[p, k] = o + x + offset * n
         vertices[p, NODES + k] = o + x - offset * n
+
+
+@wp.kernel(enable_backward=False)
+def _shell_vertices(
+    cvs: wp.array[wp.vec4],
+    patch_cv: wp.array[wp.int32],
+    patch_degree: wp.array[wp.vec2i],
+    patch_origin: wp.array[wp.vec3],
+    vertices: wp.array2d[wp.vec3],
+):
+    """Shell vertices of every patch; ``cvs`` are relative to each patch's ``patch_origin``."""
+    p = wp.tid()
+    deg = patch_degree[p]
+    if deg[0] == 3 and deg[1] == 3:
+        _shell(load_cubic(cvs, patch_cv[p]), cvs, patch_origin[p], p, vertices)
+    else:
+        patch = Bezier()
+        patch.base = patch_cv[p]
+        patch.degree = deg
+        _shell(patch, cvs, patch_origin[p], p, vertices)
 
 
 @dataclass
@@ -150,31 +168,57 @@ def empty_proxy() -> Proxy:
 
 
 def build_proxy(prim: BrepPrim, device=None) -> Proxy:
-    """Shells around the prim's bicubic NURBS patches, built on ``device`` (default: Warp's).
+    """Shells around the prim's NURBS sub-patches, built on ``device`` (default: Warp's).
 
     Other primitives keep their AABBs: an analytic face is one cheap closed-form call on its AABB,
     while a shell takes an any-hit call per layer crossed. NURBS shells win (3-11x): they replace
-    several overlapping patch AABBs, each needing Newton, with one well-seeded refinement.
+    several overlapping patch AABBs, each needing Newton, with one well-seeded refinement. That
+    holds for bicubic patches and for higher degrees (quintic springs 1.2x faster than on AABBs),
+    but not for degree (3, 4) patches: their AABB path has a specialized evaluator and rejects
+    most candidates with its oriented bound and convex hull, before Newton (nurbs_parts 14% faster).
     """
-    patches = np.nonzero((prim.prim_kind == NURBS) & np.all(prim.prim_degree == 3, axis=1))[0].astype(np.int32)
+    degree = np.asarray(prim.prim_degree)
+    patches = np.flatnonzero(
+        (prim.prim_kind == NURBS)
+        & np.all((degree >= 1) & (degree < MAX_ORDER), axis=1)
+        & ~np.all(degree == (3, 4), axis=1)
+    ).astype(np.int32)
     if not len(patches):
         return empty_proxy()
     device = wp.get_device(device)
+    # Each patch's control points relative to its first one, shifted in float64 (see _shell).
+    base = prim.prim_cv[patches].astype(np.int64)
+    count = np.prod(prim.prim_degree[patches].astype(np.int64) + 1, axis=1)
+    owner = np.repeat(np.arange(len(patches)), count)
+    index = np.repeat(base - np.cumsum(count) + count, count) + np.arange(count.sum())
+    first = prim.cvs[base].astype(np.float64)
+    origin = (first[:, :3] / first[:, 3:4]).astype(np.float32).astype(np.float64)  # as the kernel adds it
+    cvs = prim.cvs[index].astype(np.float64)
+    cvs[:, :3] -= origin[owner] * cvs[:, 3:4]
     vertices = wp.empty((len(patches), 2 * NODES), dtype=wp.vec3, device=device)
     wp.launch(
         _shell_vertices,
         dim=len(patches),
         inputs=[
-            wp.array(prim.cvs.astype(np.float32), dtype=wp.vec4, device=device),
-            wp.array(prim.prim_cv[patches], dtype=wp.int32, device=device),
+            wp.array(cvs.astype(np.float32), dtype=wp.vec4, device=device),
+            wp.array((np.cumsum(count) - count).astype(np.int32), dtype=wp.int32, device=device),
+            wp.array(prim.prim_degree[patches].astype(np.int32), dtype=wp.vec2i, device=device),
+            wp.array(origin.astype(np.float32), dtype=wp.vec3, device=device),
         ],
         outputs=[vertices],
         device=device,
     )
-    first = 2 * NODES * np.arange(len(patches), dtype=np.uint32)
+    offsets = 2 * NODES * np.arange(len(patches), dtype=np.uint32)
     return Proxy(
         vertices.numpy().reshape(-1, 3),
-        (SHELL_TRIANGLES.astype(np.uint32)[None] + first[:, None, None]).reshape(-1, 3),
+        (SHELL_TRIANGLES.astype(np.uint32)[None] + offsets[:, None, None]).reshape(-1, 3),
         np.repeat(patches, len(SHELL_TRIANGLES)),
         patches,
     )
+
+
+def shell_sbt_indices(prim: BrepPrim, proxy: Proxy) -> np.ndarray:
+    """Per shell triangle, 0 for a bicubic patch's shell and 1 for another degree's: renderers
+    trace the two with separate any-hit programs (see device.proxy_hit_bezier)."""
+    degree = np.asarray(prim.prim_degree)[proxy.tri_prim]
+    return np.any(degree != 3, axis=1).astype(np.uint32)

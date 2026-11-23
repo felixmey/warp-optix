@@ -234,7 +234,7 @@ class BrepScene:
     """GPU scene: one custom-primitive GAS per BrepArray prim, instanced with its USD transform."""
 
     def __init__(self, prims: list[BrepPrim], device=None, proxy: bool = False):
-        """``proxy``: trace bicubic NURBS patches through triangle shells (hardware traversal)."""
+        """``proxy``: trace NURBS sub-patches through triangle shells (hardware traversal)."""
         self.device = wp.get_device(device)
         dev = self.device
         # Placements of one prototype share its arrays: pack and build each prototype once.

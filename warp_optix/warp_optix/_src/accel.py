@@ -200,7 +200,8 @@ def triangles(
     points: wp.array | Sequence[wp.array],
     indices: wp.array,
     *,
-    flags: GeometryFlags = GeometryFlags.DISABLE_ANYHIT,
+    flags: GeometryFlags | Sequence[GeometryFlags] = GeometryFlags.DISABLE_ANYHIT,
+    sbt_indices: wp.array | None = None,
     validate: bool = True,
 ) -> BuildInput:
     """Triangle build input from ``vec3``/``float32[N, 3]`` points and int32/uint32 index triplets.
@@ -208,7 +209,9 @@ def triangles(
     A sequence of point arrays gives one motion key per array. Creating the
     input reads indices back once to validate bounds; pass ``validate=False``
     to skip that synchronization for indices already known to be in range. Keep
-    indices unchanged while reusing the input for builds and refits.
+    indices unchanged while reusing the input for builds and refits. With
+    ``sbt_indices`` (uint32 per triangle), triangle ``i`` uses hit record
+    ``sbt_indices[i]`` and ``flags`` holds one geometry flag per record.
     """
     keys = [points] if isinstance(points, wp.array) else list(points)
     num_vertices = _vertex_count(keys)
@@ -224,9 +227,21 @@ def triangles(
     build_input.indexStrideInBytes = 12
     build_input.numIndexTriplets = indices.size * wp.types.type_size_in_bytes(indices.dtype) // 12
     build_input.indexBuffer = 0 if empty else indices.ptr
-    build_input.flags = [int(flags)]
-    build_input.numSbtRecords = 1
-    return BuildInput(build_input, (*keys, indices))
+    flags = [int(f) for f in flags] if isinstance(flags, Sequence) else [int(flags)]
+    if not flags:
+        raise ValueError("flags must contain at least one SBT record flag")
+    build_input.flags = flags
+    build_input.numSbtRecords = len(flags)
+    if sbt_indices is None:
+        return BuildInput(build_input, (*keys, indices))
+    num_triangles = build_input.numIndexTriplets
+    if sbt_indices.dtype != wp.uint32 or sbt_indices.size != num_triangles:
+        raise ValueError("sbt_indices must contain one uint32 value per triangle")
+    _validate_indices(sbt_indices, len(flags), keys[0].device, bounds=validate)
+    build_input.sbtIndexOffsetBuffer = 0 if empty else sbt_indices.ptr
+    build_input.sbtIndexOffsetSizeInBytes = 4
+    build_input.sbtIndexOffsetStrideInBytes = 4
+    return BuildInput(build_input, (*keys, indices, sbt_indices))
 
 
 @wp.kernel(module="unique", enable_backward=False)

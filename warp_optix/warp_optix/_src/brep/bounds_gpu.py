@@ -22,6 +22,7 @@ def _extend(
     cvs: wp.array[wp.vec4],
     bases: wp.array[int],
     degrees: wp.array[wp.vec2i],
+    records: wp.array[Surface],
     transforms: wp.array3d[wp.float64],
     points: wp.array2d[wp.vec4d],
 ):
@@ -46,7 +47,7 @@ def _extend(
     for j in range(4):
         if not wp.isfinite(h[j]):
             return
-    point = wp.vec3d(h[0], h[1], h[2]) / h[3]
+    point = wp.vec3d(h[0], h[1], h[2]) / h[3] + wp.vec3d(records[prim].anchor)  # cvs are anchor-relative
     # Match the host reference's safe float32 coordinate range.
     if wp.max(wp.abs(point)) > wp.float64(1.0633823332454027e37):
         return
@@ -145,7 +146,7 @@ def build_bounds(data: BrepData, primitive_ids: np.ndarray) -> None:
     wp.launch(
         _extend,
         (len(primitive_ids), 64),
-        [ids, data.cvs, data.prim_cv, data.prim_degree, transforms, points],
+        [ids, data.cvs, data.prim_cv, data.prim_degree, data.prims, transforms, points],
         device=device,
     )
     wp.launch(_fit, len(primitive_ids), [ids, data.prim_degree, data.prim_tol, points, data.prims], device=device)

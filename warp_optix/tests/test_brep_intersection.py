@@ -111,6 +111,154 @@ def test_overlapping_shells_keep_nearest_exact_surface(tmp_path, monkeypatch, re
         assert out[2].numpy()[0, 0] == int(reverse)
 
 
+def _write_quintic_dome(path, offset):
+    """A rational biquintic dome over [-1, 1]^2, its control points shifted by ``offset`` (object
+    space, as in parts modeled in assembly coordinates)."""
+    _write_nurbs_dome(path)
+    stage = Usd.Stage.Open(str(path))
+    prim = stage.GetPrimAtPath("/Dome")
+    grid = np.linspace(-1.0, 1.0, 6)
+    x, z = np.meshgrid(grid, grid, indexing="ij")
+    y = 1.2 * (1.0 - x**2) * (1.0 - z**2) + 0.2 * x * z
+    weights = 1.0 + 0.3 * np.cos(2.0 * x) * np.cos(3.0 * z)
+    points = np.stack([x, y, z], axis=-1).reshape(-1, 3) + np.asarray(offset, dtype=np.float64)
+    prim.GetAttribute("brep:surface:nurb:controlVertices").Set([Gf.Vec3d(*map(float, p)) for p in points])
+    prim.GetAttribute("brep:surface:nurb:weights").Set([float(w) for w in weights.ravel()])
+    for name in ("uVertexCount", "vVertexCount", "uOrder", "vOrder"):
+        prim.GetAttribute(f"brep:surface:nurb:{name}").Set([6])
+    for name in ("uKnots", "vKnots"):
+        prim.GetAttribute(f"brep:surface:nurb:{name}").Set([0.0] * 6 + [1.0] * 6)
+    prim.GetAttribute("brep:extent").Set([Gf.Vec3d(*map(float, points.min(0))), Gf.Vec3d(*map(float, points.max(0)))])
+    stage.GetRootLayer().Save()
+
+
+@pytest.mark.gpu
+def test_patches_far_from_the_origin_intersect_like_near_ones(tmp_path, monkeypatch):
+    """Control points ~600 units out round in float32 more coarsely than the Newton tolerance
+    (1e-5 of a patch): patch math runs relative to each patch's anchor, so Newton still converges,
+    for the custom intersector and for shells around non-bicubic patches alike."""
+    if not wp.is_cuda_available():
+        pytest.skip("CUDA unavailable")
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "examples" / "brep"))
+    import brep_optix as bo
+    import example_brep as ex
+    from warp_optix._src.brep import proxy as brep_proxy  # noqa: PLC0415
+
+    hits, failures = {}, {}
+    for name, offset in (("near", (0.0, 0.0, 0.0)), ("far", (387.0, -512.0, 263.0))):
+        path = tmp_path / f"{name}.usda"
+        _write_quintic_dome(path, offset)
+        prims = loader.load_stage(str(path))
+        (prim,) = prims
+        assert np.all(prim.prim_degree == 5)
+        lo, hi = prim.prim_bounds[:, :3].min(0), prim.prim_bounds[:, 3:].max(0)
+        cam, *_ = bo.orbit_camera((lo + hi) * 0.5, bo.frame_distance(lo, hi), -55, 35, 64, 64, "Y")
+        # The camera rays (as camera_ray builds them), in float64.
+        y, x = np.mgrid[0:64, 0:64]
+        target = (
+            np.array(cam.lower_left, np.float64)
+            + (x[..., None] + 0.5) * np.array(cam.du, np.float64)
+            + (63 - y[..., None] + 0.5) * np.array(cam.dv, np.float64)
+        )
+        origin = np.array(cam.origin, np.float64)
+        direction = (target - origin) / np.linalg.norm(target - origin, axis=-1, keepdims=True)
+        depths = []
+        for shells in (False, True):
+            scene = bo.BrepScene(prims, "cuda:0", proxy=shells)
+            if shells:  # every quintic patch has a shell
+                assert scene.data.proxy_prim.shape[0] == len(prim.prim_kind) * len(brep_proxy.SHELL_TRIANGLES)
+            out = ex.outputs(64, 64, "cuda:0")
+            scene.render(cam, out)
+            wp.synchronize()
+            depth = out[0].numpy().astype(np.float64)
+            depths.append(depth)
+            hit = depth > 0.0
+            hits[name, shells] = int(hit.sum())
+            # Each hit lies on the exact surface (its float64 foot point), well within the shell.
+            points = origin + depth[hit][:, None] * direction[hit]
+            surface = prim.surfaces[0]
+            foot = surface.evaluate(*surface.invert(points).T)
+            assert np.linalg.norm(points - foot, axis=1).max() < 3e-4, (name, shells)
+            if bd.DIAGNOSTICS:
+                counts = scene.data.diagnostic_counts.numpy().sum(0)
+                failures[name, shells] = int(counts[bd.DIAGNOSTIC_NAMES.index("newton_failures")])
+        custom, shell = depths
+        assert ((custom > 0.0) != (shell > 0.0)).sum() <= 2
+        both = (custom > 0.0) & (shell > 0.0)
+        np.testing.assert_allclose(shell[both], custom[both], rtol=0, atol=1e-4)
+    for shells in (False, True):
+        # Same dome, same framing: the far one has no holes (Newton failing on rounding)...
+        assert hits["near", shells] > 0.2 * 64 * 64
+        assert abs(hits["far", shells] - hits["near", shells]) <= 0.002 * hits["near", shells] + 2, hits
+        # ...and Newton fails no more often than near the origin (genuine misses only).
+        if bd.DIAGNOSTICS:
+            assert failures["far", shells] <= 1.5 * failures["near", shells] + 4, failures
+
+
+def _rational_bezier(pw, s, t):
+    """Reference: a rational tensor Bezier patch, (p + 1, q + 1, 4) homogeneous control points."""
+
+    def basis(n, x):
+        return np.stack([math.comb(n, i) * x**i * (1 - x) ** (n - i) for i in range(n + 1)], axis=-1)
+
+    h = np.einsum("ni,nj,ijk->nk", basis(pw.shape[0] - 1, s), basis(pw.shape[1] - 1, t), pw)
+    return h[:, :3] / h[:, 3:]
+
+
+def _quintic_patches(prim):
+    for k in np.flatnonzero(prim.prim_kind == loader.NURBS):
+        p, q = prim.prim_degree[k]
+        yield k, prim.cvs[prim.prim_cv[k] : prim.prim_cv[k] + (p + 1) * (q + 1)].reshape(p + 1, q + 1, 4)
+
+
+@pytest.mark.gpu
+def test_shells_enclose_quintic_patches_far_from_the_origin(tmp_path):
+    if not wp.is_cuda_available():
+        pytest.skip("CUDA unavailable")
+    from warp_optix._src.brep import proxy  # noqa: PLC0415
+
+    _write_quintic_dome(tmp_path / "dome.usda", (387.0, -512.0, 263.0))
+    (prim,) = loader.load_stage(str(tmp_path / "dome.usda"))
+    shells = proxy.build_proxy(prim, "cuda:0")
+    assert len(shells.patches) == len(prim.prim_kind) > 0
+    assert np.all(proxy.shell_sbt_indices(prim, shells) == 1)
+    m = proxy.GRID + 1
+    layers = shells.points.reshape(len(shells.patches), 2, m, m, 3).astype(np.float64)  # outer, inner
+    rng = np.random.default_rng(5)
+    cells = proxy.GRID / (1.0 + 2.0 * proxy.MARGIN)
+    for (k, pw), outer, inner in zip(_quintic_patches(prim), layers[:, 0], layers[:, 1], strict=True):
+        assert k in shells.patches
+        mid, half = 0.5 * (outer + inner), 0.5 * np.linalg.norm(outer - inner, axis=-1).min()
+        s, t = rng.uniform(0.0, 1.0, 200), rng.uniform(0.0, 1.0, 200)
+        gs, gt = (s + proxy.MARGIN) * cells, (t + proxy.MARGIN) * cells
+        i, j = np.minimum(gs.astype(int), proxy.GRID - 1), np.minimum(gt.astype(int), proxy.GRID - 1)
+        a, b = (gs - i)[:, None], (gt - j)[:, None]
+        p00, p10, p01, p11 = mid[i, j], mid[i + 1, j], mid[i, j + 1], mid[i + 1, j + 1]
+        linear = np.where(a >= b, p00 + a * (p10 - p00) + b * (p11 - p10), p00 + b * (p01 - p00) + a * (p11 - p01))
+        assert np.linalg.norm(_rational_bezier(pw, s, t) - linear, axis=1).max() < half
+
+
+@pytest.mark.gpu
+def test_packed_patch_bounds_contain_anchored_patches(tmp_path):
+    """The device stores control points relative to each patch's anchor (Surface.anchor); its bounds
+    add it back."""
+    if not wp.is_cuda_available():
+        pytest.skip("CUDA unavailable")
+    _write_quintic_dome(tmp_path / "dome.usda", (387.0, -512.0, 263.0))
+    (prim,) = loader.load_stage(str(tmp_path / "dome.usda"))
+    data, bases = bd.pack([prim], "cuda:0")
+    records = data.prims.numpy()
+    anchors = records["anchor"]
+    rng = np.random.default_rng(6)
+    for k, pw in _quintic_patches(prim):
+        r = records[bases[0] + k]
+        axes = np.stack([r["x"], r["y"], r["axis"]], axis=1).astype(np.float64)
+        assert np.any(axes)
+        np.testing.assert_allclose(anchors[bases[0] + k], pw[0, 0, :3] / pw[0, 0, 3], rtol=1e-7)
+        points = _rational_bezier(pw, rng.uniform(0, 1, 100), rng.uniform(0, 1, 100))
+        assert np.abs((points - r["origin"]) @ axes).max() <= 1.0
+
+
 @pytest.mark.parametrize("swap", [False, True])
 def test_trim_culling_keeps_boundaries_and_bulges(swap):
     # A square hole inside a larger square. Vertical chords are omitted, as in slab packing.

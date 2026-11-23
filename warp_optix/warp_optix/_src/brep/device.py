@@ -83,7 +83,10 @@ class Surface:
     # (first slab, 0, slab count) and (lo a, slabs per unit a, 0, 0) for the slab test instead.
     grid: wp.vec3i
     grid_map: wp.vec4
-    reserved: wp.vec3i  # pads the record to 128 bytes
+    # NURBS sub-patches: their control points are stored relative to this point, their first one
+    # (zero for analytic faces). Patch math runs in these local coordinates, where float32 resolves
+    # the Newton tolerance even for parts modeled far from their origin (assembly coordinates).
+    anchor: wp.vec3
 
 
 KIND_SHIFT = wp.constant(8)
@@ -105,7 +108,7 @@ class BrepData:
     prim_degree: wp.array[wp.vec2i]
     prim_uv: wp.array[wp.vec4]
     prim_tol: wp.array[wp.float32]
-    cvs: wp.array[wp.vec4]
+    cvs: wp.array[wp.vec4]  # NURBS control points, homogeneous, relative to their patch's anchor
     # Triangle shells (see proxy.py): each shell triangle's global primitive (its patch), and the
     # patch parameters (s, t) at the corners of one shell's triangles (the same for every shell).
     proxy_prim: wp.array[wp.int32]
@@ -1328,37 +1331,96 @@ def intersect_nurbs(brep: BrepData, prim: int, origin: wp.vec3, direction: wp.ve
         return
     deg = brep.prim_degree[prim]
     base = brep.prim_cv[prim]
+    local = origin - brep.prims[prim].anchor  # the patch's frame (see Surface.anchor)
     if deg[0] == 3 and deg[1] == 3:
-        intersect_patch(brep, prim, load_cubic(brep.cvs, base), origin, direction)
+        intersect_patch(brep, prim, load_cubic(brep.cvs, base), local, direction)
     elif deg[0] == 3 and deg[1] == 4:
         patch34 = CubicQuartic()
         patch34.base = base
-        intersect_patch(brep, prim, patch34, origin, direction)
+        intersect_patch(brep, prim, patch34, local, direction)
     else:
         patch = Bezier()
         patch.base = base
         patch.degree = deg
-        intersect_patch(brep, prim, patch, origin, direction)
+        intersect_patch(brep, prim, patch, local, direction)
 
 
 @wp.func
-def proxy_hit(brep: BrepData, tri: int, local: int, bary: wp.vec2, origin: wp.vec3, direction: wp.vec3):
-    """Exact surface hit for a ray that crossed shell triangle ``tri`` (global index; ``local``:
-    its index in its shell geometry).
-
-    Newton starts from the patch parameters interpolated at the triangle hit, then the face's
-    range and trim decide. Returns (hit, t, u, v, outward object-space normal, face, whether the
-    hit must not end the ray's search: the any-hit records it but ignores the intersection).
-    """
-    prim = brep.proxy_prim[tri]
-    diagnostic_add(brep, prim, 2, 1)
-    corner = 3 * (local % (brep.shell_st.shape[0] // 3))
-    seed = (
+def proxy_seed(brep: BrepData, local_tri: int, bary: wp.vec2) -> wp.vec2:
+    """Patch parameters interpolated at a shell triangle hit (``local_tri``: the triangle's index in
+    its shell geometry)."""
+    corner = 3 * (local_tri % (brep.shell_st.shape[0] // 3))
+    return (
         (1.0 - bary[0] - bary[1]) * brep.shell_st[corner]
         + bary[0] * brep.shell_st[corner + 1]
         + bary[1] * brep.shell_st[corner + 2]
     )
-    patch = load_cubic(brep.cvs, brep.prim_cv[prim])
+
+
+@wp.func
+def proxy_hit_cubic(brep: BrepData, tri: int, local_tri: int, bary: wp.vec2, origin: wp.vec3, direction: wp.vec3):
+    """proxy_hit for a bicubic sub-patch's shell (control points evaluated from registers)."""
+    prim = brep.proxy_prim[tri]
+    diagnostic_add(brep, prim, 2, 1)
+    return proxy_refine(
+        brep,
+        prim,
+        load_cubic(brep.cvs, brep.prim_cv[prim]),
+        local_tri,
+        proxy_seed(brep, local_tri, bary),
+        origin - brep.prims[prim].anchor,
+        direction,
+    )
+
+
+@wp.func
+def proxy_hit_bezier(brep: BrepData, tri: int, local_tri: int, bary: wp.vec2, origin: wp.vec3, direction: wp.vec3):
+    """proxy_hit for a shell around a sub-patch of any other degree (<= 7; control points streamed).
+
+    Renderers trace these shells with their own any-hit programs, so the bicubic programs keep
+    their size (OptiX saves a program's registers on every call, and hot code exceeds the i-cache).
+    """
+    prim = brep.proxy_prim[tri]
+    diagnostic_add(brep, prim, 2, 1)
+    patch = Bezier()
+    patch.base = brep.prim_cv[prim]
+    patch.degree = brep.prim_degree[prim]
+    return proxy_refine(
+        brep, prim, patch, local_tri, proxy_seed(brep, local_tri, bary), origin - brep.prims[prim].anchor, direction
+    )
+
+
+@wp.func
+def proxy_hit(brep: BrepData, tri: int, local_tri: int, bary: wp.vec2, origin: wp.vec3, direction: wp.vec3):
+    """Exact surface hit for a ray that crossed shell triangle ``tri`` (global index; ``local_tri``:
+    its index in its shell geometry), for a sub-patch of any degree.
+
+    Newton starts from the patch parameters interpolated at the triangle hit, then the face's
+    range and trim decide. Returns (hit, t, u, v, outward object-space normal, face, whether the
+    hit must not end the ray's search: the any-hit records it but ignores the intersection).
+    Renderers that give the two kinds of shells separate programs (proxy.shell_sbt_indices) call
+    proxy_hit_cubic and proxy_hit_bezier directly.
+    """
+    ok = bool(False)
+    hit_t = float(0.0)
+    u = float(0.0)
+    v = float(0.0)
+    normal = wp.vec3(0.0)
+    face = int(0)
+    keep_searching = bool(False)
+    deg = brep.prim_degree[brep.proxy_prim[tri]]
+    if deg[0] == 3 and deg[1] == 3:
+        ok, hit_t, u, v, normal, face, keep_searching = proxy_hit_cubic(brep, tri, local_tri, bary, origin, direction)
+    else:
+        ok, hit_t, u, v, normal, face, keep_searching = proxy_hit_bezier(brep, tri, local_tri, bary, origin, direction)
+    return ok, hit_t, u, v, normal, face, keep_searching
+
+
+@wp.func
+def proxy_refine(
+    brep: BrepData, prim: int, patch: Any, local_tri: int, seed: wp.vec2, origin: wp.vec3, direction: wp.vec3
+):
+    """proxy_hit for one sub-patch representation (see there), with the ray in the patch's frame."""
     tol = brep.prim_tol[prim]
     ray = patch_ray(origin, direction, first_point(patch, brep.cvs))
     converged, ok, st, point, ds, dt = newton(
@@ -1376,7 +1438,7 @@ def proxy_hit(brep: BrepData, tri: int, local: int, bary: wp.vec2, origin: wp.ve
         diagnostic_add(brep, prim, 6, 1)
         diagnostic_add(brep, prim, 13, int(not converged))
         diagnostic_add(brep, prim, 14, int(converged))
-        layer = local % (brep.shell_st.shape[0] // 3)
+        layer = local_tri % (brep.shell_st.shape[0] // 3)
         side = wp.where(layer < SHELL_LAYER_TRIANGLES, 1.0, wp.where(layer < 2 * SHELL_LAYER_TRIANGLES, -1.0, 0.0))
         entering = wp.optix_is_front_face_hit()
         root = root_foot(ray, st, point, ds, dt)
@@ -1444,6 +1506,23 @@ def _device_array(values, dtype, device):
     return wp.array(np.ascontiguousarray(values), dtype=dtype, device=device)
 
 
+def _anchored(prim):
+    """The prim's control points relative to each sub-patch's anchor, and the anchors (see
+    Surface.anchor). Anchors are float32 values, so the device adds back exactly what the
+    host (in float64) took off."""
+    cvs = np.asarray(prim.cvs, np.float64).copy()
+    anchor = np.zeros((len(prim.prim_kind), 3))
+    nurbs = np.flatnonzero(prim.prim_kind == NURBS)
+    if len(nurbs):
+        base = np.asarray(prim.prim_cv[nurbs], np.int64)
+        count = np.prod(np.asarray(prim.prim_degree[nurbs], np.int64) + 1, axis=1)
+        first = cvs[base]
+        anchor[nurbs] = (first[:, :3] / first[:, 3:4]).astype(np.float32)
+        index = np.repeat(base - np.cumsum(count) + count, count) + np.arange(count.sum())
+        cvs[index, :3] -= np.repeat(anchor[nurbs], count, axis=0) * cvs[index, 3:4]
+    return cvs, anchor
+
+
 def _slab_data(prim, has_grid: np.ndarray):
     """The slab-test arrays of the prim's trimmed faces that have no cell grid (the grid answers
     the others): (face_slab, slab starts without the end, slab members, segments, bulges)."""
@@ -1483,7 +1562,7 @@ def pack(prims, device, proxies=None):
     cat = {k: [] for k in cast(Any, BrepData).vars if k not in ("prims", "diagnostic_counts")}
     record_fields = ("origin", "x", "y", "axis", "params", "range", "period", "flags", "grid", "grid_map")
     faces = {k: [] for k in record_fields}  # per face, expanded to its primitives below
-    prim_kind, prim_face = [], []
+    prim_kind, prim_face, anchors = [], [], []
     bases, tri_bases = [], []
     grids = trim_grid.build_trim_grids(prims, device)  # all prims' grids at once
     for n, prim in enumerate(prims):
@@ -1518,7 +1597,9 @@ def pack(prims, device, proxies=None):
         cat["prim_degree"].append(prim.prim_degree)
         cat["prim_uv"].append(prim.prim_uv)
         cat["prim_tol"].append(prim.prim_tol)
-        cat["cvs"].append(prim.cvs)
+        cvs, anchor = _anchored(prim)
+        cat["cvs"].append(cvs)
+        anchors.append(anchor)
         bases.append(prim_base)
         face_base += len(prim.face_kind)
         prim_base += len(prim.prim_kind)
@@ -1542,6 +1623,7 @@ def pack(prims, device, proxies=None):
             records[key][:prim_base] = values[face].reshape(records[key][:prim_base].shape)
         records["flags"][:prim_base] |= np.concatenate(prim_kind).astype(np.int32) << int(KIND_SHIFT)
         records["face"][:prim_base] = face
+        records["anchor"][:prim_base] = np.concatenate(anchors)
         for n, prim in enumerate(prims):
             nurbs = np.flatnonzero(prim.prim_kind == NURBS)
             for key in ("origin", "x", "y", "axis", "params"):

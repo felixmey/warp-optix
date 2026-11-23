@@ -619,7 +619,7 @@ class Brep:
             [[x, y, z] for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])], dtype=np.float32
         )
         self.bounds = np.ascontiguousarray(bounds, dtype=np.float32)
-        # Bicubic patches are traced through triangle shells (hardware traversal, exact refinement
+        # NURBS sub-patches are traced through triangle shells (hardware traversal, exact refinement
         # in any-hit); their AABBs become inactive (NaN).
         self.proxy = brep_proxy.build_proxy(prim, device) if shells else None
         if self.proxy is not None and len(self.proxy.patches):
@@ -642,7 +642,7 @@ class Brep:
 
 
 class BrepShell:
-    """Triangle shells around a Brep's bicubic patches (``brep/proxy.py``), added by ``add_brep``.
+    """Triangle shells around a Brep's NURBS sub-patches (``brep/proxy.py``), added by ``add_brep``.
 
     Traced as hardware triangles whose any-hit refines each crossing to the exact surface. The
     render primitive's position offset holds the first shell triangle's index in the BRep data.
@@ -658,6 +658,8 @@ class BrepShell:
         self.vertices = np.ascontiguousarray(brep.proxy.points, dtype=np.float32)
         self.indices = np.ascontiguousarray(brep.proxy.indices, dtype=np.uint32)
         self.material_ids = np.ascontiguousarray(brep.material_ids[brep.proxy.tri_prim], dtype=np.uint32)
+        # Per triangle: hit group "brep_shell" (bicubic patches) or the next one, "brep_shell_generic".
+        self.sbt_indices = brep_proxy.shell_sbt_indices(brep.prim, brep.proxy)
         self.material_id = brep.material_id
         self.tri_base = 0
         self.d_indices = None
@@ -1841,6 +1843,7 @@ class Scene:
             curve.d_vertices, curve.d_widths = curve_points, curve_radii
         for companion in (g for g in meshes if g.primitive_type in _BREP_COMPANIONS):
             companion.d_vertices = wp.array(companion.vertices, dtype=wp.vec3, device=self.device)
+            companion.d_sbt_indices = wp.array(companion.sbt_indices, dtype=wp.uint32, device=self.device)
 
     def _build_blas(self):
         """Build bottom-level acceleration structures for all geometry.
@@ -1884,7 +1887,11 @@ class Scene:
             elif geometry.primitive_type == "brep_shell":
                 # Any-hit refines every shell crossing to the exact surface: never disable it.
                 build_input = wo.triangles(
-                    geometry.d_vertices, geometry.d_indices, flags=wo.GeometryFlags.NONE, validate=False
+                    geometry.d_vertices,
+                    geometry.d_indices,
+                    flags=[wo.GeometryFlags.NONE, wo.GeometryFlags.NONE],
+                    sbt_indices=geometry.d_sbt_indices,
+                    validate=False,
                 )
             else:
                 curve_type = (
