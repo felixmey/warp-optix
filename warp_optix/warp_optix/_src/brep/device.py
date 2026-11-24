@@ -56,7 +56,7 @@ ATTRIBUTE_WORDS = 6
 # foot points pass outside the square grown by it (the crossings there are a neighbor's).
 SQUARE_MARGIN = wp.constant(0.05)
 # Triangles per layer of a sub-patch's shell (proxy.py): outer layer first, then inner, then walls.
-SHELL_LAYER_TRIANGLES = wp.constant(72)
+SHELL_LAYER_TRIANGLES = wp.constant(128)  # 2 x proxy.GRID^2
 GRID_REF_A = wp.constant(trim_grid.REF_A)
 GRID_REF_C = wp.constant(trim_grid.REF_C)
 

@@ -27,15 +27,17 @@ import warp as wp
 from .device import MAX_ORDER, SHELL_LAYER_TRIANGLES, Bezier, eval_patch, load_cubic
 from .loader import NURBS, BrepPrim
 
-# Shell cells along each patch direction. The shell is offset by twice the grid's deviation from the
-# surface, which falls with the square of GRID: 6 keeps shells about half as thick as 4, so far fewer
-# rays cross them without meeting the surface, for twice the triangles.
-GRID = 6
+# Shell cells along each patch direction. The shell's thickness follows the grid's deviation from the
+# surface, which falls with the square of GRID: 8 keeps shells about a quarter as thick as 4, so far
+# fewer rays cross them without meeting the surface (with signed offsets, MC1 15% faster than 6).
+GRID = 8
 # The shell covers the patch extended by MARGIN in parameter space (the Bezier polynomial continues
 # smoothly past its edges), so adjacent patches' shells overlap instead of sharing coincident side
 # walls: a ray crossing a patch boundary must cross both patches' shells.
 MARGIN = 0.05
-SAFETY = 2.0  # offset = SAFETY x the grid's deviation from the surface (plus a small floor)
+# Each layer's offset = SAFETY x the surface's largest deviation from the grid on that layer's side
+# (plus a small floor).
+SAFETY = 2.0
 OVERSAMPLE = 4  # deviation samples per cell edge
 NODES = (GRID + 1) ** 2  # vertices per shell layer
 FLOAT32_SLACK = 4.0 * 2.0**-23  # minimum offset, relative to the largest vertex coordinate
@@ -95,8 +97,11 @@ def _shell(patch: Any, cvs: wp.array[wp.vec4], o: wp.vec3, p: int, vertices: wp.
         lo = wp.min(lo, x)
         hi = wp.max(hi, x)
         vertices[p, k] = x  # the grid, read back below
-    # Deviation of the surface from the grid's triangles (diagonal as in SHELL_TRIANGLES).
-    deviation = float(0.0)
+    # Deviation of the surface from the grid's triangles (diagonal as in SHELL_TRIANGLES), per side:
+    # signed along the surface normal, so each layer is only as far out as the surface bulges toward
+    # it (a convex patch lies almost entirely on one side of its grid).
+    above = float(0.0)
+    below = float(0.0)
     fine = GRID * OVERSAMPLE + 1
     for k in range(fine * fine):
         f = _node(k, fine, 0.0, 1.0)
@@ -112,12 +117,21 @@ def _shell(patch: Any, cvs: wp.array[wp.vec4], o: wp.vec3, p: int, vertices: wp.
             linear = p00 + a * (vertices[p, ci * m + cj + m] - p00) + b * (p11 - vertices[p, ci * m + cj + m])
         else:
             linear = p00 + b * (vertices[p, ci * m + cj + 1] - p00) + a * (p11 - vertices[p, ci * m + cj + 1])
-        deviation = wp.max(deviation, wp.length(x - linear))
-    offset = SAFETY * deviation + 1.0e-4 * wp.length(hi - lo)
+        nf = wp.cross(ds, dt)
+        lf = wp.length(nf)
+        if lf > 1.0e-12 * longest:
+            d = wp.dot(x - linear, nf / lf)
+            above = wp.max(above, d)
+            below = wp.max(below, -d)
+        else:  # degenerate normal: unsigned, on both sides
+            above = wp.max(above, wp.length(x - linear))
+            below = wp.max(below, wp.length(x - linear))
+    floor = 1.0e-4 * wp.length(hi - lo)
     # The vertices are stored in float32: far from the origin, a thin shell would round across the
-    # surface it encloses. Keep it a few float32 steps of its coordinates thick.
+    # surface it encloses. Keep each layer a few float32 steps of its coordinates away.
     reach = wp.max(wp.max(wp.abs(o + lo), wp.abs(o + hi)))
-    offset = wp.max(offset, FLOAT32_SLACK * reach)
+    out_offset = wp.max(SAFETY * above + floor, FLOAT32_SLACK * reach)
+    in_offset = wp.max(SAFETY * below + floor, FLOAT32_SLACK * reach)
     # Degenerate normals (poles, apexes, collapsed edges) borrow the average normal.
     average = average / (wp.length(average) + 1.0e-30)
     for k in range(NODES):
@@ -129,8 +143,8 @@ def _shell(patch: Any, cvs: wp.array[wp.vec4], o: wp.vec3, p: int, vertices: wp.
             n = n / length
         else:
             n = average
-        vertices[p, k] = o + x + offset * n
-        vertices[p, NODES + k] = o + x - offset * n
+        vertices[p, k] = o + x + out_offset * n
+        vertices[p, NODES + k] = o + x - in_offset * n
 
 
 @wp.kernel(enable_backward=False)

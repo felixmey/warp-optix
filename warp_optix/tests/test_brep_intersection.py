@@ -228,14 +228,22 @@ def test_shells_enclose_quintic_patches_far_from_the_origin(tmp_path):
     cells = proxy.GRID / (1.0 + 2.0 * proxy.MARGIN)
     for (k, pw), outer, inner in zip(_quintic_patches(prim), layers[:, 0], layers[:, 1], strict=True):
         assert k in shells.patches
-        mid, half = 0.5 * (outer + inner), 0.5 * np.linalg.norm(outer - inner, axis=-1).min()
+        # The surface lies between the layers: on the segment joining the layers' points at its
+        # parameters (each layer interpolated like the shell's triangles; the layers are offset
+        # asymmetrically, by the surface's deviation on each side).
         s, t = rng.uniform(0.0, 1.0, 200), rng.uniform(0.0, 1.0, 200)
         gs, gt = (s + proxy.MARGIN) * cells, (t + proxy.MARGIN) * cells
         i, j = np.minimum(gs.astype(int), proxy.GRID - 1), np.minimum(gt.astype(int), proxy.GRID - 1)
         a, b = (gs - i)[:, None], (gt - j)[:, None]
-        p00, p10, p01, p11 = mid[i, j], mid[i + 1, j], mid[i, j + 1], mid[i + 1, j + 1]
-        linear = np.where(a >= b, p00 + a * (p10 - p00) + b * (p11 - p10), p00 + b * (p01 - p00) + a * (p11 - p01))
-        assert np.linalg.norm(_rational_bezier(pw, s, t) - linear, axis=1).max() < half
+
+        def linear(layer, i=i, j=j, a=a, b=b):
+            p00, p10, p01, p11 = layer[i, j], layer[i + 1, j], layer[i, j + 1], layer[i + 1, j + 1]
+            return np.where(a >= b, p00 + a * (p10 - p00) + b * (p11 - p10), p00 + b * (p01 - p00) + a * (p11 - p01))
+
+        lo, hi = linear(inner), linear(outer)
+        span = hi - lo
+        along = ((_rational_bezier(pw, s, t) - lo) * span).sum(axis=1) / (span * span).sum(axis=1)
+        assert along.min() > 0.0 and along.max() < 1.0
 
 
 @pytest.mark.gpu
