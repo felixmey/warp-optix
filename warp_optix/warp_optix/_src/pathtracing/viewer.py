@@ -1166,6 +1166,12 @@ class ViewerBackend:
             return
         elif symbol == key.P:
             self.save_screenshot()
+        elif symbol == key.B:
+            # Debug: toggle between exact BRep surfaces and their triangle shells.
+            self._api.set_show_brep_shells(not self._api.show_brep_shells)
+        elif symbol == key.X:
+            # Debug: toggle between exact BRep surfaces and the AABBs they are traced through.
+            self._api.set_show_brep_boxes(not self._api.show_brep_boxes)
         else:
             debug_keys = {
                 key._1: 2,  # Depth
@@ -1176,6 +1182,7 @@ class ViewerBackend:
                 key._6: 1,  # Noisy radiance
                 key._7: 8,  # Specular hit distance
                 key._8: 5,  # Roughness (OptiX-specific extra)
+                key._9: 9,  # Pixel time heatmap (raygen time per pixel)
             }
             if symbol in debug_keys:
                 mode = debug_keys[symbol]
@@ -1634,7 +1641,7 @@ class ViewerBackend:
         self._api.set_environment_color(self.srgb_to_linear_rgb(color))
 
     def set_debug_buffer_mode(self, mode: int):
-        mode = int(np.clip(mode, 0, 8))
+        mode = int(np.clip(mode, 0, 9))
         self._debug_buffer_mode = mode
         self._api.set_debug_buffer_mode(mode)
 

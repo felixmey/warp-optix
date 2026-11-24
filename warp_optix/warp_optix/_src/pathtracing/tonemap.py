@@ -40,6 +40,7 @@ OUTPUT_ROUGHNESS = 5
 OUTPUT_DIFFUSE = 6
 OUTPUT_SPECULAR = 7
 OUTPUT_SPEC_HITDIST = 8
+OUTPUT_PIXEL_TIME = 9  # raygen time per pixel, as a heatmap (pixel_time_heatmap writes it into color_hdr)
 
 
 @wp.func
@@ -296,8 +297,67 @@ def debug_visualize_kernel(
         h = spec_hit_dist[source_y, sx]
         n = wp.clamp(h / max_depth, 0.0, 1.0)
         out = wp.vec3(n, n, n)
+    elif mode == OUTPUT_PIXEL_TIME:
+        hdr = color_hdr[source_y, sx]
+        out = wp.vec3(hdr[0], hdr[1], hdr[2])
 
     ldr_output[y, x] = wp.vec4(out[0], out[1], out[2], 1.0)
+
+
+@wp.kernel(enable_backward=False)
+def _pixel_time_row_sums(times: wp.array2d(dtype=wp.float32), total: wp.array(dtype=wp.float32), stage: int):
+    """Stage 0 sums every pixel into total[0:2] (sum, count); stage 1 sums the pixels above a quarter
+    of that mean into total[2:4]: the reference that leaves cheap background (sky) pixels out."""
+    y = wp.tid()
+    floor = float(-1.0)
+    if stage == 1:
+        floor = 0.25 * total[0] / wp.max(total[1], 1.0)
+    row = float(0.0)
+    counted = float(0.0)
+    for x in range(times.shape[1]):
+        t = times[y, x]
+        if t > floor:
+            row += t
+            counted += 1.0
+    wp.atomic_add(total, 2 * stage, row)
+    wp.atomic_add(total, 2 * stage + 1, counted)
+
+
+@wp.func
+def _turbo(t: float) -> wp.vec3:
+    """Polynomial approximation of the Turbo colormap (blue = cheap, red = expensive)."""
+    t = wp.clamp(t, 0.0, 1.0)
+    t2 = t * t
+    t3 = t2 * t
+    t4 = t3 * t
+    t5 = t4 * t
+    r = 0.13572138 + 4.61539260 * t - 42.66032258 * t2 + 132.13108234 * t3 - 152.94239396 * t4 + 59.28637943 * t5
+    g = 0.09140261 + 2.19418839 * t + 4.84296658 * t2 - 14.18503333 * t3 + 4.27729857 * t4 + 2.82956604 * t5
+    b = 0.10667330 + 12.64194608 * t - 60.58204836 * t2 + 110.36276771 * t3 - 89.90310912 * t4 + 27.34824973 * t5
+    return wp.vec3(wp.clamp(r, 0.0, 1.0), wp.clamp(g, 0.0, 1.0), wp.clamp(b, 0.0, 1.0))
+
+
+@wp.kernel(enable_backward=False)
+def _pixel_time_heatmap(
+    times: wp.array2d(dtype=wp.float32), total: wp.array(dtype=wp.float32), color: wp.array2d(dtype=wp.vec4)
+):
+    """Log-scale heatmap around the mean cost of the non-background pixels (see _pixel_time_row_sums):
+    the mean is green, 1/8 of it dark blue, 8x it dark red."""
+    y, x = wp.tid()
+    mean = total[2] / wp.max(total[3], 1.0)
+    ratio = times[y, x] / wp.max(mean, 1.0e-30)
+    t = 0.5 + wp.log2(wp.max(ratio, 1.0e-6)) / 6.0
+    c = _turbo(t)
+    color[y, x] = wp.vec4(c[0], c[1], c[2], 1.0)  # debug_visualize_kernel shows it as is
+
+
+def pixel_time_heatmap(times: wp.array, color: wp.array, total: wp.array):
+    """Write the heatmap of ``times`` (raygen ns per pixel) into ``color``; ``total`` is a four-element
+    scratch array."""
+    total.zero_()
+    for stage in (0, 1):
+        wp.launch(_pixel_time_row_sums, dim=times.shape[0], inputs=[times, total, stage], device=times.device)
+    wp.launch(_pixel_time_heatmap, dim=times.shape, inputs=[times, total, color], device=times.device)
 
 
 # Concrete overloads avoid generic texture argument inference and resolving hdr_input every frame.

@@ -42,7 +42,7 @@ from .environment_map import EnvironmentMap
 from .lighting import RENDERER_RADIANCE_PER_NIT
 from .scene import Scene
 from .sky_lut import generate_physical_sky_lut
-from .tonemap import Tonemapper
+from .tonemap import Tonemapper, pixel_time_heatmap
 from .volume_composite import VolumeParams, composite_volume
 
 try:
@@ -156,6 +156,7 @@ class Renderer:
     OUTPUT_DIFFUSE = 6
     OUTPUT_SPECULAR = 7
     OUTPUT_SPEC_HITDIST = 8
+    OUTPUT_PIXEL_TIME = 9
 
     def __init__(
         self,
@@ -253,6 +254,9 @@ class Renderer:
         self._diffuse_buffer = None
         self._specular_buffer = None
         self._spec_hit_dist_buffer = None
+        self._pixel_clock_buffer = None
+        self._pixel_time_buffer = None
+        self._pixel_time_total = None
         self._instance_transforms_buffer = None
         self._prev_instance_transforms_buffer = None
         self._prev_instance_transforms_valid = False
@@ -315,6 +319,10 @@ class Renderer:
         self.use_path_regularization = True
         # Paths that meet the inside of a closed opaque solid end there (no light reaches it).
         self.dark_solid_interiors = True
+        # Debug view: BRep NURBS shells render as their triangles instead of the exact surface.
+        self.show_brep_shells = False
+        # Debug view: BRep primitives traced through AABBs render as those boxes.
+        self.show_brep_boxes = False
         self.use_psr = True
         self.override_roughness = -1.0
         self.override_metallic = -1.0
@@ -501,6 +509,36 @@ class Renderer:
         self._optix_launch_graph = None
         self._optix_graph_warmed = False
         self._denoiser_reset_history = True
+
+    def set_show_brep_shells(self, enabled: bool) -> None:
+        """Debug view: render BRep NURBS shells as flat triangles instead of the exact surface."""
+        value = bool(enabled)
+        if value == self.show_brep_shells:
+            return
+        self.show_brep_shells = value
+        self.sample_index = 0
+        self.frame_index = 0
+        self._optix_launch_graph = None
+        self._optix_graph_warmed = False
+        self._denoiser_reset_history = True
+
+    def set_show_brep_boxes(self, enabled: bool) -> None:
+        """Debug view: render BRep primitives traced through AABBs (analytic faces, unshelled NURBS
+        patches) as their boxes instead of the exact surface."""
+        value = bool(enabled)
+        if value == self.show_brep_boxes:
+            return
+        self.show_brep_boxes = value
+        self.sample_index = 0
+        self.frame_index = 0
+        self._optix_launch_graph = None
+        self._optix_graph_warmed = False
+        self._denoiser_reset_history = True
+
+    def get_pixel_times(self) -> np.ndarray:
+        """Raygen nanoseconds per pixel (GPU global timer), a running average over recent frames rendered in the
+        OUTPUT_PIXEL_TIME debug mode; rows bottom-up like the color buffer."""
+        return self._pixel_time_buffer.numpy()
 
     def set_volume(
         self,
@@ -703,6 +741,10 @@ class Renderer:
         self._spec_hit_dist_buffer = wp.zeros(
             (self._render_height, self._render_width), dtype=wp.float32, device="cuda"
         )
+        # Per-pixel raygen cost (debug output OUTPUT_PIXEL_TIME).
+        self._pixel_clock_buffer = wp.zeros((self._render_height, self._render_width), dtype=wp.uint64, device="cuda")
+        self._pixel_time_buffer = wp.zeros((self._render_height, self._render_width), dtype=wp.float32, device="cuda")
+        self._pixel_time_total = wp.zeros(4, dtype=wp.float32, device="cuda")
 
     def _update_instance_transform_buffers(self):
         """Upload current instance transforms for motion vectors.
@@ -770,10 +812,19 @@ class Renderer:
             return 168
         return wo.native.COMPILE_DEFAULT_MAX_REGISTER_COUNT
 
-    def _pipeline_config(self) -> tuple[int, bool]:
-        """What the pipeline is specialized on: the register limit, and whether the scene has BReps
-        (the raygen that reorders bounce rays)."""
-        return self._pipeline_registers(), self._scene is not None and self._scene.brep_count > 0
+    def _debug_views_on(self) -> bool:
+        """Whether a debug view needs the debug pipeline (BRep shells / boxes, pixel time)."""
+        return self.show_brep_shells or self.show_brep_boxes or self.output_mode == self.OUTPUT_PIXEL_TIME
+
+    def _pipeline_config(self) -> tuple[int, bool, bool]:
+        """What the pipeline is specialized on: the register limit, whether the scene has BReps
+        (the raygen that reorders bounce rays), and whether a debug view is on (its programs cost
+        even when their branches are not taken, so they are only compiled in while needed)."""
+        return (
+            self._pipeline_registers(),
+            self._scene is not None and self._scene.brep_count > 0,
+            self._debug_views_on(),
+        )
 
     def _create_pipeline(self):
         """Create the OptiX pipeline with primary and shadow/visibility ray types.
@@ -783,11 +834,15 @@ class Renderer:
         never trace recursively.
         """
         self._pipeline_key = self._pipeline_config()
-        self._pipeline_register_limit, has_breps = self._pipeline_key
+        self._pipeline_register_limit, has_breps, debug_views = self._pipeline_key
         # BRep scenes reorder bounce rays by direction: their intersection programs diverge.
+        if debug_views:
+            raygen = pwk.primary_raygen_reorder_debug if has_breps else pwk.primary_raygen_debug
+        else:
+            raygen = pwk.primary_raygen_reorder if has_breps else pwk.primary_raygen
         self._pipeline = wo.Pipeline(
-            pwk.primary_raygen_reorder if has_breps else pwk.primary_raygen,
-            sbt=pwk.SBT,
+            raygen,
+            sbt=pwk.SBT_DEBUG if debug_views else pwk.SBT,
             payload_words=19,
             # BRep custom primitives report u, v, normal and face (curves use at most two).
             attribute_words=brep_device.ATTRIBUTE_WORDS,
@@ -926,6 +981,9 @@ class Renderer:
             | (4 if self.use_path_regularization else 0)
             | (8 if self.backface_culling else 0)
             | (16 if self.dark_solid_interiors and not getattr(self._scene, "lights_in_solids", False) else 0)
+            | (32 if self.show_brep_shells else 0)
+            | (64 if self.show_brep_boxes else 0)
+            | (128 if self.output_mode == self.OUTPUT_PIXEL_TIME else 0)
         )
         values = {
             "tlas": self._scene.tlas_handle,
@@ -1081,6 +1139,8 @@ class Renderer:
             "diffuse_output": self._diffuse_buffer,
             "specular_output": self._specular_buffer,
             "spec_hit_dist_output": self._spec_hit_dist_buffer,
+            "pixel_clock": self._pixel_clock_buffer,
+            "pixel_time_output": self._pixel_time_buffer,
         }
         # Assigning an array field re-validates it, and the arrays change only with the scene or size.
         for name, value in arrays.items():
@@ -1171,6 +1231,8 @@ class Renderer:
 
     def _process_debug_output(self):
         self._tonemapper.resize(self.width, self.height)
+        if self.output_mode == self.OUTPUT_PIXEL_TIME:
+            pixel_time_heatmap(self._pixel_time_buffer, self._color_buffer, self._pixel_time_total)
         self._tonemapper.process_debug(
             self.output_mode,
             self._color_buffer,
@@ -1234,6 +1296,12 @@ class Renderer:
         samples_this_frame = self.samples_per_frame
         reset_temporal = self._update_temporal_state(camera, use_external_accum)
         self._update_instance_transform_buffers()
+        if self.output_mode == self.OUTPUT_PIXEL_TIME and (
+            camera.key != self._accum_camera_key or self._last_output_mode != self.output_mode
+        ):
+            # The pixel times are a running average: restart it when the view changes, or the old
+            # view's times trail behind a moving camera.
+            self._pixel_time_buffer.zero_()
         frame = self._launch_samples(samples_this_frame, use_external_accum, camera=camera)
 
         # Queue the current-to-previous transform snapshot behind the OptiX launch.
@@ -1243,7 +1311,15 @@ class Renderer:
         self._accum_camera_key = camera.key
         self._last_output_mode = self.output_mode
 
-        if self._dlss_denoiser is not None:
+        if self.output_mode != self.OUTPUT_FINAL and (
+            self._dlss_denoiser is not None or self._optix_denoiser is not None
+        ):
+            # Debug views show the raw render buffers: skip the denoiser (its output would be dropped,
+            # and its cost would blur frame timings such as the pixel-time heatmap). Restart its
+            # history when the final view returns, since it missed these frames.
+            self._denoiser_reset_history = True
+            self._process_output(frame, resize_final_to_render=False)
+        elif self._dlss_denoiser is not None:
             output = self._dlss_denoiser.apply(
                 self._denoiser_inputs(frame),
                 view_matrix=np.asarray(camera.view, dtype=np.float32).reshape(4, 4),

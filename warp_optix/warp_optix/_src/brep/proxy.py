@@ -18,27 +18,47 @@ them for all patches.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import warp as wp
 
-from .device import MAX_ORDER, SHELL_LAYER_TRIANGLES, Bezier, eval_patch, load_cubic
-from .loader import NURBS, BrepPrim
+from .device import MAX_ORDER, SHELL_LAYER_TRIANGLES, Analytic, Bezier, eval_patch, load_cubic
+from .loader import CONE, CYLINDER, FLAG_SWAP, FLAG_TRIMMED, NURBS, PLANE, SPHERE, TORUS, BrepPrim
 
 # Shell cells along each patch direction. The shell is offset by twice the grid's deviation from the
 # surface, which falls with the square of GRID: 6 keeps shells about half as thick as 4, so far fewer
 # rays cross them without meeting the surface, for twice the triangles.
-GRID = 6
+GRID = int(os.environ.get("WO_SHELL_GRID", "6"))  # EXPERIMENT toggle
 # The shell covers the patch extended by MARGIN in parameter space (the Bezier polynomial continues
 # smoothly past its edges), so adjacent patches' shells overlap instead of sharing coincident side
 # walls: a ray crossing a patch boundary must cross both patches' shells.
-MARGIN = 0.05
-SAFETY = 2.0  # offset = SAFETY x the grid's deviation from the surface (plus a small floor)
+MARGIN = float(os.environ.get("WO_SHELL_MARGIN", "0.05"))  # EXPERIMENT toggle
+# offset = SAFETY x the grid's deviation from the surface (plus a small floor)
+SAFETY = float(os.environ.get("WO_SHELL_SAFETY", "2.0"))  # EXPERIMENT toggle
 OVERSAMPLE = 4  # deviation samples per cell edge
 NODES = (GRID + 1) ** 2  # vertices per shell layer
+FLOOR = float(os.environ.get("WO_SHELL_FLOOR", "1e-4"))  # EXPERIMENT: relative minimum offset
+# EXPERIMENT: offset each layer by the surface's signed normal deviation on its side only
+SIGNED = wp.constant(int(os.environ.get("WO_SHELL_SIGNED", "0")))
 FLOAT32_SLACK = 4.0 * 2.0**-23  # minimum offset, relative to the largest vertex coordinate
+# EXPERIMENT: analytic faces of these kinds also get shells (comma list of plane, cylinder, cone,
+# sphere, torus, or "all"), one per piece of the face's parameter range spanning <= PIECE_ANGLE.
+_KINDS = {"plane": PLANE, "cylinder": CYLINDER, "cone": CONE, "sphere": SPHERE, "torus": TORUS}
+_ANALYTIC = os.environ.get("WO_SHELL_ANALYTIC", "")
+ANALYTIC = tuple(_KINDS.values()) if _ANALYTIC == "all" else tuple(_KINDS[k] for k in _ANALYTIC.split(",") if k)
+PIECE_ANGLE = float(os.environ.get("WO_SHELL_PIECE_ANGLE", str(np.pi / 2)))
+# EXPERIMENT: with planes in ANALYTIC, PLANE_CELLS > 0 gives each planar face one layer of triangles on
+# the plane itself (a plane needs no enclosure), over PLANE_CELLS x PLANE_CELLS cells of its parameter
+# rectangle, without the cells the face's trim cell grid puts entirely outside the face.
+PLANE_CELLS = int(os.environ.get("WO_SHELL_PLANE_CELLS", "0"))
+# EXPERIMENT: CURVED_CELLS > 0 gives each curved analytic piece a CURVED_CELLS x CURVED_CELLS shell without the
+# cells the trim puts entirely outside the face, closed by side walls around the cells it keeps.
+CURVED_CELLS = int(os.environ.get("WO_SHELL_CURVED_CELLS", "0"))
+# Which of (u, v) are angles, per kind.
+_ANGULAR = {PLANE: (False, False), CYLINDER: (True, False), CONE: (True, False), SPHERE: (True, True), TORUS: (True, True)}
 
 
 def _shell_topology() -> tuple[np.ndarray, np.ndarray]:
@@ -73,20 +93,21 @@ def _node(k: int, count: int, lo: float, span: float) -> wp.vec2:
 
 
 @wp.func
-def _shell(patch: Any, cvs: wp.array[wp.vec4], o: wp.vec3, p: int, vertices: wp.array2d[wp.vec3]):
-    """Both layers of patch p's shell: vertices[p, :NODES] outer, vertices[p, NODES:] inner.
+def _shell(patch: Any, cvs: wp.array[wp.vec4], o: wp.vec3, p: int, vertices: wp.array2d[wp.vec3], grid: int):
+    """Both layers of patch p's grid x grid shell: vertices[p, :nodes] outer, vertices[p, nodes:] inner.
 
     The patch's control points are relative to ``o``, its first control point: in float32, the
     deviation of the surface from the grid then keeps its digits instead of cancelling against the
     patch's position.
     """
-    m = GRID + 1
+    m = grid + 1
+    nodes = m * m
     span = 1.0 + 2.0 * MARGIN
     average = wp.vec3(0.0)
     longest = float(0.0)
     lo = wp.vec3(1.0e30)
     hi = wp.vec3(-1.0e30)
-    for k in range(NODES):
+    for k in range(nodes):
         st = _node(k, m, -MARGIN, span)
         x, ds, dt = eval_patch(patch, cvs, st[0], st[1])
         n = wp.cross(ds, dt)
@@ -97,14 +118,16 @@ def _shell(patch: Any, cvs: wp.array[wp.vec4], o: wp.vec3, p: int, vertices: wp.
         vertices[p, k] = x  # the grid, read back below
     # Deviation of the surface from the grid's triangles (diagonal as in SHELL_TRIANGLES).
     deviation = float(0.0)
-    fine = GRID * OVERSAMPLE + 1
+    above = float(0.0)
+    below = float(0.0)
+    fine = grid * OVERSAMPLE + 1
     for k in range(fine * fine):
         f = _node(k, fine, 0.0, 1.0)
         x, ds, dt = eval_patch(patch, cvs, -MARGIN + span * f[0], -MARGIN + span * f[1])
-        ci = wp.min(int(f[0] * float(GRID)), GRID - 1)
-        cj = wp.min(int(f[1] * float(GRID)), GRID - 1)
-        a = f[0] * float(GRID) - float(ci)
-        b = f[1] * float(GRID) - float(cj)
+        ci = wp.min(int(f[0] * float(grid)), grid - 1)
+        cj = wp.min(int(f[1] * float(grid)), grid - 1)
+        a = f[0] * float(grid) - float(ci)
+        b = f[1] * float(grid) - float(cj)
         p00 = vertices[p, ci * m + cj]
         p11 = vertices[p, ci * m + cj + m + 1]
         linear = wp.vec3(0.0)
@@ -113,14 +136,31 @@ def _shell(patch: Any, cvs: wp.array[wp.vec4], o: wp.vec3, p: int, vertices: wp.
         else:
             linear = p00 + b * (vertices[p, ci * m + cj + 1] - p00) + a * (p11 - vertices[p, ci * m + cj + 1])
         deviation = wp.max(deviation, wp.length(x - linear))
-    offset = SAFETY * deviation + 1.0e-4 * wp.length(hi - lo)
+        nf = wp.cross(ds, dt)
+        lf = wp.length(nf)
+        if lf > 1.0e-12 * longest:
+            d = wp.dot(x - linear, nf / lf)
+            above = wp.max(above, d)
+            below = wp.max(below, -d)
+        else:
+            above = wp.max(above, wp.length(x - linear))
+            below = wp.max(below, wp.length(x - linear))
+    floor = FLOOR * wp.length(hi - lo)
+    offset = SAFETY * deviation + floor
+    out_offset = offset
+    in_offset = offset
+    if SIGNED != 0:
+        out_offset = SAFETY * above + floor
+        in_offset = SAFETY * below + floor
     # The vertices are stored in float32: far from the origin, a thin shell would round across the
     # surface it encloses. Keep it a few float32 steps of its coordinates thick.
     reach = wp.max(wp.max(wp.abs(o + lo), wp.abs(o + hi)))
-    offset = wp.max(offset, FLOAT32_SLACK * reach)
+    slack = FLOAT32_SLACK * reach
+    out_offset = wp.max(out_offset, slack)
+    in_offset = wp.max(in_offset, slack)
     # Degenerate normals (poles, apexes, collapsed edges) borrow the average normal.
     average = average / (wp.length(average) + 1.0e-30)
-    for k in range(NODES):
+    for k in range(nodes):
         st = _node(k, m, -MARGIN, span)
         x, ds, dt = eval_patch(patch, cvs, st[0], st[1])
         n = wp.cross(ds, dt)
@@ -129,8 +169,8 @@ def _shell(patch: Any, cvs: wp.array[wp.vec4], o: wp.vec3, p: int, vertices: wp.
             n = n / length
         else:
             n = average
-        vertices[p, k] = o + x + offset * n
-        vertices[p, NODES + k] = o + x - offset * n
+        vertices[p, k] = o + x + out_offset * n
+        vertices[p, nodes + k] = o + x - in_offset * n
 
 
 @wp.kernel(enable_backward=False)
@@ -145,12 +185,37 @@ def _shell_vertices(
     p = wp.tid()
     deg = patch_degree[p]
     if deg[0] == 3 and deg[1] == 3:
-        _shell(load_cubic(cvs, patch_cv[p]), cvs, patch_origin[p], p, vertices)
+        _shell(load_cubic(cvs, patch_cv[p]), cvs, patch_origin[p], p, vertices, GRID)
     else:
         patch = Bezier()
         patch.base = patch_cv[p]
         patch.degree = deg
-        _shell(patch, cvs, patch_origin[p], p, vertices)
+        _shell(patch, cvs, patch_origin[p], p, vertices, GRID)
+
+
+@wp.kernel(enable_backward=False)
+def _analytic_shell_vertices(
+    kind: wp.array[wp.int32],
+    origin: wp.array[wp.vec3],
+    x: wp.array[wp.vec3],
+    y: wp.array[wp.vec3],
+    axis: wp.array[wp.vec3],
+    params: wp.array[wp.vec2],
+    rect: wp.array[wp.vec4],
+    cvs: wp.array[wp.vec4],
+    grid: int,
+    vertices: wp.array2d[wp.vec3],
+):
+    """grid x grid shell vertices of every analytic piece (see device.Analytic)."""
+    p = wp.tid()
+    patch = Analytic()
+    patch.kind = kind[p]
+    patch.x = x[p]
+    patch.y = y[p]
+    patch.axis = axis[p]
+    patch.params = params[p]
+    patch.rect = rect[p]
+    _shell(patch, cvs, origin[p], p, vertices, grid)
 
 
 @dataclass
@@ -158,12 +223,262 @@ class Proxy:
     points: np.ndarray  # (V, 3) float32, object space
     indices: np.ndarray  # (T, 3) uint32
     tri_prim: np.ndarray  # (T,) int32: the prim's local primitive index of each triangle's patch
-    patches: np.ndarray  # (P,) int32: local primitive indices that have shells
+    patches: np.ndarray  # (P,) int32: local primitive indices that have shells (unique)
+    shell_uv: np.ndarray = None  # (S, 4) float32: face parameter rectangle of each shell
+    tri_shell: np.ndarray = None  # (T,) int32: each triangle's shell (index into shell_uv)
 
 
 def empty_proxy() -> Proxy:
     return Proxy(
-        np.zeros((0, 3), np.float32), np.zeros((0, 3), np.uint32), np.zeros(0, np.int32), np.zeros(0, np.int32)
+        np.zeros((0, 3), np.float32),
+        np.zeros((0, 3), np.uint32),
+        np.zeros(0, np.int32),
+        np.zeros(0, np.int32),
+        np.zeros((0, 4), np.float32),
+        np.zeros(0, np.int32),
+    )
+
+
+def _analytic_pieces(prim: BrepPrim) -> tuple[np.ndarray, np.ndarray]:
+    """Local primitive index and parameter rectangle of each piece of the prim's analytic faces
+    that get shells (ANALYTIC): angular parameters split into equal pieces of <= PIECE_ANGLE."""
+    kinds = np.asarray(prim.prim_kind)
+    local = np.flatnonzero(np.isin(kinds, [k for k in ANALYTIC if not (k == PLANE and PLANE_CELLS > 0)]))
+    if not len(local):
+        return np.zeros(0, np.int32), np.zeros((0, 4))
+    r = np.asarray(prim.prim_uv, np.float64)[local]
+    ang = np.array([_ANGULAR[int(k)] for k in kinds[local]], bool).reshape(-1, 2)
+    nu = np.where(ang[:, 0], np.maximum(1, np.ceil((r[:, 1] - r[:, 0]) / PIECE_ANGLE - 1e-9)), 1).astype(np.int64)
+    nv = np.where(ang[:, 1], np.maximum(1, np.ceil((r[:, 3] - r[:, 2]) / PIECE_ANGLE - 1e-9)), 1).astype(np.int64)
+    count = nu * nv
+    owner = np.repeat(np.arange(len(local)), count)
+    k = np.arange(count.sum()) - np.repeat(np.cumsum(count) - count, count)
+    i, j = k // nv[owner], k % nv[owner]
+    du = (r[owner, 1] - r[owner, 0]) / nu[owner]
+    dv = (r[owner, 3] - r[owner, 2]) / nv[owner]
+    u0 = r[owner, 0] + i * du
+    v0 = r[owner, 2] + j * dv
+    rects = np.stack([u0, np.where(i == nu[owner] - 1, r[owner, 1], u0 + du), v0, np.where(j == nv[owner] - 1, r[owner, 3], v0 + dv)], 1)
+    return local[owner].astype(np.int32), rects
+
+
+def _culled_topology(keep: np.ndarray) -> np.ndarray:
+    """Triangles of an n x n shell (vertex layout as _shell_topology's) over the cells ``keep``
+    (n, n) marks: both layers of each kept cell, and a side wall on every edge of a kept cell that
+    borders a dropped cell or the shell's edge, so that the kept cells stay enclosed."""
+    n = keep.shape[0]
+    m = n + 1
+    nodes = m * m
+    i, j = np.nonzero(keep)
+    a = i * m + j
+    b, c, d = a + m, a + 1, a + m + 1
+    cells = np.concatenate([np.stack([a, b, d], 1), np.stack([a, d, c], 1)])
+    tris = [cells, cells[:, ::-1] + nodes]
+    pad = np.zeros((n + 2, n + 2), bool)
+    pad[1:-1, 1:-1] = keep
+    # (neighbor offset, edge's two vertices) per cell side
+    for (di, dj), (k0, k1) in (((-1, 0), (a, c)), ((1, 0), (b, d)), ((0, -1), (a, b)), ((0, 1), (c, d))):
+        open_ = ~pad[i + 1 + di, j + 1 + dj]
+        k0, k1 = k0[open_], k1[open_]
+        tris += [np.stack([k0, k1, k1 + nodes], 1), np.stack([k0, k1 + nodes, k0 + nodes], 1)]
+    return np.concatenate(tris)
+
+
+def _curved_keep(prim: BrepPrim, local: int, rect: np.ndarray, n: int) -> np.ndarray:
+    """_trim_cells over the shell's extended parameter rectangle, keeping the cells that reach past
+    the face's range in a periodic direction (the trim test wraps them; the classification does not)."""
+    du, dv = rect[1] - rect[0], rect[3] - rect[2]
+    ext = np.array([rect[0] - MARGIN * du, rect[1] + MARGIN * du, rect[2] - MARGIN * dv, rect[3] + MARGIN * dv])
+    face = int(prim.prim_face[local])
+    keep = _trim_cells(prim, face, ext, n)
+    if keep.all():
+        return keep
+    rng, period = prim.face_range[face], prim.face_period[face]
+    eu = np.linspace(ext[0], ext[1], n + 1)
+    ev = np.linspace(ext[2], ext[3], n + 1)
+    if period[0] > 0:
+        keep |= ((eu[:-1] < rng[0]) | (eu[1:] > rng[1]))[:, None]
+    if period[1] > 0:
+        keep |= ((ev[:-1] < rng[2]) | (ev[1:] > rng[3]))[None, :]
+    return keep
+
+
+def _analytic_proxy(prim: BrepPrim, device) -> Proxy:
+    owners, rects = _analytic_pieces(prim)
+    if not len(owners):
+        return empty_proxy()
+    face = np.asarray(prim.prim_face)[owners]
+
+    def arr(values, dtype):
+        return wp.array(np.ascontiguousarray(values, np.float32), dtype=dtype, device=device)
+
+    n = CURVED_CELLS if CURVED_CELLS > 0 else GRID
+    block = 2 * (n + 1) ** 2
+    vertices = wp.empty((len(owners), block), dtype=wp.vec3, device=device)
+    wp.launch(
+        _analytic_shell_vertices,
+        dim=len(owners),
+        inputs=[
+            wp.array(np.asarray(prim.prim_kind)[owners].astype(np.int32), dtype=wp.int32, device=device),
+            arr(prim.face_origin[face], wp.vec3),
+            arr(prim.face_x[face], wp.vec3),
+            arr(prim.face_y[face], wp.vec3),
+            arr(prim.face_axis[face], wp.vec3),
+            arr(prim.face_params[face], wp.vec2),
+            arr(rects, wp.vec4),
+            wp.zeros(1, dtype=wp.vec4, device=device),
+            n,
+        ],
+        outputs=[vertices],
+        device=device,
+    )
+    if CURVED_CELLS > 0:
+        cache = {}
+        indices, tri_shell = [], []
+        for k, (local, rect) in enumerate(zip(owners, rects)):
+            keep = _curved_keep(prim, int(local), rect, n)
+            key = keep.tobytes()
+            if key not in cache:
+                cache[key] = _culled_topology(keep).astype(np.uint32)
+            tris = cache[key]
+            indices.append(tris + np.uint32(k * block))
+            tri_shell.append(np.full(len(tris), k, np.int32))
+        tri_shell = np.concatenate(tri_shell)
+        return Proxy(
+            vertices.numpy().reshape(-1, 3),
+            np.concatenate(indices),
+            owners[tri_shell],
+            np.unique(owners),
+            rects.astype(np.float32),
+            tri_shell,
+        )
+    offsets = 2 * NODES * np.arange(len(owners), dtype=np.uint32)
+    return Proxy(
+        vertices.numpy().reshape(-1, 3),
+        (SHELL_TRIANGLES.astype(np.uint32)[None] + offsets[:, None, None]).reshape(-1, 3),
+        np.repeat(owners, len(SHELL_TRIANGLES)),
+        np.unique(owners),
+        rects.astype(np.float32),
+        np.repeat(np.arange(len(owners), dtype=np.int32), len(SHELL_TRIANGLES)),
+    )
+
+
+def _face_chords(prim: BrepPrim, face: int):
+    """The face's trim chords (a0, c0, a1, c1) and bulges; a face's chords are contiguous."""
+    base, count = (int(x) for x in prim.face_slab[face])
+    lo, hi = int(prim.slab_start[base]), int(prim.slab_start[base + count])
+    ids = prim.slab_segments[lo:hi]
+    if not len(ids):
+        return np.zeros((0, 4)), np.zeros(0)
+    first, last = int(ids.min()), int(ids.max()) + 1
+    return np.asarray(prim.segments[first:last], np.float64), np.asarray(prim.segment_bulge[first:last], np.float64)
+
+
+def _trim_cells(prim: BrepPrim, face: int, rect: np.ndarray, n: int) -> np.ndarray:
+    """(n, n) mask of the cells of ``rect`` (u0, u1, v0, v1; row-major in u) that may hold points
+    the face accepts: cells that a trim chord (thickened by its bulge, which covers its curve)
+    touches, and the others whose center has inside parity (the slab test's, toward +c)."""
+    keep = np.ones((n, n), bool)
+    if not (prim.face_flags[face] & FLAG_TRIMMED):
+        return keep
+    seg, bulge = _face_chords(prim, face)
+    if not len(seg):
+        return keep
+    swap = bool(prim.face_flags[face] & FLAG_SWAP)
+    edges_u = np.linspace(rect[0], rect[1], n + 1)
+    edges_v = np.linspace(rect[2], rect[3], n + 1)
+    edges_a, edges_c = (edges_v, edges_u) if swap else (edges_u, edges_v)
+    scale = max(1.0, float(np.abs(seg).max()), *np.abs(rect))
+    slack = 64.0 * np.finfo(np.float32).eps * scale
+    # cells [a cell, c cell], grown by the slack
+    a0 = edges_a[:-1, None, None] - slack
+    a1 = edges_a[1:, None, None] + slack
+    c0 = edges_c[None, :-1, None] - slack
+    c1 = edges_c[None, 1:, None] + slack
+    r = np.abs(bulge) + slack
+    sa0, sc0, sa1, sc1 = (seg[:, k] for k in range(4))
+    boxes = (
+        (np.maximum(sa0, sa1) + r >= a0) & (np.minimum(sa0, sa1) - r <= a1)
+        & (np.maximum(sc0, sc1) + r >= c0) & (np.minimum(sc0, sc1) - r <= c1)
+    )
+    # Separating axis: the chord's normal. Signed distances of the cell's corners to the chord's line.
+    da, dc = sa1 - sa0, sc1 - sc0
+    length = np.maximum(np.hypot(da, dc), 1e-300)
+    na, nc = -dc / length, da / length
+    off = na * sa0 + nc * sc0
+    lo = np.minimum(na * a0, na * a1) + np.minimum(nc * c0, nc * c1) - off
+    hi = np.maximum(na * a0, na * a1) + np.maximum(nc * c0, nc * c1) - off
+    touched = (boxes & (lo <= r) & (hi >= -r)).any(-1)
+    # Parity at the centers of untouched cells: chords crossing the vertical line, above the center.
+    ca = 0.5 * (edges_a[:-1] + edges_a[1:])[:, None, None]
+    cc = 0.5 * (edges_c[:-1] + edges_c[1:])[None, :, None]
+    crossing = (sa0 <= ca) != (sa1 <= ca)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        height = sc0 + (ca - sa0) * (sc1 - sc0) / (sa1 - sa0)
+    inside = (np.count_nonzero(crossing & (height > cc), axis=-1) & 1) == 1
+    keep = touched | inside
+    return keep.T if swap else keep
+
+
+def _plane_proxy(prim: BrepPrim) -> Proxy:
+    """One on-plane triangle layer per planar face (PLANE_CELLS), trim-culled cell by cell."""
+    kinds = np.asarray(prim.prim_kind)
+    local = np.flatnonzero(kinds == PLANE) if (PLANE in ANALYTIC and PLANE_CELLS > 0) else np.zeros(0, int)
+    if not len(local):
+        return empty_proxy()
+    n = PLANE_CELLS
+    m = n + 1
+    i, j = np.meshgrid(np.arange(n), np.arange(n), indexing="ij")
+    a = i * m + j
+    quad = np.stack([np.stack([a, a + m, a + m + 1], -1), np.stack([a, a + m + 1, a + 1], -1)], -2)  # (n, n, 2, 3)
+    points, indices, tri_prim, rects, tri_shell = [], [], [], [], []
+    nverts = 0
+    for s, p in enumerate(local):
+        face = int(prim.prim_face[p])
+        r = np.asarray(prim.prim_uv[p], np.float64)
+        # Grown like accept_uv's tolerance, so that rounding does not open gaps at the face's edges.
+        eu = 1.0e-5 * (r[1] - r[0]) + 1.0e-7
+        ev = 1.0e-5 * (r[3] - r[2]) + 1.0e-7
+        g = np.array([r[0] - eu, r[1] + eu, r[2] - ev, r[3] + ev])
+        keep = _trim_cells(prim, face, g, n)
+        if not keep.any():
+            continue
+        u = np.linspace(g[0], g[1], m)
+        v = np.linspace(g[2], g[3], m)
+        uu, vv = np.meshgrid(u, v, indexing="ij")
+        o, x, y = prim.face_origin[face], prim.face_x[face], prim.face_y[face]
+        pts = o + uu.reshape(-1, 1) * x + vv.reshape(-1, 1) * y
+        tris = quad[keep].reshape(-1, 3) + nverts
+        points.append(pts)
+        indices.append(tris)
+        tri_prim.append(np.full(len(tris), p, np.int32))
+        tri_shell.append(np.full(len(tris), len(rects), np.int32))
+        rects.append(r)
+        nverts += len(pts)
+    if not rects:
+        return empty_proxy()
+    return Proxy(
+        np.concatenate(points).astype(np.float32),
+        np.concatenate(indices).astype(np.uint32),
+        np.concatenate(tri_prim),
+        np.unique(local),
+        np.asarray(rects, np.float32),
+        np.concatenate(tri_shell),
+    )
+
+
+def _concat(a: Proxy, b: Proxy) -> Proxy:
+    if not len(b.indices):
+        return a
+    if not len(a.indices):
+        return b
+    return Proxy(
+        np.concatenate([a.points, b.points]),
+        np.concatenate([a.indices, b.indices + np.uint32(len(a.points))]),
+        np.concatenate([a.tri_prim, b.tri_prim]),
+        np.concatenate([a.patches, b.patches]),
+        np.concatenate([a.shell_uv, b.shell_uv]),
+        np.concatenate([a.tri_shell, b.tri_shell + np.int32(len(a.shell_uv))]),
     )
 
 
@@ -183,9 +498,10 @@ def build_proxy(prim: BrepPrim, device=None) -> Proxy:
         & np.all((degree >= 1) & (degree < MAX_ORDER), axis=1)
         & ~np.all(degree == (3, 4), axis=1)
     ).astype(np.int32)
-    if not len(patches):
-        return empty_proxy()
     device = wp.get_device(device)
+    analytic = _concat(_analytic_proxy(prim, device), _plane_proxy(prim)) if ANALYTIC else empty_proxy()
+    if not len(patches):
+        return analytic
     # Each patch's control points relative to its first one, shifted in float64 (see _shell).
     base = prim.prim_cv[patches].astype(np.int64)
     count = np.prod(prim.prim_degree[patches].astype(np.int64) + 1, axis=1)
@@ -209,12 +525,15 @@ def build_proxy(prim: BrepPrim, device=None) -> Proxy:
         device=device,
     )
     offsets = 2 * NODES * np.arange(len(patches), dtype=np.uint32)
-    return Proxy(
+    nurbs = Proxy(
         vertices.numpy().reshape(-1, 3),
         (SHELL_TRIANGLES.astype(np.uint32)[None] + offsets[:, None, None]).reshape(-1, 3),
         np.repeat(patches, len(SHELL_TRIANGLES)),
         patches,
+        np.asarray(prim.prim_uv[patches], np.float32).reshape(-1, 4),
+        np.repeat(np.arange(len(patches), dtype=np.int32), len(SHELL_TRIANGLES)),
     )
+    return _concat(nurbs, analytic)
 
 
 def shell_sbt_indices(prim: BrepPrim, proxy: Proxy) -> np.ndarray:

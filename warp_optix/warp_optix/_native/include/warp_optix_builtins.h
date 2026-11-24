@@ -121,6 +121,16 @@ WP_OPTIX_SCALAR(uint32, optix_get_hit_kind, optixGetHitKind)
 WP_OPTIX_SCALAR(uint32, optix_get_transform_list_size, optixGetTransformListSize)
 WP_OPTIX_SCALAR(int32, optix_get_exception_code, optixGetExceptionCode)
 
+// The GPU's global nanosecond timer (%globaltimer), for timing device code such as per-pixel cost
+// heatmaps. Unlike clock64 it is consistent across SMs, so it stays valid when shader execution
+// reordering moves a thread between SMs; its update granularity is coarser (up to about 1 us).
+inline CUDA_CALLABLE_DEVICE uint64 optix_global_timer()
+{
+    unsigned long long ns;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(ns));
+    return uint64(ns);
+}
+
 WP_OPTIX_SCALAR(bool, optix_hit_object_is_hit, optixHitObjectIsHit)
 WP_OPTIX_SCALAR(bool, optix_hit_object_is_miss, optixHitObjectIsMiss)
 WP_OPTIX_VEC3(optix_hit_object_get_world_ray_origin, optixHitObjectGetWorldRayOrigin)

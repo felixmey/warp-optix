@@ -164,8 +164,17 @@ The viewer follows the earlier hybrid viewer controls:
 - WASD or arrow keys move the camera; Q/E move along the model up axis.
 - Left drag looks around and the scroll wheel changes field of view.
 - Right click and drag picks bodies when a `picking_factory` is supplied.
-- Space pauses, Escape closes, and 0-8 select path-tracing debug buffers.
+- Space pauses, Escape closes, and 0-9 select path-tracing debug buffers.
 - P saves a screenshot.
+- B toggles a BRep debug view: NURBS patches render as their triangle shells (flat facets) instead of the
+  exact surface; combine it with 3 (normals) to see facets, side walls and shells over trimmed-away regions.
+  Shells are colored per patch: outer layer bright, inner layer dark, side walls pale.
+- 9 shows a per-pixel cost heatmap: raygen time per pixel (GPU global timer, a running average), on a log scale around the
+  mean cost of the non-background pixels (blue 1/8 of it, green the mean, red 8x). `PathTracer.get_pixel_times()` returns the nanoseconds.
+- X toggles a BRep debug view of the AABBs that analytic faces (and NURBS patches without shells) are traced
+  through, colored per primitive.
+- 9, B and X switch to a separately compiled debug pipeline while any of them is on (the first switch
+  compiles it); the normal pipeline carries none of their code, so they cost nothing when off.
 
 `register_ui_callback()` adds application controls to the optional ImGui panel.
 The panel also exposes rendering statistics, denoiser state, visualization flags,

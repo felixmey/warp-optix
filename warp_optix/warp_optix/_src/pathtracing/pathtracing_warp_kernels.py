@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import os
 import warp as wp
 
 import warp_optix as wo
@@ -297,6 +298,9 @@ class PathtraceLaunchParams:
     diffuse_output: wp.array2d(dtype=wp.vec4)
     specular_output: wp.array2d(dtype=wp.vec4)
     spec_hit_dist_output: wp.array2d(dtype=wp.float32)
+    # Per-pixel cost (FLAGS_TIME_PIXELS, viewer debug mode 9): raygen start time, smoothed raygen nanoseconds.
+    pixel_clock: wp.array2d(dtype=wp.uint64)
+    pixel_time_output: wp.array2d(dtype=wp.float32)
 
 
 @wp.func
@@ -1347,6 +1351,12 @@ FLAGS_USE_PATH_REGULARIZATION = wp.uint32(4)
 FLAGS_CULL_BACK_FACES = wp.uint32(8)
 # No light reaches the inside of a closed solid with opaque faces: paths that meet a face from inside stop there.
 FLAGS_DARK_SOLID_INTERIORS = wp.uint32(16)
+# Debug view: BRep shells render as the triangles they are (flat facets), not refined to the exact surface.
+FLAGS_SHOW_BREP_SHELLS = wp.uint32(32)
+# Debug view: BRep primitives traced through AABBs (analytic faces, unshelled patches) render as those boxes.
+FLAGS_SHOW_BREP_BOXES = wp.uint32(64)
+# Debug output (viewer mode 9): time each pixel's raygen (pixel_clock, pixel_time_output).
+FLAGS_TIME_PIXELS = wp.uint32(128)
 # Payload front_face values: the back side of a face, its front side, the back (inner) side of a face of a
 # closed solid (FLAG_CLOSED: open "solids", like rods without end caps, keep FACE_BACK).
 FACE_BACK = wp.constant(wp.uint32(0))
@@ -2621,6 +2631,69 @@ def _filter_roughness_for_normal_map(microfacet_roughness: wp.float32, tangent_n
 
 
 @wp.func
+def _start_pixel_timer(params: PathtraceLaunchParams, x: int, y: int):
+    """FLAGS_TIME_PIXELS: remember when this pixel's raygen started (in memory: a 64-bit clock kept
+    live across the traces would cost registers in every mode). The global timer, not clock64: shader
+    execution reordering can move the thread to another SM, whose cycle counter differs."""
+    if (params.flags & FLAGS_TIME_PIXELS) != wp.uint32(0):
+        params.pixel_clock[y, x] = wp.optix_global_timer()
+
+
+@wp.func
+def _stop_pixel_timer(params: PathtraceLaunchParams, x: int, y: int):
+    """FLAGS_TIME_PIXELS: fold this launch's raygen time (ns) into the pixel's running average."""
+    if (params.flags & FLAGS_TIME_PIXELS) != wp.uint32(0):
+        start = params.pixel_clock[y, x]
+        now = wp.optix_global_timer()
+        ns = wp.where(now > start, float(now - start), 0.0)
+        previous = params.pixel_time_output[y, x]
+        params.pixel_time_output[y, x] = wp.where(previous > 0.0, previous + 0.1 * (ns - previous), ns)
+
+
+@wp.func
+def _brep_shell_debug_color(patch: int, layer: int) -> wp.vec3:
+    """A distinct color per shell patch: full on the outer layer, dark on the inner one, pale on
+    side walls; softer on the AABBs of the box view (layer 4)."""
+    h = _hash_u32(wp.uint32(patch) * wp.uint32(2654435761) + wp.uint32(1))
+    c = (
+        wp.vec3(
+            float(h & wp.uint32(255)),
+            float((h >> wp.uint32(8)) & wp.uint32(255)),
+            float((h >> wp.uint32(16)) & wp.uint32(255)),
+        )
+        / 255.0
+    )
+    # Spread toward saturated hues: stretch each channel away from the mean.
+    mean = (c[0] + c[1] + c[2]) / 3.0
+    c = wp.vec3(
+        wp.clamp(0.55 + 1.6 * (c[0] - mean), 0.05, 1.0),
+        wp.clamp(0.55 + 1.6 * (c[1] - mean), 0.05, 1.0),
+        wp.clamp(0.55 + 1.6 * (c[2] - mean), 0.05, 1.0),
+    )
+    if layer == 2:
+        c = c * 0.3
+    elif layer == 3:
+        c = c * 0.25 + wp.vec3(0.75)
+    elif layer == 4:  # AABB of an exactly traced primitive (box view): softer, so shells stand out
+        c = c * 0.6 + wp.vec3(0.25)
+    return c
+
+
+@wp.func
+def _apply_brep_debug_color(pbr: ShadedHitData, texture_lod: float, uv: wp.vec2) -> ShadedHitData:
+    """BRep debug views: hits tagged with a negative texture LOD (_brep_shell_record_facet, box view)
+    take a flat debug color by primitive (uv[0]) and layer (-texture_lod)."""
+    out = pbr
+    if texture_lod < 0.0:
+        out.diffuse = _brep_shell_debug_color(int(uv[0]), int(-texture_lod))
+        out.metallic = 0.0
+        out.roughness = 0.6 * 0.6
+        out.opacity = 1.0
+        out.transmission = 0.0
+    return out
+
+
+@wp.func
 def _evaluate_material_from_payload(
     params: PathtraceLaunchParams,
     material_id: wp.int32,
@@ -2834,11 +2907,12 @@ def _evaluate_material_from_payload(
 
 # The renderer enables fast math for every program through the pipeline's module options. This avoids the
 # precise sin/cos range reduction, which spills to local memory and uses fp64 instructions.
-def _make_primary_raygen(reorder_bounces: bool):
+def _make_primary_raygen(reorder_bounces: bool, debug_views: bool = False):
     """The raygen program; ``reorder_bounces`` reorders threads by bounce direction before tracing
     bounce rays (shader execution reordering). That pays off when intersection programs dominate
     (BReps: 1.6x on a dense assembly), but triangle-only scenes run 10-20% slower even with the
-    reorder skipped at runtime, so it is compiled into a separate variant.
+    reorder skipped at runtime, so it is compiled into a separate variant. ``debug_views`` compiles in
+    the debug views (pixel timing, BRep debug colors), like _make_brep_programs.
     """
 
     @wo.kernel(kind=wo.ProgramKind.RAYGEN)
@@ -2852,6 +2926,8 @@ def _make_primary_raygen(reorder_bounces: bool):
         height = int(params.height)
         if x >= width or y >= height:
             return
+        if wp.static(debug_views):
+            _start_pixel_timer(params, x, y)
 
         rng = _xxhash32(wp.uint32(x), wp.uint32(y), params.frame_index)
 
@@ -2928,6 +3004,8 @@ def _make_primary_raygen(reorder_bounces: bool):
                 hit_uv1,
                 hit_barycentrics[0],
             )
+            if wp.static(debug_views):
+                pbr = _apply_brep_debug_color(pbr, hit_barycentrics[0], hit_uv)
             pbr = _set_incident_medium_for_hit(pbr, _payload_get_front_face(payload))
 
             # C++ line 253: origin = offsetRay(hitPos, pbrMat.Ng) — use geometric normal
@@ -3065,6 +3143,8 @@ def _make_primary_raygen(reorder_bounces: bool):
             params.diffuse_output[y, x] = aux_diffuse_albedo
             params.specular_output[y, x] = aux_specular_albedo
             params.spec_hit_dist_output[y, x] = aux_spec_hit_dist
+            if wp.static(debug_views):
+                _stop_pixel_timer(params, x, y)
             return
 
         # No opaque hit found after PSR chain (matches C++ !foundOpaqueHit path).
@@ -3078,6 +3158,8 @@ def _make_primary_raygen(reorder_bounces: bool):
             params.diffuse_output[y, x] = wp.vec4(0.0, 0.0, 0.0, 0.0)
             params.specular_output[y, x] = wp.vec4(0.0, 0.0, 0.0, 0.0)
             params.spec_hit_dist_output[y, x] = wp.float32(0.0)
+            if wp.static(debug_views):
+                _stop_pixel_timer(params, x, y)
             return
 
         # The PSR traversal already evaluated the terminal surface. Reuse it here;
@@ -3409,6 +3491,8 @@ def _make_primary_raygen(reorder_bounces: bool):
                 sec_uv1,
                 _payload_get_barycentrics(sec_payload)[0],
             )
+            if wp.static(debug_views):
+                sec_pbr = _apply_brep_debug_color(sec_pbr, _payload_get_barycentrics(sec_payload)[0], sec_uv)
             sec_pbr = _set_incident_medium_for_hit(sec_pbr, _payload_get_front_face(sec_payload))
 
             # C++ secondary_rchit.h lines 278-283: path regularization
@@ -3608,12 +3692,16 @@ def _make_primary_raygen(reorder_bounces: bool):
 
         params.color_output[y, x] = wp.vec4(out_color[0], out_color[1], out_color[2], primary_opacity)
         params.spec_hit_dist_output[y, x] = aux_spec_hit_dist
+        if wp.static(debug_views):
+            _stop_pixel_timer(params, x, y)
 
     return primary_raygen
 
 
 primary_raygen = _make_primary_raygen(False)
 primary_raygen_reorder = _make_primary_raygen(True)
+primary_raygen_debug = _make_primary_raygen(False, debug_views=True)
+primary_raygen_reorder_debug = _make_primary_raygen(True, debug_views=True)
 
 
 @wo.kernel(kind=wo.ProgramKind.MISS)
@@ -4072,31 +4160,6 @@ def _brep_local_primitive(params: PathtraceLaunchParams, inst_id: int) -> int:
     return int(wp.optix_get_primitive_index()) - int(params.packed_indices[int(rp.index_offset)])
 
 
-@wo.kernel(kind=wo.ProgramKind.INTERSECTION)
-@wp.kernel(module="unique")
-def brep_intersection(params: PathtraceLaunchParams):
-    """Exact ray/BRep-face intersection: planes, cylinders, cones and spheres. The primitive index is
-    global: BRep GASes offset their primitive indices."""
-    brep_device.intersect_quadric(
-        params.brep,
-        int(wp.optix_get_primitive_index()),
-        wp.optix_get_object_ray_origin(),
-        wp.optix_get_object_ray_direction(),
-    )
-
-
-@wo.kernel(kind=wo.ProgramKind.INTERSECTION)
-@wp.kernel(module="unique")
-def brep_curved_intersection(params: PathtraceLaunchParams):
-    """Exact ray/BRep-face intersection: tori and trimmed NURBS sub-patches (see intersect_curved)."""
-    brep_device.intersect_curved(
-        params.brep,
-        int(wp.optix_get_primitive_index()),
-        wp.optix_get_object_ray_origin(),
-        wp.optix_get_object_ray_direction(),
-    )
-
-
 @wp.func
 def _brep_hit_geometry(
     params: PathtraceLaunchParams,
@@ -4131,25 +4194,6 @@ def _brep_hit_geometry(
     return geo, front_face
 
 
-@wo.kernel(kind=wo.ProgramKind.CLOSEST_HIT)
-@wp.kernel(module="unique")
-def brep_primary_closest_hit(params: PathtraceLaunchParams):
-    """Adapt a BRep hit (attributes u, v, outward normal, face) to the shared PBR payload."""
-    inst_id = int(wp.optix_get_instance_id())
-    primitive_id = _brep_local_primitive(params, inst_id)
-    u = wp.optix_uint32_as_float(wp.optix_get_attribute(0))
-    v = wp.optix_uint32_as_float(wp.optix_get_attribute(1))
-    n_obj = wp.vec3(
-        wp.optix_uint32_as_float(wp.optix_get_attribute(2)),
-        wp.optix_uint32_as_float(wp.optix_get_attribute(3)),
-        wp.optix_uint32_as_float(wp.optix_get_attribute(4)),
-    )
-    geo, front_face = _brep_hit_geometry(params, inst_id, primitive_id, u, v, n_obj, wp.optix_get_world_ray_direction())
-    if front_face == FACE_BACK and _brep_closed(params, int(wp.optix_get_primitive_index())):
-        front_face = FACE_SOLID_INSIDE
-    _store_primary_hit_payload(geo, wp.int32(inst_id), wp.int32(primitive_id), front_face, u, v)
-
-
 @wp.func
 def _brep_shell_hit(params: PathtraceLaunchParams):
     """Exact hit behind the crossed shell triangle of a bicubic patch: its render primitive's
@@ -4173,14 +4217,25 @@ def _brep_shell_generic_hit(params: PathtraceLaunchParams):
     inst_id = int(wp.optix_get_instance_id())
     primitive_id = int(wp.optix_get_primitive_index())
     rp = params.render_primitives[int(params.instance_render_prim_ids[inst_id])]
+    tri = int(rp.vertex_buffer.position_offset) + primitive_id
+    if wp.static(brep_proxy_analytic()):
+        # EXPERIMENT (proxy.ANALYTIC): analytic face pieces share this hit group.
+        if (params.brep.prims[int(params.brep.proxy_prim[tri])].flags >> brep_device.KIND_SHIFT) != brep_device.NURBS:
+            return brep_device.proxy_hit_analytic(
+                params.brep, tri, primitive_id, wp.optix_get_object_ray_origin(), wp.optix_get_object_ray_direction()
+            )
     return brep_device.proxy_hit_bezier(
         params.brep,
-        int(rp.vertex_buffer.position_offset) + primitive_id,
+        tri,
         primitive_id,
         wp.optix_get_triangle_barycentrics(),
         wp.optix_get_object_ray_origin(),
         wp.optix_get_object_ray_direction(),
     )
+
+
+def brep_proxy_analytic() -> bool:
+    return bool(os.environ.get("WO_SHELL_ANALYTIC", ""))
 
 
 @wp.func
@@ -4237,20 +4292,33 @@ def _brep_shell_record(
         wp.optix_ignore_intersection()
 
 
-@wo.kernel(kind=wo.ProgramKind.ANY_HIT)
-@wp.kernel(module="unique")
-def brep_shell_any_hit(params: PathtraceLaunchParams):
-    """Refine a bicubic patch's shell crossing to the exact surface (see _brep_shell_record)."""
-    ok, hit_t, u, v, n_obj, face, keep_searching = _brep_shell_hit(params)
-    _brep_shell_record(params, ok, hit_t, u, v, n_obj, face, keep_searching)
-
-
-@wo.kernel(kind=wo.ProgramKind.ANY_HIT)
-@wp.kernel(module="unique")
-def brep_shell_generic_any_hit(params: PathtraceLaunchParams):
-    """brep_shell_any_hit for the shells of sub-patches of other degrees."""
-    ok, hit_t, u, v, n_obj, face, keep_searching = _brep_shell_generic_hit(params)
-    _brep_shell_record(params, ok, hit_t, u, v, n_obj, face, keep_searching)
+@wp.func
+def _brep_shell_record_facet(params: PathtraceLaunchParams):
+    """Debug view (FLAGS_SHOW_BREP_SHELLS): accept the shell triangle itself, flat-shaded with its
+    facet normal. Accepting shrinks tmax, so the nearest shell triangle (or exact analytic face) wins."""
+    inst_id = int(wp.optix_get_instance_id())
+    primitive_id = int(wp.optix_get_primitive_index())
+    vertices = wp.optix_get_triangle_vertex_data()
+    n_obj = wp.cross(vertices[1] - vertices[0], vertices[2] - vertices[0])
+    bary = wp.optix_get_triangle_barycentrics()
+    geo, front_face = _brep_hit_geometry(
+        params, inst_id, primitive_id, bary[0], bary[1], n_obj, wp.optix_get_world_ray_direction()
+    )
+    # Debug color code for _evaluate_material_from_payload: a negative texture LOD marks the shell
+    # layer (-1 outer, -2 inner, -3 side wall), uv[0] carries the patch's global BRep primitive.
+    rp = params.render_primitives[int(params.instance_render_prim_ids[inst_id])]
+    patch = int(params.brep.proxy_prim[int(rp.vertex_buffer.position_offset) + primitive_id])
+    local = primitive_id % (params.brep.shell_st.shape[0] // 3)
+    layer = wp.where(
+        local < brep_device.SHELL_LAYER_TRIANGLES, 1, wp.where(local < 2 * brep_device.SHELL_LAYER_TRIANGLES, 2, 3)
+    )
+    geo.texture_lod = -float(layer)
+    geo.uv = wp.vec2(float(patch), 0.0)
+    geo.uv1 = geo.uv
+    # Shell triangles are not consistently oriented (side walls): never treat a facet as a solid's inside.
+    _write_primary_payload(
+        geo, wp.int32(inst_id), wp.int32(primitive_id), FACE_FRONT, bary[0], bary[1], wp.optix_get_ray_tmax()
+    )
 
 
 @wo.kernel(kind=wo.ProgramKind.CLOSEST_HIT)
@@ -4258,28 +4326,6 @@ def brep_shell_generic_any_hit(params: PathtraceLaunchParams):
 def brep_shell_closest_hit(params: PathtraceLaunchParams):
     """The shell any-hits already left the nearest exact hit in the payload."""
     pass
-
-
-@wo.kernel(kind=wo.ProgramKind.ANY_HIT)
-@wp.kernel(module="unique")
-def brep_shell_secondary_any_hit(params: PathtraceLaunchParams):
-    """Shadow rays: occluded only where the ray really crosses the exact BRep surface."""
-    ok, hit_t, u, v, n_obj, face, keep_searching = _brep_shell_hit(params)
-    if not ok:
-        wp.optix_ignore_intersection()
-        return
-    _secondary_any_hit(params)
-
-
-@wo.kernel(kind=wo.ProgramKind.ANY_HIT)
-@wp.kernel(module="unique")
-def brep_shell_generic_secondary_any_hit(params: PathtraceLaunchParams):
-    """brep_shell_secondary_any_hit for the shells of sub-patches of other degrees."""
-    ok, hit_t, u, v, n_obj, face, keep_searching = _brep_shell_generic_hit(params)
-    if not ok:
-        wp.optix_ignore_intersection()
-        return
-    _secondary_any_hit(params)
 
 
 @wp.func
@@ -4357,6 +4403,141 @@ DYNAMIC_BUILD_FLAGS = (
 )
 
 
+def _make_brep_programs(debug_views: bool) -> dict:
+    """The BRep intersection, closest-hit and shell any-hit programs. ``debug_views`` compiles in the
+    debug views (FLAGS_SHOW_BREP_SHELLS, FLAGS_SHOW_BREP_BOXES); the renderer swaps to that pipeline
+    only while a debug view is on, since even untaken branches in these hot programs cost (registers
+    OptiX saves per call, i-cache)."""
+
+    @wo.kernel(kind=wo.ProgramKind.INTERSECTION)
+    @wp.kernel(module="unique")
+    def brep_intersection(params: PathtraceLaunchParams):
+        """Exact ray/BRep-face intersection: planes, cylinders, cones and spheres. The primitive index
+        is global: BRep GASes offset their primitive indices."""
+        if wp.static(debug_views):
+            if (params.flags & FLAGS_SHOW_BREP_BOXES) != wp.uint32(0):
+                brep_device.intersect_box(
+                    params.brep,
+                    int(wp.optix_get_primitive_index()),
+                    wp.optix_get_object_ray_origin(),
+                    wp.optix_get_object_ray_direction(),
+                )
+                return
+        brep_device.intersect_quadric(
+            params.brep,
+            int(wp.optix_get_primitive_index()),
+            wp.optix_get_object_ray_origin(),
+            wp.optix_get_object_ray_direction(),
+        )
+
+    @wo.kernel(kind=wo.ProgramKind.INTERSECTION)
+    @wp.kernel(module="unique")
+    def brep_curved_intersection(params: PathtraceLaunchParams):
+        """Exact ray/BRep-face intersection: tori and trimmed NURBS sub-patches (see intersect_curved)."""
+        if wp.static(debug_views):
+            if (params.flags & FLAGS_SHOW_BREP_BOXES) != wp.uint32(0):
+                brep_device.intersect_box(
+                    params.brep,
+                    int(wp.optix_get_primitive_index()),
+                    wp.optix_get_object_ray_origin(),
+                    wp.optix_get_object_ray_direction(),
+                )
+                return
+        brep_device.intersect_curved(
+            params.brep,
+            int(wp.optix_get_primitive_index()),
+            wp.optix_get_object_ray_origin(),
+            wp.optix_get_object_ray_direction(),
+        )
+
+    @wo.kernel(kind=wo.ProgramKind.CLOSEST_HIT)
+    @wp.kernel(module="unique")
+    def brep_primary_closest_hit(params: PathtraceLaunchParams):
+        """Adapt a BRep hit (attributes u, v, outward normal, face) to the shared PBR payload."""
+        inst_id = int(wp.optix_get_instance_id())
+        primitive_id = _brep_local_primitive(params, inst_id)
+        u = wp.optix_uint32_as_float(wp.optix_get_attribute(0))
+        v = wp.optix_uint32_as_float(wp.optix_get_attribute(1))
+        n_obj = wp.vec3(
+            wp.optix_uint32_as_float(wp.optix_get_attribute(2)),
+            wp.optix_uint32_as_float(wp.optix_get_attribute(3)),
+            wp.optix_uint32_as_float(wp.optix_get_attribute(4)),
+        )
+        geo, front_face = _brep_hit_geometry(
+            params, inst_id, primitive_id, u, v, n_obj, wp.optix_get_world_ray_direction()
+        )
+        if front_face == FACE_BACK and _brep_closed(params, int(wp.optix_get_primitive_index())):
+            front_face = FACE_SOLID_INSIDE
+        if wp.static(debug_views):
+            if (params.flags & FLAGS_SHOW_BREP_BOXES) != wp.uint32(0):
+                # Box view: color by primitive (_apply_brep_debug_color, layer code 4 = box).
+                geo.texture_lod = -4.0
+                geo.uv = wp.vec2(float(int(wp.optix_get_primitive_index())), 0.0)
+                geo.uv1 = geo.uv
+                front_face = FACE_FRONT
+        _store_primary_hit_payload(geo, wp.int32(inst_id), wp.int32(primitive_id), front_face, u, v)
+
+    @wo.kernel(kind=wo.ProgramKind.ANY_HIT)
+    @wp.kernel(module="unique")
+    def brep_shell_any_hit(params: PathtraceLaunchParams):
+        """Refine a bicubic patch's shell crossing to the exact surface (see _brep_shell_record)."""
+        if wp.static(debug_views):
+            if (params.flags & FLAGS_SHOW_BREP_SHELLS) != wp.uint32(0):
+                _brep_shell_record_facet(params)
+                return
+        ok, hit_t, u, v, n_obj, face, keep_searching = _brep_shell_hit(params)
+        _brep_shell_record(params, ok, hit_t, u, v, n_obj, face, keep_searching)
+
+    @wo.kernel(kind=wo.ProgramKind.ANY_HIT)
+    @wp.kernel(module="unique")
+    def brep_shell_generic_any_hit(params: PathtraceLaunchParams):
+        """brep_shell_any_hit for the shells of sub-patches of other degrees."""
+        if wp.static(debug_views):
+            if (params.flags & FLAGS_SHOW_BREP_SHELLS) != wp.uint32(0):
+                _brep_shell_record_facet(params)
+                return
+        ok, hit_t, u, v, n_obj, face, keep_searching = _brep_shell_generic_hit(params)
+        _brep_shell_record(params, ok, hit_t, u, v, n_obj, face, keep_searching)
+
+    @wo.kernel(kind=wo.ProgramKind.ANY_HIT)
+    @wp.kernel(module="unique")
+    def brep_shell_secondary_any_hit(params: PathtraceLaunchParams):
+        """Shadow rays: occluded only where the ray really crosses the exact BRep surface."""
+        if wp.static(debug_views):
+            if (params.flags & FLAGS_SHOW_BREP_SHELLS) != wp.uint32(0):
+                _secondary_any_hit(params)
+                return
+        ok, hit_t, u, v, n_obj, face, keep_searching = _brep_shell_hit(params)
+        if not ok:
+            wp.optix_ignore_intersection()
+            return
+        _secondary_any_hit(params)
+
+    @wo.kernel(kind=wo.ProgramKind.ANY_HIT)
+    @wp.kernel(module="unique")
+    def brep_shell_generic_secondary_any_hit(params: PathtraceLaunchParams):
+        """brep_shell_secondary_any_hit for the shells of sub-patches of other degrees."""
+        if wp.static(debug_views):
+            if (params.flags & FLAGS_SHOW_BREP_SHELLS) != wp.uint32(0):
+                _secondary_any_hit(params)
+                return
+        ok, hit_t, u, v, n_obj, face, keep_searching = _brep_shell_generic_hit(params)
+        if not ok:
+            wp.optix_ignore_intersection()
+            return
+        _secondary_any_hit(params)
+
+    return {
+        "intersection": brep_intersection,
+        "curved_intersection": brep_curved_intersection,
+        "closest_hit": brep_primary_closest_hit,
+        "shell_any_hit": brep_shell_any_hit,
+        "shell_generic_any_hit": brep_shell_generic_any_hit,
+        "shell_secondary_any_hit": brep_shell_secondary_any_hit,
+        "shell_generic_secondary_any_hit": brep_shell_generic_secondary_any_hit,
+    }
+
+
 def _hit_groups(primary_closest_hit, builtin=None, build_flags=wo.BuildFlags.PREFER_FAST_TRACE, intersection=None):
     return {
         "primary": wo.HitGroup(
@@ -4368,33 +4549,41 @@ def _hit_groups(primary_closest_hit, builtin=None, build_flags=wo.BuildFlags.PRE
     }
 
 
-# Hit groups are named by the scene geometry's hit_group.
-SBT = wo.SbtLayout(
-    ray_types=RAY_TYPES,
-    miss={"primary": primary_miss, "secondary": secondary_miss},
-    hit_groups={
-        "triangles": _hit_groups(primary_closest_hit),
-        "round_linear": _hit_groups(curve_primary_closest_hit, wo.PrimitiveType.ROUND_LINEAR, STATIC_BUILD_FLAGS),
-        "round_cubic_bezier": _hit_groups(
-            curve_primary_closest_hit, wo.PrimitiveType.ROUND_CUBIC_BEZIER, STATIC_BUILD_FLAGS
-        ),
-        "round_linear_dynamic": _hit_groups(
-            curve_primary_closest_hit, wo.PrimitiveType.ROUND_LINEAR, DYNAMIC_BUILD_FLAGS
-        ),
-        "round_cubic_bezier_dynamic": _hit_groups(
-            curve_primary_closest_hit, wo.PrimitiveType.ROUND_CUBIC_BEZIER, DYNAMIC_BUILD_FLAGS
-        ),
-        "brep": _hit_groups(brep_primary_closest_hit, intersection=brep_intersection),
-        # Must follow "brep": a BRep primitive's SBT index 1 selects it (tori, NURBS sub-patches).
-        "brep_curved": _hit_groups(brep_primary_closest_hit, intersection=brep_curved_intersection),
-        "brep_shell": {
-            "primary": wo.HitGroup(brep_shell_closest_hit, brep_shell_any_hit),
-            "secondary": wo.HitGroup(secondary_closest_hit, brep_shell_secondary_any_hit),
+def _make_sbt(debug_views: bool) -> wo.SbtLayout:
+    """Hit groups are named by the scene geometry's hit_group; both variants share the layout (the
+    scene's SBT offsets), only the BRep programs differ (see _make_brep_programs)."""
+    brep = _make_brep_programs(debug_views)
+    return wo.SbtLayout(
+        ray_types=RAY_TYPES,
+        miss={"primary": primary_miss, "secondary": secondary_miss},
+        hit_groups={
+            "triangles": _hit_groups(primary_closest_hit),
+            "round_linear": _hit_groups(curve_primary_closest_hit, wo.PrimitiveType.ROUND_LINEAR, STATIC_BUILD_FLAGS),
+            "round_cubic_bezier": _hit_groups(
+                curve_primary_closest_hit, wo.PrimitiveType.ROUND_CUBIC_BEZIER, STATIC_BUILD_FLAGS
+            ),
+            "round_linear_dynamic": _hit_groups(
+                curve_primary_closest_hit, wo.PrimitiveType.ROUND_LINEAR, DYNAMIC_BUILD_FLAGS
+            ),
+            "round_cubic_bezier_dynamic": _hit_groups(
+                curve_primary_closest_hit, wo.PrimitiveType.ROUND_CUBIC_BEZIER, DYNAMIC_BUILD_FLAGS
+            ),
+            "brep": _hit_groups(brep["closest_hit"], intersection=brep["intersection"]),
+            # Must follow "brep": a BRep primitive's SBT index 1 selects it (tori, NURBS sub-patches).
+            "brep_curved": _hit_groups(brep["closest_hit"], intersection=brep["curved_intersection"]),
+            "brep_shell": {
+                "primary": wo.HitGroup(brep_shell_closest_hit, brep["shell_any_hit"]),
+                "secondary": wo.HitGroup(secondary_closest_hit, brep["shell_secondary_any_hit"]),
+            },
+            # Must follow "brep_shell": a shell triangle's SBT index 1 selects it (non-bicubic patches).
+            "brep_shell_generic": {
+                "primary": wo.HitGroup(brep_shell_closest_hit, brep["shell_generic_any_hit"]),
+                "secondary": wo.HitGroup(secondary_closest_hit, brep["shell_generic_secondary_any_hit"]),
+            },
         },
-        # Must follow "brep_shell": a shell triangle's SBT index 1 selects it (non-bicubic patches).
-        "brep_shell_generic": {
-            "primary": wo.HitGroup(brep_shell_closest_hit, brep_shell_generic_any_hit),
-            "secondary": wo.HitGroup(secondary_closest_hit, brep_shell_generic_secondary_any_hit),
-        },
-    },
-)
+    )
+
+
+SBT = _make_sbt(False)
+# With the debug views (BRep shells / boxes, pixel time) compiled in; used only while one is on.
+SBT_DEBUG = _make_sbt(True)

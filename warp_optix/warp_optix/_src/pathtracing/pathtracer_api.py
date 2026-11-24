@@ -178,6 +178,31 @@ class PathTracer:
         """Globally enable or disable triangle backface culling at runtime."""
         self._viewer.set_backface_culling(enabled)
 
+    @property
+    def show_brep_shells(self) -> bool:
+        """Whether BRep NURBS shells render as their triangles (debug view) instead of the exact surface."""
+        return bool(self._viewer.show_brep_shells)
+
+    def set_show_brep_shells(self, enabled: bool) -> None:
+        """Debug view: render BRep NURBS shells as flat triangles instead of the exact surface."""
+        self._viewer.set_show_brep_shells(enabled)
+
+    @property
+    def show_brep_boxes(self) -> bool:
+        """Whether BRep primitives traced through AABBs render as those boxes (debug view)."""
+        return bool(self._viewer.show_brep_boxes)
+
+    def set_show_brep_boxes(self, enabled: bool) -> None:
+        """Debug view: render BRep primitives traced through AABBs (analytic faces, unshelled NURBS
+        patches) as their boxes instead of the exact surface."""
+        self._viewer.set_show_brep_boxes(enabled)
+
+    def get_pixel_times(self):
+        """Raygen nanoseconds per pixel (GPU global timer) from the pixel-time debug mode (``set_debug_buffer_mode(9)``),
+        a running average over recent frames; rows bottom-up like ``get_frame``."""
+        self.initialize()
+        return self._viewer.get_pixel_times()
+
     def set_ray_budget(
         self,
         *,

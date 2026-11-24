@@ -151,6 +151,16 @@ class _FakePathTracer:
     def set_debug_buffer_mode(self, mode):
         self.debug_mode = int(mode)
 
+    show_brep_shells = False
+
+    def set_show_brep_shells(self, enabled):
+        self.show_brep_shells = bool(enabled)
+
+    show_brep_boxes = False
+
+    def set_show_brep_boxes(self, enabled):
+        self.show_brep_boxes = bool(enabled)
+
     def set_environment_color(self, color):
         self.environment_color = tuple(color)
 
@@ -485,6 +495,8 @@ def test_debug_and_bridge_transform_compatibility():
         SPACE=10,
         ESCAPE=11,
         P=14,
+        B=15,
+        X=16,
         _0=20,
         _1=21,
         _2=22,
@@ -494,6 +506,7 @@ def test_debug_and_bridge_transform_compatibility():
         _6=26,
         _7=27,
         _8=28,
+        _9=30,
         BACKSPACE=29,
     )
     viewer._presenter = SimpleNamespace(pyglet=SimpleNamespace(window=SimpleNamespace(key=key)))
@@ -501,6 +514,18 @@ def test_debug_and_bridge_transform_compatibility():
     assert api.debug_mode == 2
     viewer.on_key_press(key._1, None)
     assert api.debug_mode == 0
+    viewer.on_key_press(key._9, None)
+    assert api.debug_mode == 9  # pixel-time heatmap
+    viewer.on_key_press(key._9, None)
+    assert api.debug_mode == 0
+    viewer.on_key_press(key.B, None)
+    assert api.show_brep_shells
+    viewer.on_key_press(key.B, None)
+    assert not api.show_brep_shells
+    viewer.on_key_press(key.X, None)
+    assert api.show_brep_boxes
+    viewer.on_key_press(key.X, None)
+    assert not api.show_brep_boxes
     viewer._presenter = None
     assert viewer.get_instance_transform_gl_buffer() == 0
     assert viewer.get_instance_transform_capacity() == 10000

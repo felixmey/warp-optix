@@ -74,7 +74,9 @@ def _pack_display_rgba8(src: wp.array2d(dtype=wp.vec4), dst: wp.array(dtype=wp.u
 
 
 class FreeCameraController:
-    """Left-drag to look, WASD/arrows to move, Q/E down/up, Shift faster, wheel to zoom, 1-9 debug views."""
+    """Left-drag to look, WASD/arrows to move, Q/E down/up, Shift faster, wheel to zoom, 1-9 debug views, 0 pixel-time heatmap,
+    B BRep shells (debug: NURBS patches as their triangle shells; 5 shows their facet normals),
+    X BRep boxes (debug: the AABBs of analytic faces and unshelled patches)."""
 
     def __init__(self, viewer, api: PathTracer, view: View):
         self.pyglet = viewer.pyglet
@@ -122,11 +124,18 @@ class FreeCameraController:
             self._apply()
 
     def on_key_press(self, symbol, _modifiers):
-        # 1 final, 2 radiance, 3 depth, 4 motion, 5 normal, 6 roughness, 7 diffuse, 8 specular, 9 spec hit distance.
+        # 1 final, 2 radiance, 3 depth, 4 motion, 5 normal, 6 roughness, 7 diffuse, 8 specular, 9 spec hit distance,
+        # 0 pixel time heatmap (raygen cost per pixel: blue cheap, green the frame mean, red 8x the mean).
         key = self.pyglet.window.key
         debug_keys = (key._1, key._2, key._3, key._4, key._5, key._6, key._7, key._8, key._9)
         if symbol in debug_keys:
             self.api.set_debug_buffer_mode(debug_keys.index(symbol))
+        elif symbol == key._0:
+            self.api.set_debug_buffer_mode(9)
+        elif symbol == key.B:
+            self.api.set_show_brep_shells(not self.api.show_brep_shells)
+        elif symbol == key.X:
+            self.api.set_show_brep_boxes(not self.api.show_brep_boxes)
         self.keys_down.add(symbol)
 
     def on_key_release(self, symbol, _modifiers):

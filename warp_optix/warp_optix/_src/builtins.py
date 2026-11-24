@@ -63,6 +63,7 @@ _QUERIES = {
     "optix_get_world_to_object_matrix": (wp.mat44, "World-to-object matrix of the current hit."),
     "optix_get_transform_list_size": (wp.uint32, "Number of transforms between the current hit and the root."),
     "optix_get_exception_code": (wp.int32, "Code of the exception being handled."),
+    "optix_global_timer": (wp.uint64, "GPU global timer in nanoseconds (%globaltimer), consistent across SMs."),
     # Hit-object queries, valid after optix_traverse() in raygen, closest-hit, or miss.
     "optix_hit_object_is_hit": (wp.bool, "Whether the hit object holds a hit."),
     "optix_hit_object_is_miss": (wp.bool, "Whether the hit object holds a miss."),
