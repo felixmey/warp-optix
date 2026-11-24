@@ -46,10 +46,7 @@
 #include <utility>
 #include <vector>
 
-#ifdef _WIN32
-#include <windows.h>
-#else
-#include <dlfcn.h>
+#ifndef _WIN32
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -58,21 +55,6 @@
 namespace py = pybind11;
 
 namespace {
-
-// The extension links no CUDA library; resolve the driver entry point at runtime.
-CUresult current_cuda_context(CUcontext* context) {
-    using CtxGetCurrentFn = CUresult(CUDAAPI*)(CUcontext*);
-    static const CtxGetCurrentFn function = [] {
-#ifdef _WIN32
-        HMODULE driver = LoadLibraryExA("nvcuda.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-        return driver ? reinterpret_cast<CtxGetCurrentFn>(GetProcAddress(driver, "cuCtxGetCurrent")) : nullptr;
-#else
-        void* driver = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
-        return driver ? reinterpret_cast<CtxGetCurrentFn>(dlsym(driver, "cuCtxGetCurrent")) : nullptr;
-#endif
-    }();
-    return function ? function(context) : CUDA_ERROR_NOT_INITIALIZED;
-}
 
 // warp-optix has no NVIDIA-issued application ID, so NGX identifies it by project ID.
 // Applications built on warp-optix should pass their own project ID (Python:
@@ -476,7 +458,7 @@ DlssRRDenoiser create(DlssRRContext& context, const DlssRRInitInfo& initInfo, ui
     createFlags |= initInfo.autoExposure ? NVSDK_NGX_DLSS_Feature_Flags_AutoExposure : 0;
 
     CUcontext cuContext = nullptr;
-    if (current_cuda_context(&cuContext) != CUDA_SUCCESS || cuContext == nullptr)
+    if (cuCtxGetCurrent(&cuContext) != CUDA_SUCCESS || cuContext == nullptr)
         throw std::runtime_error("DLSS RR requires a current CUDA context.");
 
     Parameters params;
