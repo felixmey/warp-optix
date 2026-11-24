@@ -23,7 +23,7 @@ import numpy as np
 import warp as wp
 
 from . import bounds, trim_grid
-from .loader import CONE, CYLINDER, FLAG_FLIP, FLAG_SOLID, FLAG_SWAP, FLAG_TRIMMED, NURBS, PLANE, SPHERE, TORUS
+from .loader import CONE, FLAG_FLIP, FLAG_SOLID, FLAG_SWAP, FLAG_TRIMMED, NURBS, PLANE, SPHERE, TORUS
 
 # Read once before kernel compilation. Disabled builds contain no diagnostic atomics.
 DIAGNOSTICS = os.environ.get("WARP_OPTIX_BREP_DIAGNOSTICS") == "1"
@@ -56,7 +56,7 @@ ATTRIBUTE_WORDS = 6
 # foot points pass outside the square grown by it (the crossings there are a neighbor's).
 SQUARE_MARGIN = wp.constant(0.05)
 # Triangles per layer of a sub-patch's shell (proxy.py): outer layer first, then inner, then walls.
-SHELL_LAYER_TRIANGLES = wp.constant(2 * int(os.environ.get("WO_SHELL_GRID", "6")) ** 2)  # EXPERIMENT toggle
+SHELL_LAYER_TRIANGLES = wp.constant(72)
 GRID_REF_A = wp.constant(trim_grid.REF_A)
 GRID_REF_C = wp.constant(trim_grid.REF_C)
 
@@ -113,10 +113,6 @@ class BrepData:
     # patch parameters (s, t) at the corners of one shell's triangles (the same for every shell).
     proxy_prim: wp.array[wp.int32]
     shell_st: wp.array[wp.vec2]
-    # Per shell (global shell triangle // triangles per shell): the face parameter rectangle it
-    # encloses (a NURBS sub-patch's prim_uv, or one piece of an analytic face).
-    shell_uv: wp.array[wp.vec4]
-    tri_shell: wp.array[wp.int32]  # per global shell triangle: its shell (index into shell_uv)
     # Each primitive's object-space AABB (lo at 2 * prim, hi at 2 * prim + 1), for the debug box view.
     prim_box: wp.array[wp.vec3]
     diagnostic_counts: wp.array2d[wp.uint64]  # per primitive; empty when diagnostics are disabled
@@ -572,216 +568,6 @@ def intersect_torus(brep: BrepData, prim: int, origin: wp.vec3, direction: wp.ve
             ):
                 return
         i += 1
-
-
-# ---------------------------------------------------------------------------------------------
-# Analytic faces in triangle shells (EXPERIMENT, proxy.ANALYTIC): one shell per piece of the face's
-# parameter range; the any-hit solves the face in closed form and keeps the roots in its piece.
-# ---------------------------------------------------------------------------------------------
-
-
-@wp.struct
-class Analytic:
-    """A rectangle of an analytic face's parameters, as a patch over (s, t) in [0, 1]^2 (proxy.py).
-    Points are relative to the face origin (the shell kernel adds it back)."""
-
-    kind: wp.int32
-    x: wp.vec3
-    y: wp.vec3
-    axis: wp.vec3
-    params: wp.vec2
-    rect: wp.vec4
-
-
-@wp.func
-def eval_patch(patch: Analytic, cvs: wp.array[wp.vec4], s: float, t: float):
-    rect = patch.rect
-    su = rect[1] - rect[0]
-    sv = rect[3] - rect[2]
-    u = rect[0] + s * su
-    v = rect[2] + t * sv
-    x = patch.x
-    y = patch.y
-    a = patch.axis
-    r0 = patch.params[0]
-    r1 = patch.params[1]
-    kind = patch.kind
-    cu = wp.cos(u)
-    sn = wp.sin(u)
-    radial = cu * x + sn * y
-    tangent = -sn * x + cu * y
-    p = wp.vec3(0.0)
-    du = wp.vec3(0.0)
-    dv = wp.vec3(0.0)
-    if kind == PLANE:
-        p = u * x + v * y
-        du = x
-        dv = y
-    elif kind == CYLINDER:
-        p = r0 * radial + v * a
-        du = r0 * tangent
-        dv = a
-    elif kind == CONE:
-        rad = r0 + v * r1
-        p = rad * radial + v * a
-        du = rad * tangent
-        dv = r1 * radial + a
-    elif kind == SPHERE:
-        cv = wp.cos(v)
-        sv_ = wp.sin(v)
-        p = r0 * (cv * radial + sv_ * a)
-        du = r0 * cv * tangent
-        dv = r0 * (-sv_ * radial + cv * a)
-    else:  # torus
-        cv = wp.cos(v)
-        sv_ = wp.sin(v)
-        rad = r0 + r1 * cv
-        p = rad * radial + r1 * sv_ * a
-        du = rad * tangent
-        dv = -r1 * sv_ * radial + r1 * cv * a
-    return p, su * du, sv * dv
-
-
-@wp.func
-def in_piece(brep: BrepData, shell: int, u: float, v: float) -> bool:
-    """Whether face parameters (wrapped into the face range by accept_uv) lie in the shell's piece,
-    grown like the shell (proxy.MARGIN) so that neighboring pieces overlap."""
-    r = brep.shell_uv[shell]
-    mu = SQUARE_MARGIN * (r[1] - r[0])
-    mv = SQUARE_MARGIN * (r[3] - r[2])
-    return u >= r[0] - mu and u <= r[1] + mu and v >= r[2] - mv and v <= r[3] + mv
-
-
-@wp.func
-def quadric_piece_hit(brep: BrepData, prim: int, shell: int, origin: wp.vec3, direction: wp.vec3, tmin: float):
-    """quadric_hit's nearest root at or after tmin, inside the face and the shell's piece."""
-    surf = brep.prims[prim]
-    kind = surf.flags >> KIND_SHIFT
-    o, d, shift = frame_ray(surf.origin, surf.x, surf.y, surf.axis, origin, direction)
-    fp = surf.params
-    plane = kind == PLANE
-    a = wp.where(plane, 0.0, 1.0)
-    e = wp.where(kind == SPHERE, 1.0, 0.0)
-    h = wp.where(plane, 1.0, 0.0)
-    g = wp.where(plane, 0.0, fp[0])
-    k = wp.where(kind == CONE, fp[1], 0.0)
-    if wp.abs(k) > 1.0 and d[2] != 0.0:
-        reach = wp.length(o) + wp.abs(g)
-        step = wp.clamp(-(g + k * o[2]) / (k * d[2]), -reach, reach)
-        o = o + step * d
-        shift = shift + step
-    ro = g + k * o[2]
-    count, t0, t1 = solve_quadratic(
-        a * (d[0] * d[0] + d[1] * d[1]) + (e - k * k) * d[2] * d[2],
-        a * (o[0] * d[0] + o[1] * d[1]) + (e * o[2] + 0.5 * h - k * ro) * d[2],
-        a * (o[0] * o[0] + o[1] * o[1]) + (e * o[2] + h) * o[2] - ro * ro,
-    )
-    for i in range(count):
-        t = wp.where(i == 1, t1, t0)
-        if t + shift >= tmin:
-            p = o + t * d
-            rho = g + k * p[2]
-            u = p[0]
-            v = p[1]
-            if not plane:
-                s = wp.where(rho < 0.0, -1.0, 1.0)
-                u = wp.atan2(s * p[1], s * p[0])
-                v = p[2]
-                if kind == SPHERE:
-                    v = wp.asin(wp.clamp(p[2] / g, -1.0, 1.0))
-                if wp.abs(k) > 1.0:
-                    v = (s * wp.sqrt(p[0] * p[0] + p[1] * p[1]) - g) / k
-            inside, u, v = accept_uv(brep, surf, u, v)
-            if inside and in_piece(brep, shell, u, v):
-                n = wp.vec3(a * p[0], a * p[1], e * p[2] + 0.5 * h - k * rho)
-                n = n[0] * surf.x + n[1] * surf.y + n[2] * surf.axis
-                return True, t + shift, u, v, n
-    return False, 0.0, 0.0, 0.0, wp.vec3()
-
-
-@wp.func
-def torus_piece_hit(brep: BrepData, prim: int, shell: int, origin: wp.vec3, direction: wp.vec3, tmin: float):
-    """intersect_torus's nearest root at or after tmin, inside the face and the shell's piece."""
-    o, d, shift = local_ray(brep, prim, origin, direction)
-    major = brep.prims[prim].params[0]
-    minor = brep.prims[prim].params[1]
-    bound = major + minor
-    count, ta, tb = solve_quadratic(wp.dot(d, d), wp.dot(o, d), wp.dot(o, o) - bound * bound)
-    ta = wp.max(ta, tmin - shift)
-    if count < 2 or tb <= ta:
-        return False, 0.0, 0.0, 0.0, wp.vec3()
-    inv = 1.0 / bound
-    A = (o + ta * d) * inv
-    B = (tb - ta) * d * inv
-    R = major * inv
-    k = R * R - minor * minor * inv * inv
-    a2 = wp.dot(B, B)
-    a1 = 2.0 * wp.dot(A, B)
-    g0 = wp.dot(A, A) + k
-    b2 = B[0] * B[0] + B[1] * B[1]
-    b1 = 2.0 * (A[0] * B[0] + A[1] * B[1])
-    b0 = A[0] * A[0] + A[1] * A[1]
-    fr = 4.0 * R * R
-    c = vec5(g0 * g0 - fr * b0, 2.0 * a1 * g0 - fr * b1, a1 * a1 + 2.0 * a2 * g0 - fr * b2, 2.0 * a2 * a1, a2 * a2)
-    qc, q0, q1 = solve_quadratic(12.0 * c[4], 3.0 * c[3], 2.0 * c[2])
-    p1 = float(0.0)
-    if qc >= 1 and q0 > 0.0 and q0 < 1.0:
-        p1 = q0
-    p2 = p1
-    if qc == 2 and q1 > 0.0 and q1 < 1.0:
-        p2 = q1
-    r1 = derivative_root(c, 0.0, p1, 0.0)
-    r2 = derivative_root(c, p1, p2, r1)
-    r3 = derivative_root(c, p2, 1.0, r2)
-    crit = vec5(0.0, r1, r2, r3, 1.0)
-    i = int(0)
-    while i < 4:
-        lo = breakpoint_at(crit, i)
-        hi = breakpoint_at(crit, i + 1)
-        if changes_sign(c, 0, lo, hi):
-            s = bisect(c, 0, lo, hi)
-            df = poly_eval(c, 1, s)
-            if df != 0.0:
-                s = wp.clamp(s - poly_eval(c, 0, s) / df, lo, hi)
-            t = ta + s * (tb - ta)
-            p = o + t * d
-            rho = wp.sqrt(p[0] * p[0] + p[1] * p[1])
-            side = wp.where(wp.dot(p, p) + (major - minor) * (major + minor) < 0.0, -1.0, 1.0)
-            nrm = side * p - wp.vec3(p[0], p[1], 0.0) * (major / wp.max(rho, 1.0e-30))
-            if t + shift >= tmin:
-                inside, u, v = accept_uv(
-                    brep, prim, wp.atan2(side * p[1], side * p[0]), wp.atan2(p[2], side * rho - major)
-                )
-                if inside and in_piece(brep, shell, u, v):
-                    return True, t + shift, u, v, to_object(brep, prim, nrm)
-        i += 1
-    return False, 0.0, 0.0, 0.0, wp.vec3()
-
-
-@wp.func
-def proxy_hit_analytic(brep: BrepData, tri: int, local_tri: int, origin: wp.vec3, direction: wp.vec3):
-    """proxy_hit for a shell around a piece of an analytic face: the nearest exact crossing of the
-    face within the piece, at or after the ray's start."""
-    prim = brep.proxy_prim[tri]
-    diagnostic_add(brep, prim, 2, 1)
-    shell = brep.tri_shell[tri]
-    tmin = wp.optix_get_ray_tmin()
-    ok = bool(False)
-    t = float(0.0)
-    u = float(0.0)
-    v = float(0.0)
-    n = wp.vec3(0.0)
-    if (brep.prims[prim].flags >> KIND_SHIFT) == TORUS:
-        ok, t, u, v, n = torus_piece_hit(brep, prim, shell, origin, direction, tmin)
-    else:
-        ok, t, u, v, n = quadric_piece_hit(brep, prim, shell, origin, direction, tmin)
-    normal = wp.vec3(0.0)
-    if ok:
-        normal = wp.normalize(n)
-        if (brep.prims[prim].flags & FLAG_FLIP) != 0:
-            normal = -normal
-    keep_searching = t > wp.optix_get_ray_tmax()
-    return ok, t, u, v, normal, brep.prims[prim].face, keep_searching
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1823,7 +1609,7 @@ def pack(prims, device, proxies=None):
     after uploading the arrays; CPU packing uses the reference fitter.
     """
     face_base = prim_base = cv_base = seg_base = slab_base = slab_seg_base = tri_base = 0
-    cell_base = member_base = shell_base = 0
+    cell_base = member_base = 0
     gpu_bounds = wp.get_device(device).is_cuda
     bound_ids = []
     cat = {k: [] for k in cast(Any, BrepData).vars if k not in ("prims", "diagnostic_counts")}
@@ -1835,8 +1621,6 @@ def pack(prims, device, proxies=None):
     for n, prim in enumerate(prims):
         if proxies is not None:
             cat["proxy_prim"].append(proxies[n].tri_prim + prim_base)
-            cat["tri_shell"].append(proxies[n].tri_shell + shell_base)
-            shell_base += len(proxies[n].shell_uv)
             tri_bases.append(tri_base)
             tri_base += len(proxies[n].tri_prim)
         for k in ("origin", "x", "y", "axis", "params", "range", "period", "flags"):
@@ -1881,8 +1665,6 @@ def pack(prims, device, proxies=None):
     from .proxy import SHELL_ST  # noqa: PLC0415 - proxy builds on this module's patch evaluation
 
     cat["shell_st"].append(SHELL_ST.reshape(-1, 2))
-    if proxies is not None:
-        cat["shell_uv"].extend(p.shell_uv for p in proxies)
     data = BrepData()
     data.diagnostic_counts = wp.zeros(
         (prim_base if DIAGNOSTICS else 0, len(DIAGNOSTIC_NAMES)), dtype=wp.uint64, device=device
@@ -1902,7 +1684,7 @@ def pack(prims, device, proxies=None):
                 records[key][bases[n] + nurbs] = 0
             # Shell candidates already have a tighter hardware test. Only fit active AABBs.
             if proxies is not None:
-                nurbs = np.setdiff1d(nurbs, proxies[n].patches)
+                nurbs = np.setdiff1d(nurbs, proxies[n].patches, assume_unique=True)
             if gpu_bounds:
                 if len(nurbs):
                     bound_ids.append(bases[n] + nurbs)
