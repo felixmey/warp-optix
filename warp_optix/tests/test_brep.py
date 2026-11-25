@@ -548,6 +548,91 @@ def _write_holed_plate(path):
     stage.GetRootLayer().Save()
 
 
+def _reference_trim_cells(prim, face, rect, n):
+    """NumPy reference for proxy._trim_cells_kernel, one (face, rect) item at a time."""
+    from warp_optix._src.brep import proxy  # noqa: PLC0415
+
+    keep = np.ones((n, n), bool)
+    first, end = proxy._face_chord_ranges(prim)
+    if not (prim.face_flags[face] & loader.FLAG_TRIMMED) or end[face] == first[face]:
+        return keep
+    seg = np.asarray(prim.segments[first[face] : end[face]], np.float64)
+    bulge = np.asarray(prim.segment_bulge[first[face] : end[face]], np.float64)
+    swap = bool(prim.face_flags[face] & loader.FLAG_SWAP)
+    edges_u = np.linspace(rect[0], rect[1], n + 1)
+    edges_v = np.linspace(rect[2], rect[3], n + 1)
+    edges_a, edges_c = (edges_v, edges_u) if swap else (edges_u, edges_v)
+    scale = max(1.0, float(np.abs(seg).max()), *np.abs(rect))
+    slack = 64.0 * np.finfo(np.float32).eps * scale
+    a0 = edges_a[:-1, None, None] - slack
+    a1 = edges_a[1:, None, None] + slack
+    c0 = edges_c[None, :-1, None] - slack
+    c1 = edges_c[None, 1:, None] + slack
+    r = np.abs(bulge) + slack
+    sa0, sc0, sa1, sc1 = (seg[:, k] for k in range(4))
+    boxes = (
+        (np.maximum(sa0, sa1) + r >= a0)
+        & (np.minimum(sa0, sa1) - r <= a1)
+        & (np.maximum(sc0, sc1) + r >= c0)
+        & (np.minimum(sc0, sc1) - r <= c1)
+    )
+    da, dc = sa1 - sa0, sc1 - sc0
+    length = np.maximum(np.hypot(da, dc), 1e-300)
+    na, nc = -dc / length, da / length
+    off = na * sa0 + nc * sc0
+    lo = np.minimum(na * a0, na * a1) + np.minimum(nc * c0, nc * c1) - off
+    hi = np.maximum(na * a0, na * a1) + np.maximum(nc * c0, nc * c1) - off
+    touched = (boxes & (lo <= r) & (hi >= -r)).any(-1)
+    ends_a = np.concatenate([sa0, sa1])
+    ends_c = np.concatenate([sc0, sc1])
+    values, group, count = np.unique(ends_a, return_inverse=True, return_counts=True)
+    shared = count >= 2
+    if shared.any():
+        c_lo = np.full(len(values), np.inf)
+        c_hi = np.full(len(values), -np.inf)
+        np.minimum.at(c_lo, group, ends_c)
+        np.maximum.at(c_hi, group, ends_c)
+        va, vlo, vhi = values[shared], c_lo[shared], c_hi[shared]
+        touched |= ((a0 <= va) & (va <= a1) & (c0 <= vhi) & (vlo <= c1)).any(-1)
+    ca = 0.5 * (edges_a[:-1] + edges_a[1:])[:, None, None]
+    cc = 0.5 * (edges_c[:-1] + edges_c[1:])[None, :, None]
+    crossing = (sa0 <= ca) != (sa1 <= ca)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        height = sc0 + (ca - sa0) * (sc1 - sc0) / (sa1 - sa0)
+    inside = (np.count_nonzero(crossing & (height > cc), axis=-1) & 1) == 1
+    keep = touched | inside
+    return keep.T if swap else keep
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_trim_cells_kernel_matches_the_numpy_reference(tmp_path, device):
+    """The analytic shells' trim cell culling, batched in a kernel, keeps exactly the cells of
+    the per-item reference: the holed plate (axis-aligned hole edges, i.e. the vertical chords
+    the loader drops) and the seam-trimmed hemisphere, over random rectangles around their faces."""
+    from warp_optix._src.brep import proxy  # noqa: PLC0415
+
+    if device == "cuda" and not wp.is_cuda_available():
+        pytest.skip("no CUDA device")
+    _write_holed_plate(tmp_path / "plate.usda")
+    plate_stage = Usd.Stage.Open(str(tmp_path / "plate.usda"))
+    plate = loader.load_brep_prim(plate_stage.GetPrimAtPath("/Plate"), np.eye(4))
+    sphere_stage = _write_sphere_brep(tmp_path / "half.usda", trimmed=True)
+    sphere = loader.load_brep_prim(sphere_stage.GetPrimAtPath("/Ball"), np.eye(4))
+    rng = np.random.default_rng(1)
+    for prim in (plate, sphere):
+        lo, hi = prim.face_range[0][[0, 2]], prim.face_range[0][[1, 3]]
+        span = hi - lo
+        corners = lo + span * rng.uniform(-0.2, 1.2, (64, 2, 2))
+        corners.sort(axis=1)
+        rects = np.stack([corners[:, 0, 0], corners[:, 1, 0], corners[:, 0, 1], corners[:, 1, 1]], 1)
+        rects[0] = prim.face_range[0]  # the face's own rectangle, edges on the trim
+        for n in (4, 8, 16):
+            got = proxy._trim_cells_batch(prim, np.zeros(len(rects), np.int64), rects, n, device)
+            want = np.stack([_reference_trim_cells(prim, 0, rect, n) for rect in rects])
+            np.testing.assert_array_equal(got, want)
+            assert not want.all()  # the trims cull cells
+
+
 @pytest.mark.gpu
 @pytest.mark.render
 def test_path_traced_plate_shows_its_hole(tmp_path):

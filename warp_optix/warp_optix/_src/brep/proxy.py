@@ -314,26 +314,43 @@ def _culled_topology(keep: np.ndarray) -> np.ndarray:
     return np.concatenate(tris)
 
 
-def _curved_keep(prim: BrepPrim, local: int, rect: np.ndarray, n: int) -> np.ndarray:
-    """_trim_cells over the shell's extended parameter rectangle, keeping the cells that reach past
-    the face's range in a periodic direction (the trim test wraps them; the classification does not)."""
-    du, dv = rect[1] - rect[0], rect[3] - rect[2]
-    ext = np.array([rect[0] - MARGIN * du, rect[1] + MARGIN * du, rect[2] - MARGIN * dv, rect[3] + MARGIN * dv])
-    face = int(prim.prim_face[local])
-    keep = _trim_cells(prim, face, ext, n)
-    if keep.all():
-        return keep
-    rng, period = prim.face_range[face], prim.face_period[face]
-    eu = np.linspace(ext[0], ext[1], n + 1)
-    ev = np.linspace(ext[2], ext[3], n + 1)
-    if period[0] > 0:
-        keep |= ((eu[:-1] < rng[0]) | (eu[1:] > rng[1]))[:, None]
-    if period[1] > 0:
-        keep |= ((ev[:-1] < rng[2]) | (ev[1:] > rng[3]))[None, :]
-    return keep
+def _curved_keep(prim: BrepPrim, owners: np.ndarray, rects: np.ndarray, n: int, device, tables) -> np.ndarray:
+    """(K, n, n) trim cell masks of the pieces over their shells' extended parameter rectangles,
+    keeping the cells that reach past the face's range in a periodic direction (the trim test
+    wraps them; the classification does not)."""
+    du, dv = rects[:, 1] - rects[:, 0], rects[:, 3] - rects[:, 2]
+    ext = np.stack(
+        [rects[:, 0] - MARGIN * du, rects[:, 1] + MARGIN * du, rects[:, 2] - MARGIN * dv, rects[:, 3] + MARGIN * dv], 1
+    )
+    face = np.asarray(prim.prim_face, np.int64)[owners]
+    keep = _trim_cells_batch(prim, face, ext, n, device, tables)
+    rng = np.asarray(prim.face_range, np.float64)[face]
+    period = np.asarray(prim.face_period, np.float64)[face]
+    eu = np.linspace(ext[:, 0], ext[:, 1], n + 1, axis=1)
+    ev = np.linspace(ext[:, 2], ext[:, 3], n + 1, axis=1)
+    wrap_u = (period[:, 0:1] > 0) & ((eu[:, :-1] < rng[:, 0:1]) | (eu[:, 1:] > rng[:, 1:2]))
+    wrap_v = (period[:, 1:2] > 0) & ((ev[:, :-1] < rng[:, 2:3]) | (ev[:, 1:] > rng[:, 3:4]))
+    return keep | wrap_u[:, :, None] | wrap_v[:, None, :]
 
 
-def _analytic_proxy(prim: BrepPrim, device) -> Proxy:
+def _gather_topologies(keep: np.ndarray, block: int) -> tuple[np.ndarray, np.ndarray]:
+    """_culled_topology of each (n, n) mask in ``keep`` (K, n, n), offset to the item's vertex block:
+    (triangles, item of each triangle). Masks repeat a lot, so each distinct one is built once."""
+    k_items = len(keep)
+    packed = np.packbits(keep.reshape(k_items, -1), axis=1)
+    distinct, first_item, inverse = np.unique(packed, axis=0, return_index=True, return_inverse=True)
+    inverse = inverse.reshape(-1)
+    topologies = [_culled_topology(keep[i]).astype(np.uint32) for i in first_item]
+    lengths = np.array([len(t) for t in topologies], np.int64)
+    flat = np.concatenate(topologies)
+    starts = np.cumsum(lengths) - lengths
+    count = lengths[inverse]
+    owner = np.repeat(np.arange(k_items), count)
+    rows = np.arange(count.sum()) + np.repeat(starts[inverse] - np.cumsum(count) + count, count)
+    return flat[rows] + (owner * block).astype(np.uint32)[:, None], owner.astype(np.int32)
+
+
+def _analytic_proxy(prim: BrepPrim, device, tables: dict | None = None) -> Proxy:
     owners, rects = _analytic_pieces(prim)
     if not len(owners):
         return empty_proxy()
@@ -363,20 +380,10 @@ def _analytic_proxy(prim: BrepPrim, device) -> Proxy:
         device=device,
     )
     if CURVED_CELLS > 0:
-        cache = {}
-        indices, tri_shell = [], []
-        for k, (local, rect) in enumerate(zip(owners, rects)):
-            keep = _curved_keep(prim, int(local), rect, n)
-            key = keep.tobytes()
-            if key not in cache:
-                cache[key] = _culled_topology(keep).astype(np.uint32)
-            tris = cache[key]
-            indices.append(tris + np.uint32(k * block))
-            tri_shell.append(np.full(len(tris), k, np.int32))
-        tri_shell = np.concatenate(tri_shell)
+        indices, tri_shell = _gather_topologies(_curved_keep(prim, owners, rects, n, device, tables), block)
         return Proxy(
             vertices.numpy().reshape(-1, 3),
-            np.concatenate(indices),
+            indices,
             owners[tri_shell],
             np.unique(owners),
             rects.astype(np.float32),
@@ -393,83 +400,244 @@ def _analytic_proxy(prim: BrepPrim, device) -> Proxy:
     )
 
 
-def _face_chords(prim: BrepPrim, face: int):
-    """The face's trim chords (a0, c0, a1, c1) and bulges; a face's chords are contiguous."""
-    base, count = (int(x) for x in prim.face_slab[face])
-    lo, hi = int(prim.slab_start[base]), int(prim.slab_start[base + count])
-    ids = prim.slab_segments[lo:hi]
-    if not len(ids):
-        return np.zeros((0, 4)), np.zeros(0)
-    first, last = int(ids.min()), int(ids.max()) + 1
-    return np.asarray(prim.segments[first:last], np.float64), np.asarray(prim.segment_bulge[first:last], np.float64)
+def _face_chord_ranges(prim: BrepPrim) -> tuple[np.ndarray, np.ndarray]:
+    """Per face, the [first, end) range of its trim chords in ``prim.segments``: the chords its
+    slabs list (a face's chords are contiguous)."""
+    nfaces = len(prim.face_slab)
+    first = np.full(nfaces, np.iinfo(np.int64).max)
+    last = np.full(nfaces, -1, np.int64)
+    base, count = prim.face_slab[:, 0].astype(np.int64), prim.face_slab[:, 1].astype(np.int64)
+    starts = np.asarray(prim.slab_start, np.int64)
+    lo, hi = starts[base], starts[base + count]
+    face = np.repeat(np.arange(nfaces), hi - lo)
+    entry = np.arange((hi - lo).sum()) + np.repeat(lo - np.cumsum(hi - lo) + (hi - lo), hi - lo)
+    ids = np.asarray(prim.slab_segments, np.int64)[entry]
+    np.minimum.at(first, face, ids)
+    np.maximum.at(last, face, ids)
+    empty = last < 0
+    first[empty], last[empty] = 0, -1
+    return first, last + 1
 
 
-def _trim_cells(prim: BrepPrim, face: int, rect: np.ndarray, n: int) -> np.ndarray:
-    """(n, n) mask of the cells of ``rect`` (u0, u1, v0, v1; row-major in u) that may hold points
-    the face accepts: cells that a trim chord (thickened by its bulge, which covers its curve)
-    touches, and the others whose center has inside parity (the slab test's, toward +c)."""
-    keep = np.ones((n, n), bool)
-    if not (prim.face_flags[face] & FLAG_TRIMMED):
-        return keep
-    seg, bulge = _face_chords(prim, face)
-    if not len(seg):
-        return keep
-    swap = bool(prim.face_flags[face] & FLAG_SWAP)
-    edges_u = np.linspace(rect[0], rect[1], n + 1)
-    edges_v = np.linspace(rect[2], rect[3], n + 1)
-    edges_a, edges_c = (edges_v, edges_u) if swap else (edges_u, edges_v)
-    scale = max(1.0, float(np.abs(seg).max()), *np.abs(rect))
-    slack = 64.0 * np.finfo(np.float32).eps * scale
-    # cells [a cell, c cell], grown by the slack
-    a0 = edges_a[:-1, None, None] - slack
-    a1 = edges_a[1:, None, None] + slack
-    c0 = edges_c[None, :-1, None] - slack
-    c1 = edges_c[None, 1:, None] + slack
-    r = np.abs(bulge) + slack
-    sa0, sc0, sa1, sc1 = (seg[:, k] for k in range(4))
-    boxes = (
-        (np.maximum(sa0, sa1) + r >= a0)
-        & (np.minimum(sa0, sa1) - r <= a1)
-        & (np.maximum(sc0, sc1) + r >= c0)
-        & (np.minimum(sc0, sc1) - r <= c1)
+def _shared_endpoints(segments: np.ndarray, first: np.ndarray, end: np.ndarray):
+    """Chord endpoints that share their a-value with another endpoint of the same face (see
+    _trim_cells_kernel): (face, a, lowest c, highest c) per shared a-value, sorted by face. Face f's
+    chords are segments[first[f]:end[f]]."""
+    count = end - first
+    seg_face = np.repeat(np.arange(len(first)), count)
+    seg = np.arange(count.sum()) + np.repeat(first - np.cumsum(count) + count, count)
+    s = segments[seg]
+    face = np.concatenate([seg_face, seg_face])
+    a = np.concatenate([s[:, 0], s[:, 2]])
+    c = np.concatenate([s[:, 1], s[:, 3]])
+    # = np.lexsort((a, face)): a stable integer sort (radix) after the float sort is much faster.
+    order = np.argsort(a, kind="stable")
+    order = order[np.argsort(face[order], kind="stable")]
+    face, a, c = face[order], a[order], c[order]
+    new = np.ones(len(a), bool)
+    new[1:] = (face[1:] != face[:-1]) | (a[1:] != a[:-1])
+    starts = np.flatnonzero(new)
+    if not len(starts):
+        return np.zeros(0, np.int64), np.zeros(0), np.zeros(0), np.zeros(0)
+    sizes = np.diff(np.append(starts, len(a)))
+    shared = sizes >= 2
+    c_lo = np.minimum.reduceat(c, starts)[shared]
+    c_hi = np.maximum.reduceat(c, starts)[shared]
+    return face[starts][shared], a[starts][shared], c_lo, c_hi
+
+
+@wp.kernel(enable_backward=False)
+def _trim_cells_kernel(
+    faces: wp.array[wp.int32],
+    rects: wp.array2d[wp.float64],
+    swap: wp.array[wp.int32],
+    first: wp.array[wp.int32],
+    count: wp.array[wp.int32],
+    face_abs: wp.array[wp.float64],
+    segments: wp.array2d[wp.float64],
+    bulges: wp.array[wp.float64],
+    shared_first: wp.array[wp.int32],
+    shared_count: wp.array[wp.int32],
+    shared: wp.array2d[wp.float64],
+    n: int,
+    keep: wp.array3d[wp.uint8],
+):
+    """Whether cell (ia, ic) of item k's n x n grid over rects[k] (u0, u1, v0, v1; keep is
+    row-major in u) may hold points the face accepts: cells that a trim chord (thickened by its
+    bulge, which covers its curve) touches, and the others whose center has inside parity (the
+    slab test's, toward +c). Faces without chords keep every cell. Float64, with cells grown by a
+    slack for the device's float32 arithmetic."""
+    tid = wp.tid()
+    k = tid // (n * n)
+    ia = (tid // n) % n
+    ic = tid % n
+    face = faces[k]
+    s = count[face]
+    sw = swap[k]
+    # the cell's a and c ranges, as np.linspace(rect[lo], rect[hi], n + 1)
+    a_lo = rects[k, 0]
+    a_hi = rects[k, 1]
+    c_lo = rects[k, 2]
+    c_hi = rects[k, 3]
+    if sw != 0:
+        a_lo = rects[k, 2]
+        a_hi = rects[k, 3]
+        c_lo = rects[k, 0]
+        c_hi = rects[k, 1]
+    step_a = (a_hi - a_lo) / wp.float64(n)
+    step_c = (c_hi - c_lo) / wp.float64(n)
+    e_a0 = wp.float64(ia) * step_a + a_lo
+    e_a1 = wp.float64(ia + 1) * step_a + a_lo
+    if ia + 1 == n:
+        e_a1 = a_hi
+    e_c0 = wp.float64(ic) * step_c + c_lo
+    e_c1 = wp.float64(ic + 1) * step_c + c_lo
+    if ic + 1 == n:
+        e_c1 = c_hi
+    scale = wp.max(
+        wp.max(wp.float64(1.0), face_abs[face]),
+        wp.max(wp.max(wp.abs(a_lo), wp.abs(a_hi)), wp.max(wp.abs(c_lo), wp.abs(c_hi))),
     )
-    # Separating axis: the chord's normal. Signed distances of the cell's corners to the chord's line.
-    da, dc = sa1 - sa0, sc1 - sc0
-    length = np.maximum(np.hypot(da, dc), 1e-300)
-    na, nc = -dc / length, da / length
-    off = na * sa0 + nc * sc0
-    lo = np.minimum(na * a0, na * a1) + np.minimum(nc * c0, nc * c1) - off
-    hi = np.maximum(na * a0, na * a1) + np.maximum(nc * c0, nc * c1) - off
-    touched = (boxes & (lo <= r) & (hi >= -r)).any(-1)
+    slack = wp.float64(64.0 * 1.1920928955078125e-07) * scale
+    a0 = e_a0 - slack
+    a1 = e_a1 + slack
+    c0 = e_c0 - slack
+    c1 = e_c1 + slack
+    ca = wp.float64(0.5) * (e_a0 + e_a1)
+    cc = wp.float64(0.5) * (e_c0 + e_c1)
+    touched = int(0)
+    above = int(0)
+    base = first[face]
+    for q in range(s):
+        g = base + q
+        sa0 = segments[g, 0]
+        sc0 = segments[g, 1]
+        sa1 = segments[g, 2]
+        sc1 = segments[g, 3]
+        r = wp.abs(bulges[g]) + slack
+        if touched == 0:  # box test, then the chord's normal as separating axis
+            if (
+                wp.max(sa0, sa1) + r >= a0
+                and wp.min(sa0, sa1) - r <= a1
+                and wp.max(sc0, sc1) + r >= c0
+                and wp.min(sc0, sc1) - r <= c1
+            ):
+                da = sa1 - sa0
+                dc = sc1 - sc0
+                length = wp.max(wp.sqrt(da * da + dc * dc), wp.float64(1.0e-300))
+                na = -dc / length
+                nc = da / length
+                off = na * sa0 + nc * sc0
+                lo = wp.min(na * a0, na * a1) + wp.min(nc * c0, nc * c1) - off
+                hi = wp.max(na * a0, na * a1) + wp.max(nc * c0, nc * c1) - off
+                if lo <= r and hi >= -r:
+                    touched = 1
+        if (sa0 <= ca) != (sa1 <= ca):  # parity: chords crossing the vertical line above the center
+            height = sc0 + (ca - sa0) * (sc1 - sc0) / (sa1 - sa0)
+            if height > cc:
+                above += 1
     # The face's chords exclude the ones along c with no bulge (loader._build_trim: the slab test needs
     # no chord that no vertical ray crosses). Such a chord joins two chord endpoints at the same a, so
     # cells at that a, within the c span of the endpoints there, also touch the boundary.
-    ends_a = np.concatenate([sa0, sa1])
-    ends_c = np.concatenate([sc0, sc1])
-    values, group, count = np.unique(ends_a, return_inverse=True, return_counts=True)
-    shared = count >= 2
-    if shared.any():
-        c_lo = np.full(len(values), np.inf)
-        c_hi = np.full(len(values), -np.inf)
-        np.minimum.at(c_lo, group, ends_c)
-        np.maximum.at(c_hi, group, ends_c)
-        va, vlo, vhi = values[shared], c_lo[shared], c_hi[shared]
-        touched |= ((a0 <= va) & (va <= a1) & (c0 <= vhi) & (vlo <= c1)).any(-1)
-    # Parity at the centers of untouched cells: chords crossing the vertical line, above the center.
-    ca = 0.5 * (edges_a[:-1] + edges_a[1:])[:, None, None]
-    cc = 0.5 * (edges_c[:-1] + edges_c[1:])[None, :, None]
-    crossing = (sa0 <= ca) != (sa1 <= ca)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        height = sc0 + (ca - sa0) * (sc1 - sc0) / (sa1 - sa0)
-    inside = (np.count_nonzero(crossing & (height > cc), axis=-1) & 1) == 1
-    keep = touched | inside
-    return keep.T if swap else keep
+    if touched == 0:
+        sb = shared_first[face]
+        for q in range(shared_count[face]):
+            va = shared[sb + q, 0]
+            if a0 <= va and va <= a1 and c0 <= shared[sb + q, 2] and shared[sb + q, 1] <= c1:
+                touched = 1
+    value = wp.uint8(0)
+    if s == 0 or touched != 0 or (above & 1) == 1:  # no chords: an untrimmed face keeps every cell
+        value = wp.uint8(1)
+    if sw != 0:
+        keep[k, ic, ia] = value
+    else:
+        keep[k, ia, ic] = value
 
 
-def _plane_proxy(prim: BrepPrim) -> Proxy:
-    """One on-plane triangle layer per planar face (PLANE_CELLS), trim-culled cell by cell."""
+def _trim_tables(prim: BrepPrim, device, faces: np.ndarray | None = None) -> dict:
+    """The trim chords of the prim's ``faces`` (default: all), on ``device``, for _trim_cells_batch.
+
+    Other faces get no chords (NURBS faces can have 100k+ each; analytic shells never need them)."""
+    first, end = _face_chord_ranges(prim)
+    flags = np.asarray(prim.face_flags)
+    count = np.where((flags & FLAG_TRIMMED) != 0, end - first, 0)
+    if faces is not None:
+        wanted = np.zeros(len(first), bool)
+        wanted[np.asarray(faces, np.int64)] = True
+        count = np.where(wanted, count, 0)
+    # Gather the wanted faces' chords into a compact array, rebasing ``first``.
+    seg_ids = np.arange(count.sum()) + np.repeat(first - np.cumsum(count) + count, count)
+    first = np.cumsum(count) - count
+    end = first + count
+    seg = np.asarray(prim.segments, np.float64).reshape(-1, 4)[seg_ids]
+    bulge = np.asarray(prim.segment_bulge, np.float64)[seg_ids]
+    face_abs = np.zeros(len(first))  # each face's largest |chord coordinate|: the slack's scale
+    if len(seg):
+        np.maximum.at(face_abs, np.repeat(np.arange(len(first)), count), np.abs(seg).max(axis=1))
+    sh_face, sh_a, sh_lo, sh_hi = _shared_endpoints(seg, first, end)
+    sh_first = np.searchsorted(sh_face, np.arange(len(first)))
+    sh_count = np.searchsorted(sh_face, np.arange(len(first)), side="right") - sh_first
+
+    def arr(values, dtype):
+        return wp.array(np.ascontiguousarray(values), dtype=dtype, device=device)
+
+    return {
+        "flags": flags,
+        "first": arr(first.astype(np.int32), wp.int32),
+        "count": arr(count.astype(np.int32), wp.int32),
+        "face_abs": arr(face_abs, wp.float64),
+        "segments": arr(seg if len(seg) else np.zeros((1, 4)), wp.float64),
+        "bulges": arr(bulge if len(seg) else np.zeros(1), wp.float64),
+        "shared_first": arr(sh_first.astype(np.int32), wp.int32),
+        "shared_count": arr(sh_count.astype(np.int32), wp.int32),
+        "shared": arr(np.stack([sh_a, sh_lo, sh_hi], 1) if len(sh_a) else np.zeros((1, 3)), wp.float64),
+    }
+
+
+def _trim_cells_batch(
+    prim: BrepPrim, faces: np.ndarray, rects: np.ndarray, n: int, device=None, tables: dict | None = None
+) -> np.ndarray:
+    """(K, n, n) masks of the cells of each (face, rect) item that may hold points the face accepts
+    (_trim_cells_kernel), on ``device``: MC1 has 67k pieces and planes, 20 s as NumPy per item.
+    ``tables`` (_trim_tables) can be shared between calls on one prim."""
+    faces = np.asarray(faces, np.int64)
+    rects = np.asarray(rects, np.float64).reshape(-1, 4)
+    if not len(faces):
+        return np.ones((0, n, n), bool)
+    device = wp.get_device(device)
+    t = tables if tables is not None else _trim_tables(prim, device, faces)
+    keep = wp.empty((len(faces), n, n), dtype=wp.uint8, device=device)
+    wp.launch(
+        _trim_cells_kernel,
+        dim=len(faces) * n * n,
+        inputs=[
+            wp.array(faces.astype(np.int32), dtype=wp.int32, device=device),
+            wp.array(rects, dtype=wp.float64, device=device),
+            wp.array(((t["flags"][faces] & FLAG_SWAP) != 0).astype(np.int32), dtype=wp.int32, device=device),
+            t["first"],
+            t["count"],
+            t["face_abs"],
+            t["segments"],
+            t["bulges"],
+            t["shared_first"],
+            t["shared_count"],
+            t["shared"],
+            n,
+        ],
+        outputs=[keep],
+        device=device,
+    )
+    return keep.numpy().astype(bool)
+
+
+def _plane_faces(prim: BrepPrim) -> np.ndarray:
     kinds = np.asarray(prim.prim_kind)
-    local = np.flatnonzero(kinds == PLANE) if (PLANE in ANALYTIC and PLANE_CELLS > 0) else np.zeros(0, int)
+    return np.flatnonzero(kinds == PLANE) if (PLANE in ANALYTIC and PLANE_CELLS > 0) else np.zeros(0, np.int64)
+
+
+def _plane_proxy(prim: BrepPrim, device=None, tables: dict | None = None) -> Proxy:
+    """One on-plane triangle layer per planar face (PLANE_CELLS), trim-culled cell by cell."""
+    local = _plane_faces(prim)
     if not len(local):
         return empty_proxy()
     n = PLANE_CELLS
@@ -477,39 +645,37 @@ def _plane_proxy(prim: BrepPrim) -> Proxy:
     i, j = np.meshgrid(np.arange(n), np.arange(n), indexing="ij")
     a = i * m + j
     quad = np.stack([np.stack([a, a + m, a + m + 1], -1), np.stack([a, a + m + 1, a + 1], -1)], -2)  # (n, n, 2, 3)
-    points, indices, tri_prim, rects, tri_shell = [], [], [], [], []
-    nverts = 0
-    for p in local:
-        face = int(prim.prim_face[p])
-        r = np.asarray(prim.prim_uv[p], np.float64)
-        # Grown like accept_uv's tolerance, so that rounding does not open gaps at the face's edges.
-        eu = 1.0e-5 * (r[1] - r[0]) + 1.0e-7
-        ev = 1.0e-5 * (r[3] - r[2]) + 1.0e-7
-        g = np.array([r[0] - eu, r[1] + eu, r[2] - ev, r[3] + ev])
-        keep = _trim_cells(prim, face, g, n)
-        if not keep.any():
-            continue
-        u = np.linspace(g[0], g[1], m)
-        v = np.linspace(g[2], g[3], m)
-        uu, vv = np.meshgrid(u, v, indexing="ij")
-        o, x, y = prim.face_origin[face], prim.face_x[face], prim.face_y[face]
-        pts = o + uu.reshape(-1, 1) * x + vv.reshape(-1, 1) * y
-        tris = quad[keep].reshape(-1, 3) + nverts
-        points.append(pts)
-        indices.append(tris)
-        tri_prim.append(np.full(len(tris), p, np.int32))
-        tri_shell.append(np.full(len(tris), len(rects), np.int32))
-        rects.append(r)
-        nverts += len(pts)
-    if not rects:
+    face = np.asarray(prim.prim_face, np.int64)[local]
+    r = np.asarray(prim.prim_uv, np.float64)[local].reshape(-1, 4)
+    # Grown like accept_uv's tolerance, so that rounding does not open gaps at the face's edges.
+    eu = 1.0e-5 * (r[:, 1] - r[:, 0]) + 1.0e-7
+    ev = 1.0e-5 * (r[:, 3] - r[:, 2]) + 1.0e-7
+    g = np.stack([r[:, 0] - eu, r[:, 1] + eu, r[:, 2] - ev, r[:, 3] + ev], 1)
+    keep = _trim_cells_batch(prim, face, g, n, device, tables)
+    kept = keep.reshape(len(local), -1).any(axis=1)
+    if not kept.any():
         return empty_proxy()
+    local, face, r, g, keep = local[kept], face[kept], r[kept], g[kept], keep[kept]
+    u = np.linspace(g[:, 0], g[:, 1], m, axis=1)
+    v = np.linspace(g[:, 2], g[:, 3], m, axis=1)
+    o = np.asarray(prim.face_origin, np.float64)[face]
+    x = np.asarray(prim.face_x, np.float64)[face]
+    y = np.asarray(prim.face_y, np.float64)[face]
+    # points[k, iu * m + iv] = o + u[iu] x + v[iv] y
+    points = (
+        o[:, None, None] + u[:, :, None, None] * x[:, None, None] + v[:, None, :, None] * y[:, None, None]
+    ).reshape(-1, 3)
+    cells = np.broadcast_to(quad, (len(local), n, n, 2, 3))[keep]  # (cells, 2, 3), in item order
+    owner = np.repeat(np.arange(len(local)), keep.reshape(len(local), -1).sum(axis=1))
+    tris = (cells + (owner * m * m)[:, None, None]).reshape(-1, 3)
+    tri_shell = np.repeat(owner, 2).astype(np.int32)
     return Proxy(
-        np.concatenate(points).astype(np.float32),
-        np.concatenate(indices).astype(np.uint32),
-        np.concatenate(tri_prim),
-        np.unique(local),
-        np.asarray(rects, np.float32),
-        np.concatenate(tri_shell),
+        points.astype(np.float32),
+        tris.astype(np.uint32),
+        local[tri_shell].astype(np.int32),
+        np.unique(local).astype(np.int32),
+        r.astype(np.float32),
+        tri_shell,
     )
 
 
@@ -545,7 +711,12 @@ def build_proxy(prim: BrepPrim, device=None) -> Proxy:
         & ~np.all(degree == (3, 4), axis=1)
     ).astype(np.int32)
     device = wp.get_device(device)
-    analytic = _concat(_analytic_proxy(prim, device), _plane_proxy(prim)) if ANALYTIC else empty_proxy()
+    analytic = empty_proxy()
+    if ANALYTIC:
+        owners, _ = _analytic_pieces(prim)
+        faces = np.asarray(prim.prim_face, np.int64)[np.concatenate([owners, _plane_faces(prim)]).astype(np.int64)]
+        tables = _trim_tables(prim, device, faces)  # shared by both
+        analytic = _concat(_analytic_proxy(prim, device, tables), _plane_proxy(prim, device, tables))
     if not len(patches):
         return analytic
     # Each patch's control points relative to its first one, shifted in float64 (see _shell).
