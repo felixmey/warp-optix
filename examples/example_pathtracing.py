@@ -38,6 +38,7 @@ USD stages with time-sampled transforms play back in a loop (Space pauses).
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -75,7 +76,7 @@ def _pack_display_rgba8(src: wp.array2d(dtype=wp.vec4), dst: wp.array(dtype=wp.u
 
 class FreeCameraController:
     """Left-drag to look, WASD/arrows to move, Q/E down/up, Shift faster, wheel to zoom, 1-9 debug views, 0 pixel-time heatmap,
-    B BRep shells (debug: NURBS patches as their triangle shells; 5 shows their facet normals),
+    B BRep shells (debug: NURBS patches as their triangle shells; 5 shows their facet normals), P print the camera,
     X BRep boxes (debug: the AABBs of analytic faces and unshelled patches)."""
 
     def __init__(self, viewer, api: PathTracer, view: View):
@@ -136,7 +137,18 @@ class FreeCameraController:
             self.api.set_show_brep_shells(not self.api.show_brep_shells)
         elif symbol == key.X:
             self.api.set_show_brep_boxes(not self.api.show_brep_boxes)
+        elif symbol == key.P:
+            print("[optix] view: " + json.dumps(self.view_dict()), flush=True)
         self.keys_down.add(symbol)
+
+    def view_dict(self) -> dict:
+        """The camera as set_camera_angles takes it (scene space after the loader's unit and up-axis conversion)."""
+        return {
+            "position": [round(float(x), 6) for x in self.position],
+            "yaw": round(self.yaw, 4),
+            "pitch": round(self.pitch, 4),
+            "fov": round(self.fov, 4),
+        }
 
     def on_key_release(self, symbol, _modifiers):
         self.keys_down.discard(symbol)
