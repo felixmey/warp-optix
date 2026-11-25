@@ -4241,6 +4241,18 @@ def _brep_shell_closed(params: PathtraceLaunchParams) -> wp.bool:
 
 
 @wp.func
+def _brep_shell_behind_hit(params: PathtraceLaunchParams) -> wp.bool:
+    """Whether this shell triangle lies at or beyond the nearest exact hit recorded so far.
+
+    Accepting such a triangle is what refining it would end in (see proxy_refine's keep_searching):
+    its patch can only add a farther hit, and tmax shrinks to the triangle either way. Skipping the
+    refinement saves the exit layer's repeat of the root its entry layer just found, and every shell
+    traversal reaches beyond the hit before tmax shrinks.
+    """
+    return wp.optix_get_ray_tmax() >= wp.optix_uint32_as_float(wp.optix_get_payload(0))
+
+
+@wp.func
 def _brep_shell_record(
     params: PathtraceLaunchParams,
     ok: bool,
@@ -4473,6 +4485,8 @@ def _make_brep_programs(debug_views: bool) -> dict:
             if (params.flags & FLAGS_SHOW_BREP_SHELLS) != wp.uint32(0):
                 _brep_shell_record_facet(params)
                 return
+        if _brep_shell_behind_hit(params):
+            return  # accept: tmax shrinks to this triangle, the recorded hit stays
         ok, hit_t, u, v, n_obj, face, keep_searching = _brep_shell_hit(params)
         _brep_shell_record(params, ok, hit_t, u, v, n_obj, face, keep_searching)
 
@@ -4484,6 +4498,8 @@ def _make_brep_programs(debug_views: bool) -> dict:
             if (params.flags & FLAGS_SHOW_BREP_SHELLS) != wp.uint32(0):
                 _brep_shell_record_facet(params)
                 return
+        if _brep_shell_behind_hit(params):
+            return  # accept: tmax shrinks to this triangle, the recorded hit stays
         ok, hit_t, u, v, n_obj, face, keep_searching = _brep_shell_generic_hit(params)
         _brep_shell_record(params, ok, hit_t, u, v, n_obj, face, keep_searching)
 
