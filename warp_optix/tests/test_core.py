@@ -118,9 +118,9 @@ def test_raygen_only_pipeline_over_device_instances():
     flags = wo.BuildFlags.PREFER_FAST_TRACE | wo.BuildFlags.ALLOW_COMPACTION
     gas, spare = (wo.Accel([wo.triangles(vertices, indices)], flags=flags, device=device) for _ in range(2))
     gas.rebuild()
-    uncompacted = gas._buffer.size
+    uncompacted = gas._buffer.capacity
     wo.compact([gas, spare])
-    assert gas._buffer.size < uncompacted
+    assert gas._buffer.capacity < uncompacted
     assert gas._memory[0] is gas._buffer
 
     # Two worlds side by side; each world's quad sits at its own height.

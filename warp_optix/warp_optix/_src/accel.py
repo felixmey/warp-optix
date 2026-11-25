@@ -158,6 +158,15 @@ class BuildInput:
         return self.arrays[0].device
 
 
+def _device_bytes(nbytes: int, device) -> wp.array:
+    """Uninitialized device memory of at least ``nbytes`` bytes; ``capacity`` is its size in bytes.
+
+    Allocated as 8-byte words: a uint8 array is limited to 2 GiB by Warp's int32 shapes, which
+    large structures' output and scratch buffers exceed.
+    """
+    return wp.empty((int(nbytes) + 7) // 8, dtype=wp.uint64, device=device)
+
+
 def _vertex_count(keys):
     if not keys:
         raise ValueError("points must contain at least one motion key")
@@ -491,8 +500,8 @@ class Accel:
             scratch_size = (max(sizes.tempSizeInBytes, sizes.tempUpdateSizeInBytes) + 7) // 8 * 8
             compacting = bool(flags & BuildFlags.ALLOW_COMPACTION)
             # The compacted size is emitted into 8 bytes after the scratch space, saving an allocation.
-            scratch = wp.empty(scratch_size + 8 * compacting, dtype=wp.uint8, device=context.device)
-            buffer = wp.empty(sizes.outputSizeInBytes, dtype=wp.uint8, device=context.device)
+            scratch = _device_bytes(scratch_size + 8 * compacting, context.device)
+            buffer = _device_bytes(sizes.outputSizeInBytes, context.device)
             compacted_size = scratch.ptr + scratch_size if compacting else None
             emitted = [native.AccelEmitDesc(compacted_size, native.PROPERTY_TYPE_COMPACTED_SIZE)] if compacting else []
             handle = context.native.accelBuild(
@@ -502,7 +511,7 @@ class Accel:
                 scratch.ptr,
                 scratch_size,
                 buffer.ptr,
-                buffer.size,
+                buffer.capacity,
                 emitted,
             )
 
@@ -605,8 +614,8 @@ class Accel:
             if scratch is None:
                 sizes = context.native.accelComputeMemoryUsage(options, self._native_inputs)
                 with wp.ScopedStream(stream, sync_enter=False):
-                    scratch = wp.empty(sizes.tempSizeInBytes, dtype=wp.uint8, device=context.device)
-                scratch_size = scratch.size
+                    scratch = _device_bytes(sizes.tempSizeInBytes, context.device)
+                scratch_size = scratch.capacity
             for item in self._inputs:
                 if item.prepare is not None:
                     item.prepare(stream)
@@ -618,7 +627,7 @@ class Accel:
                     scratch.ptr,
                     scratch_size,
                     self._buffer.ptr,
-                    self._buffer.size,
+                    self._buffer.capacity,
                     []
                     if self._compacted_size is None
                     else [native.AccelEmitDesc(self._compacted_size, native.PROPERTY_TYPE_COMPACTED_SIZE)],
@@ -659,8 +668,8 @@ def _compact(accels: list[Accel], context, stream: wp.Stream) -> None:
     wp.synchronize_stream(stream)
     with wp.ScopedDevice(device), wp.ScopedStream(stream, sync_enter=False):
         for accel, size in zip(accels, host_sizes.numpy().tolist(), strict=True):
-            if size < accel._buffer.size:
-                output = wp.empty(size, dtype=wp.uint8, device=device)
+            if size < accel._buffer.capacity:
+                output = _device_bytes(size, device)
                 accel._id = int(context.native.accelCompact(stream.cuda_stream, accel._id, output.ptr, size))
                 accel._buffer = output
                 accel._memory = (output, *accel._memory[1:])

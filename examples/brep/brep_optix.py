@@ -297,7 +297,7 @@ class BrepScene:
         )
 
     def accel_bytes(self) -> int:
-        return sum(g._buffer.size for g in self.gases) + self.ias._buffer.size
+        return sum(g._buffer.capacity for g in self.gases) + self.ias._buffer.capacity
 
     def data_bytes(self) -> int:
         return sum(getattr(self.data, k).capacity for k in BrepData.vars)
@@ -336,7 +336,7 @@ class MeshScene:
         )
 
     def accel_bytes(self) -> int:
-        return self.gas._buffer.size
+        return self.gas._buffer.capacity
 
     def data_bytes(self) -> int:
         return self.points.capacity + self.indices.capacity
@@ -377,7 +377,7 @@ class InstancedMeshScene:
         )
 
     def accel_bytes(self) -> int:
-        return sum(g._buffer.size for g in self.gases) + self.ias._buffer.size
+        return sum(g._buffer.capacity for g in self.gases) + self.ias._buffer.capacity
 
     def data_bytes(self) -> int:
         return sum(b.capacity for b in self.buffers)
