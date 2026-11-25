@@ -126,4 +126,4 @@ def camera_for_scene(api, requested_path=None, use_authored=True):
 
 def default_camera_speed(scene_radius: float) -> float:
     """Return a useful speed for centimeter- through world-scale stages."""
-    return max(float(scene_radius) * 0.75, 0.25)
+    return max(float(scene_radius) * 0.2, 0.05)

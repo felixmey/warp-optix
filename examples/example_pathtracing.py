@@ -75,7 +75,8 @@ def _pack_display_rgba8(src: wp.array2d(dtype=wp.vec4), dst: wp.array(dtype=wp.u
 
 
 class FreeCameraController:
-    """Left-drag to look, WASD/arrows to move, Q/E down/up, Shift faster, wheel to zoom, 1-9 debug views, 0 pixel-time heatmap,
+    """Left-drag to look, WASD/arrows to move, Q/E down/up, Shift 4x faster, Ctrl 4x slower, [/] or -/+ halve/double the
+    speed, wheel to zoom, 1-9 debug views, 0 pixel-time heatmap,
     B BRep shells (debug: NURBS patches as their triangle shells; 5 shows their facet normals), P print the camera,
     X BRep boxes (debug: the AABBs of analytic faces and unshelled patches)."""
 
@@ -120,7 +121,11 @@ class FreeCameraController:
                 move += direction
         move_norm = float(np.linalg.norm(move))
         if move_norm > 1.0e-6:
-            speed = self.speed * (4.0 if {key.LSHIFT, key.RSHIFT} & self.keys_down else 1.0)
+            speed = self.speed
+            if {key.LSHIFT, key.RSHIFT} & self.keys_down:
+                speed *= 4.0
+            if {key.LCTRL, key.RCTRL} & self.keys_down:
+                speed *= 0.25
             self.position += move / move_norm * speed * max(0.0, min(dt, 0.1))
             self._apply()
 
@@ -139,6 +144,9 @@ class FreeCameraController:
             self.api.set_show_brep_boxes(not self.api.show_brep_boxes)
         elif symbol == key.P:
             print("[optix] view: " + json.dumps(self.view_dict()), flush=True)
+        elif symbol in (key.BRACKETLEFT, key.MINUS, key.NUM_SUBTRACT, key.BRACKETRIGHT, key.EQUAL, key.NUM_ADD):
+            self.speed *= 0.5 if symbol in (key.BRACKETLEFT, key.MINUS, key.NUM_SUBTRACT) else 2.0
+            print(f"[optix] camera speed: {self.speed:.4g} units/s", flush=True)
         self.keys_down.add(symbol)
 
     def view_dict(self) -> dict:
@@ -348,6 +356,9 @@ def _parse_args():
     )
     parser.add_argument("--denoiser", choices=("auto", "dlss", "optix", "none"), default="auto")
     parser.add_argument("--exposure", type=float, help="Display exposure (default depends on the scene).")
+    parser.add_argument(
+        "--camera-speed", type=float, help="Camera speed in scene units per second (default depends on the scene)."
+    )
     parser.add_argument("--hair-count", type=int, default=4000, help="Number of strands (hairball).")
     parser.add_argument("--arrow-count", type=int, default=1800, help="Number of arrows (arrowball).")
     parser.add_argument("--contact-count", type=int, default=100_000, help="Maximum number of lines (contact_lines).")
@@ -379,6 +390,8 @@ def main():
         name, view = args.gltf.name, setup_gltf(api, args)
     else:
         name, view = args.scene, SCENES[args.scene](api, args)
+    if args.camera_speed is not None:
+        view.speed = args.camera_speed
     api.tonemap_exposure = view.exposure if args.exposure is None else args.exposure
     api.tonemap_contrast = 1.08
     api.tonemap_saturation = 1.1
