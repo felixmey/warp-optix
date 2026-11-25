@@ -30,6 +30,8 @@ from .func_common import Mat16f, Vec6f
 # Ray types of the path tracer's SBT, in record order. Traces use these indices as their SBT
 # offset and miss index, and the count as their SBT stride.
 RAY_TYPES = ("primary", "secondary")
+# Scene instance masks are either 0 or 255. A distinct camera mask identifies diagnostic rays.
+CAMERA_RAY_MASK = wp.constant(wp.uint32(1 if brep_device.DIAGNOSTICS else 255))
 PRIMARY_RAY = wp.constant(wp.uint32(RAY_TYPES.index("primary")))
 SECONDARY_RAY = wp.constant(wp.uint32(RAY_TYPES.index("secondary")))
 RAY_STRIDE = wp.constant(wp.uint32(len(RAY_TYPES)))
@@ -1876,6 +1878,23 @@ def _direction_coherence(d: wp.vec3) -> wp.uint32:
     return wp.uint32(int(d[0] > 0.0) | (int(d[1] > 0.0) << 1) | (int(d[2] > 0.0) << 2))
 
 
+@wp.func
+def _origin_coherence(params: PathtraceLaunchParams, origin: wp.vec3) -> wp.uint32:
+    """Two bits for the ray origin's quadrant in camera space."""
+    horizontal = float(0.0)
+    vertical = float(0.0)
+    if params.device_camera.shape[0] > 0:
+        camera = params.device_camera[0]
+        relative = origin - camera.position
+        horizontal = wp.dot(camera.right, relative)
+        vertical = wp.dot(camera.up, relative)
+    else:
+        local = _mul_mat4_cm(params.view, wp.vec4(origin[0], origin[1], origin[2], 1.0))
+        horizontal = local[0]
+        vertical = local[1]
+    return wp.uint32(int(horizontal > 0.0) | (int(vertical > 0.0) << 1))
+
+
 # Camera rays and rays from offset surface points (_offset_ray moves an origin off the surface,
 # relative to its coordinates' magnitude) need no minimum distance. A fixed one skips real occluders
 # within it: 1 mm (formerly) leaked light through concave corners of centimetre-scale parts, and
@@ -2907,7 +2926,7 @@ def _evaluate_material_from_payload(
 # The renderer enables fast math for every program through the pipeline's module options. This avoids the
 # precise sin/cos range reduction, which spills to local memory and uses fp64 instructions.
 def _make_primary_raygen(reorder_bounces: bool, debug_views: bool = False):
-    """The raygen program; ``reorder_bounces`` reorders threads by bounce direction before tracing
+    """The raygen program; ``reorder_bounces`` reorders threads by bounce direction and origin before tracing
     bounce rays (shader execution reordering). That pays off when intersection programs dominate
     (BReps: 1.6x on a dense assembly), but triangle-only scenes run 10-20% slower even with the
     reorder skipped at runtime, so it is compiled into a separate variant. ``debug_views`` compiles in
@@ -2946,7 +2965,7 @@ def _make_primary_raygen(reorder_bounces: bool, debug_views: bool = False):
             payload,
             RAY_TMIN,
             0.0,
-            wp.uint32(255),
+            CAMERA_RAY_MASK,
             ray_flags,
             PRIMARY_RAY,
             RAY_STRIDE,
@@ -3435,7 +3454,8 @@ def _make_primary_raygen(reorder_bounces: bool, debug_views: bool = False):
 
             if wp.static(reorder_bounces):
                 wp.optix_make_nop_hit_object()
-                wp.optix_reorder(_direction_coherence(sec_direction), wp.uint32(3))
+                hint = _direction_coherence(sec_direction) | (_origin_coherence(params, sec_origin) << wp.uint32(3))
+                wp.optix_reorder(hint, wp.uint32(5))
             sec_payload = _init_primary_payload()
             wp.optix_trace(
                 params.tlas,
@@ -3989,8 +4009,8 @@ class AnyHitAlphaResult:
 
 
 @wp.func
-def _compute_any_hit_alpha(params: PathtraceLaunchParams) -> AnyHitAlphaResult:
-    """Evaluate coverage for triangles and curves through one material path."""
+def _compute_any_hit_alpha(params: PathtraceLaunchParams, shell: bool) -> AnyHitAlphaResult:
+    """Evaluate material coverage. Shell shaders pass a constant to specialize the lookup."""
     out = AnyHitAlphaResult()
     out.valid = wp.uint32(0)
     out.inst_id = wp.int32(-1)
@@ -4013,15 +4033,20 @@ def _compute_any_hit_alpha(params: PathtraceLaunchParams) -> AnyHitAlphaResult:
 
     render_primitives = params.render_primitives
     rp = render_primitives[render_prim_id]
-    geometry_types = params.instance_geometry_types
-    is_curve = geometry_types.shape[0] > 0 and geometry_types[inst_id] != wp.uint32(0)
-    is_brep = geometry_types.shape[0] > 0 and (
-        geometry_types[inst_id] == wp.uint32(GEOMETRY_TYPE_BREP)
-        or geometry_types[inst_id] == wp.uint32(GEOMETRY_TYPE_BREP_SHELL)
-    )
-    if is_brep and geometry_types[inst_id] == wp.uint32(GEOMETRY_TYPE_BREP):
-        primitive_id = primitive_id - int(params.packed_indices[int(rp.index_offset)])  # see _brep_local_primitive
-    primitive_count = int(rp.num_indices) if is_curve else int(rp.num_indices) // 3
+    is_curve = False
+    is_brep = shell
+    primitive_count = int(rp.num_indices)
+    if not shell:
+        geometry_types = params.instance_geometry_types
+        is_curve = geometry_types.shape[0] > 0 and geometry_types[inst_id] != wp.uint32(0)
+        is_brep = geometry_types.shape[0] > 0 and (
+            geometry_types[inst_id] == wp.uint32(GEOMETRY_TYPE_BREP)
+            or geometry_types[inst_id] == wp.uint32(GEOMETRY_TYPE_BREP_SHELL)
+        )
+        if is_brep and geometry_types[inst_id] == wp.uint32(GEOMETRY_TYPE_BREP):
+            primitive_id = primitive_id - int(params.packed_indices[int(rp.index_offset)])  # see _brep_local_primitive
+        if not is_curve:
+            primitive_count = primitive_count // 3
     if primitive_id < 0 or primitive_id >= primitive_count:
         return out
     material_id = _resolve_material_id(params, inst_id, render_prim_id, primitive_id, primitive_count)
@@ -4240,6 +4265,31 @@ def _brep_closed(params: PathtraceLaunchParams, prim: int) -> wp.bool:
 
 
 @wp.func
+def _brep_shell_patch(params: PathtraceLaunchParams) -> int:
+    rp = params.render_primitives[int(params.instance_render_prim_ids[int(wp.optix_get_instance_id())])]
+    triangle = int(rp.vertex_buffer.position_offset) + int(wp.optix_get_primitive_index())
+    return int(params.brep.proxy_prim[triangle])
+
+
+@wp.func
+def _count_shell_callback(params: PathtraceLaunchParams, shadow: bool, skipped: bool):
+    if wp.static(brep_device.DIAGNOSTICS):
+        patch = _brep_shell_patch(params)
+        if (params.brep.prims[patch].flags >> brep_device.KIND_SHIFT) == brep_device.NURBS:
+            camera = wp.optix_get_ray_visibility_mask() == wp.uint32(1)
+            ray = 2 if shadow else (0 if camera else 1)
+            triangles_per_shell = params.brep.shell_st.shape[0] // 3
+            local = int(wp.optix_get_primitive_index()) % triangles_per_shell
+            crossing = 0 if wp.optix_is_front_face_hit() else 1
+            if local >= 2 * brep_device.SHELL_LAYER_TRIANGLES:
+                crossing = 2
+            brep_device.diagnostic_add(params.brep, patch, brep_device.DIAG_SHELL_CALLBACK + 3 * ray + crossing, 1)
+            if skipped:
+                metric = brep_device.DIAG_SHELL_CAMERA_SKIP if camera else brep_device.DIAG_SHELL_BOUNCE_SKIP
+                brep_device.diagnostic_add(params.brep, patch, metric, 1)
+
+
+@wp.func
 def _brep_shell_closed(params: PathtraceLaunchParams) -> wp.bool:
     """Whether the crossed shell triangle's face belongs to a closed solid."""
     rp = params.render_primitives[int(params.instance_render_prim_ids[int(wp.optix_get_instance_id())])]
@@ -4281,7 +4331,7 @@ def _brep_shell_record(
     if not ok:
         wp.optix_ignore_intersection()
         return
-    alpha_hit = _compute_any_hit_alpha(params)
+    alpha_hit = _compute_any_hit_alpha(params, True)
     if alpha_hit.valid != wp.uint32(0) and alpha_hit.alpha < 0.999:
         if alpha_hit.alpha <= 0.001 or _pcg_rand01(_any_hit_rng(alpha_hit.coverage_seed)) > alpha_hit.alpha:
             wp.optix_ignore_intersection()
@@ -4343,7 +4393,7 @@ def _any_hit_rng(coverage_seed: wp.uint32) -> wp.uint32:
 @wo.kernel(kind=wo.ProgramKind.ANY_HIT)
 @wp.kernel(module="unique")
 def primary_any_hit(params: PathtraceLaunchParams):
-    alpha_hit = _compute_any_hit_alpha(params)
+    alpha_hit = _compute_any_hit_alpha(params, False)
     if alpha_hit.valid == wp.uint32(0):
         return
 
@@ -4375,12 +4425,12 @@ def secondary_closest_hit(params: PathtraceLaunchParams):
 @wo.kernel(kind=wo.ProgramKind.ANY_HIT)
 @wp.kernel(module="unique")
 def secondary_any_hit(params: PathtraceLaunchParams):
-    _secondary_any_hit(params)
+    _secondary_any_hit(params, False)
 
 
 @wp.func
-def _secondary_any_hit(params: PathtraceLaunchParams):
-    alpha_hit = _compute_any_hit_alpha(params)
+def _secondary_any_hit(params: PathtraceLaunchParams, shell: bool):
+    alpha_hit = _compute_any_hit_alpha(params, shell)
     if alpha_hit.valid == wp.uint32(1):
         blocking = alpha_hit.alpha * (1.0 - alpha_hit.transmission)
         if blocking <= 0.001:
@@ -4431,6 +4481,26 @@ def _make_brep_programs(debug_views: bool) -> dict:
                 )
                 return
         brep_device.intersect_quadric(
+            params.brep,
+            int(wp.optix_get_primitive_index()),
+            wp.optix_get_object_ray_origin(),
+            wp.optix_get_object_ray_direction(),
+        )
+
+    @wo.kernel(kind=wo.ProgramKind.INTERSECTION)
+    @wp.kernel(module="unique")
+    def brep_opaque_intersection(params: PathtraceLaunchParams):
+        """Exact intersection for instances with opaque materials."""
+        if wp.static(debug_views):
+            if (params.flags & FLAGS_SHOW_BREP_BOXES) != wp.uint32(0):
+                brep_device.intersect_box(
+                    params.brep,
+                    int(wp.optix_get_primitive_index()),
+                    wp.optix_get_object_ray_origin(),
+                    wp.optix_get_object_ray_direction(),
+                )
+                return
+        brep_device.intersect_opaque_quadric(
             params.brep,
             int(wp.optix_get_primitive_index()),
             wp.optix_get_object_ray_origin(),
@@ -4492,7 +4562,10 @@ def _make_brep_programs(debug_views: bool) -> dict:
             if (params.flags & FLAGS_SHOW_BREP_SHELLS) != wp.uint32(0):
                 _brep_shell_record_facet(params)
                 return
-        if _brep_shell_behind_hit(params):
+        behind = _brep_shell_behind_hit(params)
+        if wp.static(brep_device.DIAGNOSTICS):
+            _count_shell_callback(params, False, behind)
+        if behind:
             return  # accept: tmax shrinks to this triangle, the recorded hit stays
         ok, hit_t, u, v, n_obj, face, keep_searching = _brep_shell_hit(params)
         _brep_shell_record(params, ok, hit_t, u, v, n_obj, face, keep_searching)
@@ -4505,7 +4578,10 @@ def _make_brep_programs(debug_views: bool) -> dict:
             if (params.flags & FLAGS_SHOW_BREP_SHELLS) != wp.uint32(0):
                 _brep_shell_record_facet(params)
                 return
-        if _brep_shell_behind_hit(params):
+        behind = _brep_shell_behind_hit(params)
+        if wp.static(brep_device.DIAGNOSTICS):
+            _count_shell_callback(params, False, behind)
+        if behind:
             return  # accept: tmax shrinks to this triangle, the recorded hit stays
         ok, hit_t, u, v, n_obj, face, keep_searching = _brep_shell_generic_hit(params)
         _brep_shell_record(params, ok, hit_t, u, v, n_obj, face, keep_searching)
@@ -4516,13 +4592,15 @@ def _make_brep_programs(debug_views: bool) -> dict:
         """Shadow rays: occluded only where the ray really crosses the exact BRep surface."""
         if wp.static(debug_views):
             if (params.flags & FLAGS_SHOW_BREP_SHELLS) != wp.uint32(0):
-                _secondary_any_hit(params)
+                _secondary_any_hit(params, True)
                 return
+        if wp.static(brep_device.DIAGNOSTICS):
+            _count_shell_callback(params, True, False)
         ok, hit_t, u, v, n_obj, face, keep_searching = _brep_shell_hit(params)
         if not ok:
             wp.optix_ignore_intersection()
             return
-        _secondary_any_hit(params)
+        _secondary_any_hit(params, True)
 
     @wo.kernel(kind=wo.ProgramKind.ANY_HIT)
     @wp.kernel(module="unique")
@@ -4530,16 +4608,19 @@ def _make_brep_programs(debug_views: bool) -> dict:
         """brep_shell_secondary_any_hit for the shells of sub-patches of other degrees."""
         if wp.static(debug_views):
             if (params.flags & FLAGS_SHOW_BREP_SHELLS) != wp.uint32(0):
-                _secondary_any_hit(params)
+                _secondary_any_hit(params, True)
                 return
+        if wp.static(brep_device.DIAGNOSTICS):
+            _count_shell_callback(params, True, False)
         ok, hit_t, u, v, n_obj, face, keep_searching = _brep_shell_generic_hit(params)
         if not ok:
             wp.optix_ignore_intersection()
             return
-        _secondary_any_hit(params)
+        _secondary_any_hit(params, True)
 
     return {
         "intersection": brep_intersection,
+        "opaque_intersection": brep_opaque_intersection,
         "curved_intersection": brep_curved_intersection,
         "closest_hit": brep_primary_closest_hit,
         "shell_any_hit": brep_shell_any_hit,
@@ -4582,6 +4663,9 @@ def _make_sbt(debug_views: bool) -> wo.SbtLayout:
             "brep": _hit_groups(brep["closest_hit"], intersection=brep["intersection"]),
             # Must follow "brep": a BRep primitive's SBT index 1 selects it (tori, NURBS sub-patches).
             "brep_curved": _hit_groups(brep["closest_hit"], intersection=brep["curved_intersection"]),
+            "brep_opaque": _hit_groups(brep["closest_hit"], intersection=brep["opaque_intersection"]),
+            # The instance offset selects the pair. GAS indices still distinguish quadrics from curved faces.
+            "brep_opaque_curved": _hit_groups(brep["closest_hit"], intersection=brep["curved_intersection"]),
             "brep_shell": {
                 "primary": wo.HitGroup(brep_shell_closest_hit, brep["shell_any_hit"]),
                 "secondary": wo.HitGroup(secondary_closest_hit, brep["shell_secondary_any_hit"]),

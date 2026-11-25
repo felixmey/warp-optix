@@ -778,6 +778,7 @@ class Scene:
         self._ias = None
         self._opaque_materials = np.empty(0, dtype=np.bool_)
         self._instance_records = None
+        self._compact_material_override = False
         self._instance_traversables = None
         self._instance_sbt_offsets = None
         self._instance_flags = None
@@ -892,9 +893,9 @@ class Scene:
 
     def set_instance_material_ids_host(self, material_ids: np.ndarray):
         """Upload per-instance material IDs from host memory."""
-        self._instance_material_ids = wp.array(
-            np.asarray(material_ids, dtype=np.uint32), dtype=wp.uint32, device=self.device
-        )
+        ids = np.asarray(material_ids, dtype=np.uint32)
+        self._instance_material_ids = wp.array(ids, dtype=wp.uint32, device=self.device)
+        self._refresh_brep_instance_routing(ids)
 
     def set_compact_material_bytes(self, compact_bytes: np.ndarray):
         """Upload compact material table bytes to GPU."""
@@ -902,6 +903,8 @@ class Scene:
             np.asarray(compact_bytes, dtype=np.uint8), dtype=wp.uint8, device=self.device
         )
         self._compact_material_floats = None
+        self._compact_material_override = True
+        self._refresh_brep_instance_routing()
 
     def set_instance_materials_device(
         self,
@@ -1641,6 +1644,7 @@ class Scene:
         self._gas.clear()
         self._ias = None
         self._instance_records = None
+        self._compact_material_override = False
         self._device_instance_transforms = None
         self._instance_records_dirty = True
         self._instance_transform_cache = np.empty((0, 4, 4), dtype=np.float32)
@@ -1701,6 +1705,7 @@ class Scene:
         self._gas.clear()
         self._ias = None
         self._instance_records = None
+        self._compact_material_override = False
         self._device_instance_transforms = None
         self._instance_records_dirty = True
         # Any-hit programs only matter for alpha-tested or transmissive materials.
@@ -1999,6 +2004,46 @@ class Scene:
             rebuild_tlas=rebuild_tlas,
         )
 
+    def _brep_instance_routing(self, geometry, double_sided: bool, override: int | None) -> tuple[int, int]:
+        opaque = self._opaque_materials
+        all_opaque = False
+        if not self._compact_material_override and len(opaque):
+            if override is None:
+                all_opaque = bool(opaque[np.clip(geometry.material_ids, 0, len(opaque) - 1)].all())
+            else:
+                all_opaque = 0 <= override < len(opaque) and bool(opaque[override])
+        group = "brep_opaque" if all_opaque else "brep"
+        flags = wo.InstanceFlags.DISABLE_ANYHIT if all_opaque else wo.InstanceFlags.ENFORCE_ANYHIT
+        if double_sided:
+            flags |= wo.InstanceFlags.DISABLE_TRIANGLE_FACE_CULLING
+        return pwk.SBT.get_sbt_offset(group), int(flags)
+
+    def _refresh_brep_instance_routing(self, material_ids: np.ndarray | None = None):
+        """Keep the TLAS route in sync with raw material overrides uploaded after a build."""
+        if self._instance_records is None or len(self._instance_records) != len(self._instances):
+            return
+        offsets = self._instance_sbt_offsets_host
+        flags = self._instance_flags_host
+        changed = False
+        for index, inst in enumerate(self._instances):
+            geometry = self._meshes[inst.mesh_index]
+            if geometry.primitive_type != "brep":
+                continue
+            material = None
+            if material_ids is not None and index < len(material_ids):
+                raw = int(material_ids[index])
+                if raw != NO_MATERIAL_OVERRIDE:
+                    material = raw
+            offset, flag = self._brep_instance_routing(geometry, inst.double_sided, material)
+            if offset != offsets[index] or flag != flags[index]:
+                offsets[index] = offset
+                flags[index] = flag
+                changed = True
+        if changed:
+            self._instance_sbt_offsets.assign(offsets)
+            self._instance_flags.assign(flags)
+            self._build_tlas()
+
     def _build_tlas(self, stream=None):
         """Write instance records on the GPU, then build or refit the TLAS.
 
@@ -2013,8 +2058,18 @@ class Scene:
             opaque = self._opaque_materials
             mesh_indices = np.fromiter((inst.mesh_index for inst in self._instances), dtype=np.intp, count=count)
             flags = np.zeros(count, dtype=np.uint32)
+            sbt_offsets = np.array(
+                [pwk.SBT.get_sbt_offset(geometry.hit_group) for geometry in self._meshes], dtype=np.uint32
+            )
+            instance_sbt_offsets = sbt_offsets[mesh_indices]
             for index, inst in enumerate(self._instances):
-                if self._meshes[inst.mesh_index].primitive_type == "brep_shell":
+                geometry = self._meshes[inst.mesh_index]
+                if geometry.primitive_type == "brep":
+                    instance_sbt_offsets[index], flags[index] = self._brep_instance_routing(
+                        geometry, inst.double_sided, inst.material_id
+                    )
+                    continue
+                if geometry.primitive_type == "brep_shell":
                     # Both shell layers must be found, and the refinement always runs.
                     flags[index] = wo.InstanceFlags.DISABLE_TRIANGLE_FACE_CULLING | wo.InstanceFlags.ENFORCE_ANYHIT
                     continue
@@ -2027,11 +2082,9 @@ class Scene:
                         wo.InstanceFlags.DISABLE_ANYHIT if override_opaque else wo.InstanceFlags.ENFORCE_ANYHIT
                     )
             handles = np.array([gas.id for gas in self._gas], dtype=np.uint64)
-            sbt_offsets = np.array(
-                [pwk.SBT.get_sbt_offset(geometry.hit_group) for geometry in self._meshes], dtype=np.uint32
-            )
             self._instance_traversables = wp.array(handles[mesh_indices], dtype=wp.uint64, device=self.device)
-            instance_sbt_offsets = sbt_offsets[mesh_indices]
+            self._instance_sbt_offsets_host = instance_sbt_offsets
+            self._instance_flags_host = flags
             self._instance_sbt_offsets = wp.array(instance_sbt_offsets, dtype=wp.uint32, device=self.device)
             self._instance_flags = wp.array(flags, dtype=wp.uint32, device=self.device)
             self._instance_masks = wp.empty(count, dtype=wp.uint32, device=self.device)

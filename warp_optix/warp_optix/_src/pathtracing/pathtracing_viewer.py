@@ -835,7 +835,7 @@ class Renderer:
         """
         self._pipeline_key = self._pipeline_config()
         self._pipeline_register_limit, has_breps, debug_views = self._pipeline_key
-        # BRep scenes reorder bounce rays by direction: their intersection programs diverge.
+        # BRep scenes reorder bounce rays by direction and origin to improve shader coherence.
         if debug_views:
             raygen = pwk.primary_raygen_reorder_debug if has_breps else pwk.primary_raygen_debug
         else:

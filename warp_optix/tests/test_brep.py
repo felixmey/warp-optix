@@ -366,6 +366,79 @@ def test_instance_material_and_visibility_reach_brep_shells(tmp_path):
         api.close()
 
 
+@pytest.mark.gpu
+@pytest.mark.render
+def test_brep_shell_respects_instance_material_alpha_cutoff(tmp_path):
+    if not wp.is_cuda_available():
+        pytest.skip("CUDA unavailable")
+    from warp_optix._src.pathtracing.pathtracing_warp_kernels import MISS_DISTANCE  # noqa: PLC0415
+    from warp_optix.pathtracing import PathTracer  # noqa: PLC0415
+
+    path = tmp_path / "dome.usda"
+    _write_nurbs_dome(path)
+    api = PathTracer(width=32, height=32, denoiser="none", enable_set=False, backface_culling=False)
+    try:
+        api.initialize()
+        assert api.load_scene_from_usd(str(path), build_scene=False)
+        materials = [
+            api.scene.materials.add_gltf_material(base_color=(1.0, 1.0, 1.0, alpha), alpha_mode="MASK")
+            for alpha in (0.25, 0.75)
+        ]
+        api.set_camera_look_at((0.0, 1.6, 3.2), (0.0, 0.4, 0.0))
+        for material, visible in zip(materials, (False, True), strict=True):
+            api.set_instance_material(0, material)
+            api.build_scene()
+            api.render_frame()
+            wp.synchronize()
+            hits = np.count_nonzero(api.viewer._depth_buffer.numpy() < MISS_DISTANCE)
+            if visible:
+                assert hits > 50
+            else:
+                assert hits == 0
+    finally:
+        api.close()
+
+
+@pytest.mark.gpu
+@pytest.mark.render
+def test_opaque_quadric_route_follows_material_overrides(tmp_path):
+    if not wp.is_cuda_available():
+        pytest.skip("CUDA unavailable")
+    from warp_optix._src.pathtracing import pathtracing_warp_kernels as pwk  # noqa: PLC0415
+    from warp_optix._src.pathtracing.scene import NO_MATERIAL_OVERRIDE  # noqa: PLC0415
+    from warp_optix.pathtracing import PathTracer  # noqa: PLC0415
+
+    path = tmp_path / "ball.usda"
+    _write_sphere_brep(path)
+    api = PathTracer(width=32, height=32, denoiser="none", enable_set=False, max_bounces=1)
+    try:
+        api.initialize()
+        assert api.load_scene_from_usd(str(path), build_scene=False)
+        opaque = api.scene.materials.add_diffuse((0.5, 0.5, 0.5))
+        masked = api.scene.materials.add_gltf_material(base_color=(1.0, 1.0, 1.0, 0.25), alpha_mode="MASK")
+        api.set_instance_material(0, masked)
+        api.build_scene()
+        api.set_camera_look_at((0.0, 0.0, 3.2), (0.0, 0.0, 0.0))
+
+        def hits(group):
+            assert api.scene._instance_sbt_offsets_host[0] == pwk.SBT.get_sbt_offset(group)
+            api.render_frame()
+            wp.synchronize()
+            return np.count_nonzero(api.viewer._depth_buffer.numpy() < pwk.MISS_DISTANCE)
+
+        assert hits("brep") == 0
+        api.scene.set_instance_material_ids_host(np.array([opaque], dtype=np.uint32))
+        assert hits("brep_opaque") > 50
+        api.scene.set_instance_material_ids_host(np.array([masked], dtype=np.uint32))
+        assert hits("brep") == 0
+        api.scene.set_instance_material_ids_host(np.array([NO_MATERIAL_OVERRIDE], dtype=np.uint32))
+        assert hits("brep_opaque") > 50
+        api.scene.set_compact_material_bytes(api.scene._compact_materials.numpy())
+        assert hits("brep") > 50
+    finally:
+        api.close()
+
+
 def _write_holed_plate(path):
     """A planar face: the square [-1, 1]^2 in z = 0 with a square hole [-0.4, 0.4]^2, line edges."""
     stage = Usd.Stage.CreateNew(str(path))

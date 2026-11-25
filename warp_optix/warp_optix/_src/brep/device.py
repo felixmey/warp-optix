@@ -49,6 +49,14 @@ DIAGNOSTIC_NAMES = (
     "projection_stalled",
     "obb_rejects",
 )
+# Append so existing diagnostic column indices stay stable.
+DIAG_SHELL_CALLBACK = len(DIAGNOSTIC_NAMES)
+DIAGNOSTIC_NAMES += tuple(
+    f"shell_{ray}_{crossing}" for ray in ("camera", "bounce", "shadow") for crossing in ("entry", "exit", "wall")
+)
+DIAG_SHELL_CAMERA_SKIP = len(DIAGNOSTIC_NAMES)
+DIAG_SHELL_BOUNCE_SKIP = DIAG_SHELL_CAMERA_SKIP + 1
+DIAGNOSTIC_NAMES += ("shell_camera_skip", "shell_bounce_skip")
 NEWTON_ITERATIONS = 10
 # Below this |cos| between the ray and the surface, a ray can cross a flat sub-patch twice: there,
 # the nearest crossing is isolated along the ray (first_root) instead of trusting Newton's root.
@@ -434,6 +442,13 @@ def quadric_hit(brep: BrepData, prim: int, origin: wp.vec3, direction: wp.vec3, 
                 n = n[0] * surf.x + n[1] * surf.y + n[2] * surf.axis
                 return True, t + shift, u, v, n, i
     return False, 0.0, 0.0, 0.0, wp.vec3(), count
+
+
+@wp.func
+def intersect_opaque_quadric(brep: BrepData, prim: int, origin: wp.vec3, direction: wp.vec3):
+    hit, t, u, v, n, root = quadric_hit(brep, prim, origin, direction, 0)
+    if hit:
+        report(brep, prim, t, u, v, n, direction)
 
 
 @wp.func

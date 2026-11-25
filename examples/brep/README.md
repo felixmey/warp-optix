@@ -176,10 +176,10 @@ unique ray/patch counts. The script reports a single frame after warmup, with a 
 The accounting identity is `newton_calls = aabb_candidates - obb_rejects - hull_rejects + shell_candidates`.
 
 Diagnostic atomics perturb execution: never use instrumented timings to judge speedups. Normal
-builds compile out the updates and allocate no counter storage. The renderer groups bounce rays
-by direction octant and writes primary guide buffers before the bounce loop to reduce state
-carried across reordering. Benchmark hint and live-state changes on the intended scene; small
-improvements can depend on compiler layout and ray distribution.
+builds compile out the updates and allocate no counter storage. The renderer groups BRep bounce rays
+by direction octant and the origin's camera-space quadrant. It writes primary guide buffers before
+the bounce loop to reduce state carried across reordering. Small timing differences can depend
+on compiler layout and ray distribution.
 
 Newton diagnostics also include the 1–10 iteration histogram, singular/domain exits, failures
 on the last iteration, and separate nonconverged/grazing fallback entries. Last-iteration failures
