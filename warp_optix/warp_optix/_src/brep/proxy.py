@@ -92,12 +92,15 @@ def _node(k: int, count: int, lo: float, span: float) -> wp.vec2:
 
 
 @wp.func
-def _shell(patch: Any, cvs: wp.array[wp.vec4], o: wp.vec3, p: int, vertices: wp.array2d[wp.vec3], grid: int):
+def _shell(
+    patch: Any, cvs: wp.array[wp.vec4], o: wp.vec3, p: int, vertices: wp.array2d[wp.vec3], grid: int, slide_walls: bool
+):
     """Both layers of patch p's grid x grid shell: vertices[p, :nodes] outer, vertices[p, nodes:] inner.
 
     The patch's control points are relative to ``o``, its first control point: in float32, the
     deviation of the surface from the grid then keeps its digits instead of cancelling against the
-    patch's position.
+    patch's position. ``slide_walls`` moves the side walls out by the surface's deviation along
+    itself (see below); NURBS shells skip it (no pixel changes in the benchmark scenes, MC1 5% slower).
     """
     m = grid + 1
     nodes = m * m
@@ -117,9 +120,13 @@ def _shell(patch: Any, cvs: wp.array[wp.vec4], o: wp.vec3, p: int, vertices: wp.
         vertices[p, k] = x  # the grid, read back below
     # Deviation of the surface from the grid's triangles (diagonal as in SHELL_TRIANGLES), per side:
     # signed along the surface normal, so each layer is only as far out as the surface bulges toward
-    # it (a convex patch lies almost entirely on one side of its grid).
+    # it (a convex patch lies almost entirely on one side of its grid). The rest of the deviation runs
+    # along the surface: where the normal tilts against a chord's sag (cones, tori), the surface
+    # slides sideways off its grid point, past the side walls of a narrow patch (a chamfer, a thin
+    # fillet) unless the walls move out by as much.
     above = float(0.0)
     below = float(0.0)
+    slide = float(0.0)
     fine = grid * OVERSAMPLE + 1
     for k in range(fine * fine):
         f = _node(k, fine, 0.0, 1.0)
@@ -141,15 +148,18 @@ def _shell(patch: Any, cvs: wp.array[wp.vec4], o: wp.vec3, p: int, vertices: wp.
             d = wp.dot(x - linear, nf / lf)
             above = wp.max(above, d)
             below = wp.max(below, -d)
-        else:  # degenerate normal: unsigned, on both sides
+            slide = wp.max(slide, wp.length(x - linear - d * (nf / lf)))
+        else:  # degenerate normal: unsigned, on both sides and along the surface
             above = wp.max(above, wp.length(x - linear))
             below = wp.max(below, wp.length(x - linear))
+            slide = wp.max(slide, wp.length(x - linear))
     floor = 1.0e-4 * wp.length(hi - lo)
     # The vertices are stored in float32: far from the origin, a thin shell would round across the
     # surface it encloses. Keep each layer a few float32 steps of its coordinates away.
     reach = wp.max(wp.max(wp.abs(o + lo), wp.abs(o + hi)))
     out_offset = wp.max(SAFETY * above + floor, FLOAT32_SLACK * reach)
     in_offset = wp.max(SAFETY * below + floor, FLOAT32_SLACK * reach)
+    push = wp.where(slide_walls, SAFETY * slide, 0.0)
     # Degenerate normals (poles, apexes, collapsed edges) borrow the average normal.
     average = average / (wp.length(average) + 1.0e-30)
     for k in range(nodes):
@@ -161,8 +171,28 @@ def _shell(patch: Any, cvs: wp.array[wp.vec4], o: wp.vec3, p: int, vertices: wp.
             n = n / length
         else:
             n = average
-        vertices[p, k] = o + x + out_offset * n
-        vertices[p, nodes + k] = o + x - in_offset * n
+        # Boundary nodes move out along the surface, across their edge, by the sideways deviation.
+        i = k // m
+        j = k % m
+        out = wp.vec3(0.0)
+        if i == 0 or i == grid:
+            across = wp.cross(dt, n)  # tangent, perpendicular to the s edge
+            la = wp.length(across)
+            if la > 0.0:
+                across = across / la
+                if wp.dot(across, ds) < 0.0:
+                    across = -across
+                out += wp.where(i == 0, -push, push) * across
+        if j == 0 or j == grid:
+            across = wp.cross(n, ds)  # tangent, perpendicular to the t edge
+            la = wp.length(across)
+            if la > 0.0:
+                across = across / la
+                if wp.dot(across, dt) < 0.0:
+                    across = -across
+                out += wp.where(j == 0, -push, push) * across
+        vertices[p, k] = o + x + out_offset * n + out
+        vertices[p, nodes + k] = o + x - in_offset * n + out
 
 
 @wp.kernel(enable_backward=False)
@@ -177,12 +207,12 @@ def _shell_vertices(
     p = wp.tid()
     deg = patch_degree[p]
     if deg[0] == 3 and deg[1] == 3:
-        _shell(load_cubic(cvs, patch_cv[p]), cvs, patch_origin[p], p, vertices, GRID)
+        _shell(load_cubic(cvs, patch_cv[p]), cvs, patch_origin[p], p, vertices, GRID, False)
     else:
         patch = Bezier()
         patch.base = patch_cv[p]
         patch.degree = deg
-        _shell(patch, cvs, patch_origin[p], p, vertices, GRID)
+        _shell(patch, cvs, patch_origin[p], p, vertices, GRID, False)
 
 
 @wp.kernel(enable_backward=False)
@@ -207,7 +237,7 @@ def _analytic_shell_vertices(
     patch.axis = axis[p]
     patch.params = params[p]
     patch.rect = rect[p]
-    _shell(patch, cvs, origin[p], p, vertices, grid)
+    _shell(patch, cvs, origin[p], p, vertices, grid, True)
 
 
 @dataclass

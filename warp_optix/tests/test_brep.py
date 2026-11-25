@@ -309,6 +309,72 @@ def test_shell_proxies_enclose_bicubic_patches(tmp_path):
         assert along.min() > 0.0 and along.max() < 1.0
 
 
+@pytest.mark.parametrize(
+    ("kind", "params", "rect"),
+    [
+        # A 45 degree chamfer 0.025 tall on a radius of 5.5: the chords' sag across u, radial,
+        # tilts against the cone's normal and slides the surface along it, further than the band is
+        # wide. (Sizes from a bearing housing that lost pixels along its chamfers.)
+        (loader.CONE, (5.525, 1.0), (math.pi, 1.5 * math.pi, -0.025, 0.0)),
+        # A thin fillet band of a torus with a large major radius.
+        (loader.TORUS, (47.3, 0.3), (0.0, 0.5 * math.pi, 0.75 * math.pi, math.pi)),
+    ],
+)
+def test_analytic_shells_enclose_narrow_bands(kind, params, rect):
+    """Every ray that meets the surface of a narrow analytic piece crosses its shell."""
+    from warp_optix._src.brep import proxy  # noqa: PLC0415
+
+    n = proxy.CURVED_CELLS
+    vertices = wp.empty((1, 2 * (n + 1) ** 2), dtype=wp.vec3)
+
+    def arr(value, dtype):
+        return wp.array(np.asarray([value], np.float32), dtype=dtype)
+
+    wp.launch(
+        proxy._analytic_shell_vertices,
+        dim=1,
+        inputs=[
+            wp.array([kind], dtype=wp.int32),
+            arr((0.0, 0.0, 0.0), wp.vec3),
+            arr((1.0, 0.0, 0.0), wp.vec3),
+            arr((0.0, 1.0, 0.0), wp.vec3),
+            arr((0.0, 0.0, 1.0), wp.vec3),
+            arr(params, wp.vec2),
+            arr(rect, wp.vec4),
+            wp.zeros(1, dtype=wp.vec4),
+            n,
+        ],
+        outputs=[vertices],
+    )
+    points = vertices.numpy()[0].astype(np.float64)
+    triangles = points[proxy._culled_topology(np.ones((n, n), bool))]
+    surface = loader.Surface(kind, params=params)
+    rng = np.random.default_rng(0)
+    count = 2000
+    u = rng.uniform(rect[0], rect[1], count)
+    v = rng.uniform(rect[2], rect[3], count)
+    hit = surface.evaluate(u, v)
+    normal = np.cross(surface.evaluate(u + 1e-6, v) - hit, surface.evaluate(u, v + 1e-6) - hit)
+    normal /= np.linalg.norm(normal, axis=1, keepdims=True)
+    # Directions from grazing to head-on, from either side of the surface.
+    tangent = rng.normal(size=(count, 3))
+    tangent -= (tangent * normal).sum(axis=1, keepdims=True) * normal
+    tangent /= np.linalg.norm(tangent, axis=1, keepdims=True)
+    angle = rng.choice([1e-3, 0.05, 0.3, 1.5], count) * rng.choice([-1.0, 1.0], count)
+    direction = np.cos(angle)[:, None] * tangent + np.sin(angle)[:, None] * normal
+    # Moller-Trumbore against every shell triangle, along the whole line through the hit point.
+    v0, e1, e2 = triangles[:, 0], triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0]
+    p = np.cross(direction[:, None], e2[None])
+    det = (e1[None] * p).sum(-1)
+    inv = 1.0 / np.where(det == 0.0, np.inf, det)
+    s = hit[:, None] - v0[None]
+    a = (s * p).sum(-1) * inv
+    q = np.cross(s, e1[None])
+    b = (direction[:, None] * q).sum(-1) * inv
+    crossed = ((a >= 0.0) & (b >= 0.0) & (a + b <= 1.0) & (det != 0.0)).any(axis=1)
+    assert crossed.all(), f"{np.count_nonzero(~crossed)} of {count} rays miss the shell"
+
+
 @pytest.mark.gpu
 @pytest.mark.render
 def test_path_traced_shells_match_the_custom_nurbs_intersector(tmp_path, monkeypatch):
