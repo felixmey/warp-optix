@@ -4216,9 +4216,16 @@ def _brep_shell_generic_hit(params: PathtraceLaunchParams):
     inst_id = int(wp.optix_get_instance_id())
     primitive_id = int(wp.optix_get_primitive_index())
     rp = params.render_primitives[int(params.instance_render_prim_ids[inst_id])]
+    tri = int(rp.vertex_buffer.position_offset) + primitive_id
+    if wp.static(brep_device.ANALYTIC_SHELLS):
+        # EXPERIMENT: analytic face pieces share this hit group.
+        if (params.brep.prims[int(params.brep.proxy_prim[tri])].flags >> brep_device.KIND_SHIFT) != brep_device.NURBS:
+            return brep_device.proxy_hit_analytic(
+                params.brep, tri, primitive_id, wp.optix_get_object_ray_origin(), wp.optix_get_object_ray_direction()
+            )
     return brep_device.proxy_hit_bezier(
         params.brep,
-        int(rp.vertex_buffer.position_offset) + primitive_id,
+        tri,
         primitive_id,
         wp.optix_get_triangle_barycentrics(),
         wp.optix_get_object_ray_origin(),
