@@ -344,6 +344,28 @@ def test_path_traced_shells_match_the_custom_nurbs_intersector(tmp_path, monkeyp
     assert abs(shell_x - custom_x) < 0.5
 
 
+def test_instance_material_and_visibility_reach_brep_shells(tmp_path):
+    """A BRep instance's material override and visibility also apply to its shell instance."""
+    from warp_optix.pathtracing import PathTracer  # noqa: PLC0415
+
+    _write_nurbs_dome(tmp_path / "dome.usda")
+    api = PathTracer(width=32, height=32, denoiser="none", enable_set=False)
+    api.initialize()
+    try:
+        assert api.scene.load_from_usd(str(tmp_path / "dome.usda"))
+        scene = api.scene
+        (shell,) = scene.brep_companions(0)
+        material = api.create_diffuse_material((0.1, 0.8, 0.2))
+        api.set_instance_material(0, material)
+        assert scene._instances[shell].material_id == material
+        api.set_instance_visible(0, False)
+        assert not scene._instances[shell].visible
+        api.set_instances_visible([0], True)
+        assert scene._instance_visibility_cache[shell]
+    finally:
+        api.close()
+
+
 def _write_holed_plate(path):
     """A planar face: the square [-1, 1]^2 in z = 0 with a square hole [-0.4, 0.4]^2, line edges."""
     stage = Usd.Stage.CreateNew(str(path))

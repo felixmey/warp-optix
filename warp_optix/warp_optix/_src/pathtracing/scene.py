@@ -1352,6 +1352,8 @@ class Scene:
         if 0 <= instance_index < len(self._instances):
             self._instances[instance_index].material_id = material_id
             self._lights_in_solids = None
+            for companion in self._brep_companions.get(instance_index, []):
+                self.set_instance_material(companion, material_id)
 
     def set_instance_visible(self, instance_index: int, visible: bool):
         """Control whether one instance participates in traversal."""
@@ -1360,6 +1362,8 @@ class Scene:
             self._instances[instance_index].visible = value
             self._instance_visibility_cache[instance_index] = value
             self._instance_records_dirty = True
+            for companion in self._brep_companions.get(instance_index, []):
+                self.set_instance_visible(companion, value)
 
     def set_instances_visible_batch(self, instance_indices, visible: bool):
         """Set visibility for a batch with one host-array assignment."""
@@ -1368,6 +1372,9 @@ class Scene:
             return
         if int(indices.min()) < 0 or int(indices.max()) >= len(self._instances):
             raise IndexError("instance index is out of range")
+        companions = [c for i in indices.tolist() for c in self._brep_companions.get(i, [])]
+        if companions:
+            indices = np.concatenate([indices, np.asarray(companions, dtype=np.intp)])
         self._instance_visibility_cache[indices] = bool(visible)
         if self._instance_masks is None:
             self._instance_records_dirty = True
